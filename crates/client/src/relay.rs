@@ -6,7 +6,7 @@ use hyperspace_bridge::{ClientBridge, LinkStats, RelayUrl, Status};
 use hyperspace_proto::log;
 use hyperspace_proto::relay::refused;
 use hyperspace_proto::secure::Key;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -118,7 +118,7 @@ pub fn status_line(status: Status, host: &str) -> String {
         ),
         Status::RelayBusy => "the relay is busy; retrying.".to_string(),
         Status::Refused(refused::NOT_ALLOWED) => "this relay does not serve this PC yet: its operator must add the \
-             PC's relay id (shown by hyperspace-host --relay-id)."
+             PC's relay id (hyperspace-host --relay-id prints it)."
             .to_string(),
         Status::Refused(r) => format!("the relay refused the connection: {}.", refused::describe(r)),
         Status::HostOffline => "the PC is not connected to the relay (host not running, older than 0.3.0, or \
@@ -137,6 +137,9 @@ pub struct Relay {
     host: String,
     key: Key,
     bridge: Option<ClientBridge>,
+    /// The one socket that talks to the link, for the link's whole life: the
+    /// link serves only the first local socket that sends to it.
+    sock: Option<UdpSocket>,
     start_error: Option<String>,
     /// The relay carried the last session: the next race starts with it.
     won_last: bool,
@@ -152,6 +155,7 @@ impl Relay {
             host,
             key,
             bridge: None,
+            sock: None,
             start_error: None,
             won_last: false,
             reconnects_seen: 0,
@@ -164,36 +168,72 @@ impl Relay {
     }
 
     /// Starts the link unless it runs (it comes up in the background), and
-    /// asks for a new one if the host closed the last. Returns the loopback
-    /// address that stands for the host, or None if the link cannot start.
-    pub fn start(&mut self) -> Option<SocketAddr> {
+    /// asks for a new one if the host closed the last. Returns a handle on
+    /// the link's one socket, with the loopback address that stands for the
+    /// host, or None if the link cannot start.
+    pub fn start(&mut self) -> Option<(UdpSocket, SocketAddr)> {
         match self.bridge.as_ref().map(ClientBridge::status) {
             None => {}
-            // The link stopped for good: a new one, below.
+            // The link stopped for good: a new one (and a new socket), below.
             Some(Status::Closed(why)) => {
                 log!("relay: starting a new relay link (the last one stopped: {why})");
                 self.report();
                 self.bridge = None;
+                self.sock = None;
             }
             Some(status) => {
-                let b = self.bridge.as_ref()?;
                 if status == Status::ClosedByHost {
-                    b.reconnect();
+                    // Called once per connect attempt, and attempts back off.
+                    if let Some(b) = &self.bridge {
+                        b.reconnect();
+                    }
                 }
-                return Some(b.local_addr());
+                return self.socket();
             }
         }
-        match ClientBridge::start(&self.url, &self.key) {
-            Ok((bridge, addr)) => {
-                self.bridge = Some(bridge);
-                self.start_error = None;
-                self.reconnects_seen = 0;
-                self.last_report = Instant::now();
-                Some(addr)
-            }
+        let (bridge, addr) = match ClientBridge::start(&self.url, &self.key) {
+            Ok(started) => started,
             Err(e) => {
                 log!("relay: cannot start the relay link: {e}");
                 self.start_error = Some(e);
+                return None;
+            }
+        };
+        match crate::session::relay_socket(addr) {
+            Ok(sock) => {
+                self.bridge = Some(bridge);
+                self.sock = Some(sock);
+                self.start_error = None;
+                self.reconnects_seen = 0;
+                self.last_report = Instant::now();
+                self.socket()
+            }
+            Err(e) => {
+                // The link is of no use without it: it closes here.
+                log!("relay: cannot use the relay: no local socket for it ({e})");
+                self.start_error = Some(format!("no local socket for it ({e})"));
+                None
+            }
+        }
+    }
+
+    /// A handle on the link's one socket for one connect, with what the last
+    /// session left in it dropped.
+    fn socket(&self) -> Option<(UdpSocket, SocketAddr)> {
+        let (bridge, sock) = (self.bridge.as_ref()?, self.sock.as_ref()?);
+        let handle = sock.try_clone().and_then(|s| s.set_nonblocking(true).map(|()| s));
+        match handle {
+            Ok(s) => {
+                let mut buf = [0u8; 2048];
+                for _ in 0..100_000 {
+                    if s.recv(&mut buf).is_err() {
+                        break;
+                    }
+                }
+                Some((s, bridge.local_addr()))
+            }
+            Err(e) => {
+                log!("relay: cannot use the relay link's socket: {e}");
                 None
             }
         }
@@ -204,6 +244,7 @@ impl Relay {
         if self.bridge.is_some() {
             self.report();
             self.bridge = None;
+            self.sock = None;
             log!("relay link closed: the host answered directly");
         }
         self.won_last = false;
@@ -397,8 +438,8 @@ mod tests {
             ),
             (
                 Status::Refused(refused::NOT_ALLOWED),
-                "this relay does not serve this PC yet: its operator must add the PC's relay id (shown by \
-                 hyperspace-host --relay-id).",
+                "this relay does not serve this PC yet: its operator must add the PC's relay id \
+                 (hyperspace-host --relay-id prints it).",
             ),
             (
                 Status::HostOffline,
@@ -421,6 +462,54 @@ mod tests {
             let line = status_line(status, host);
             assert!(!line.contains("Status") && !line.contains("bridge") && !line.contains("room"), "{line}");
         }
+    }
+
+    #[test]
+    fn the_sessions_socket_hears_only_the_link() {
+        for lo in ["127.0.0.1:0", "[::1]:0"] {
+            // A machine without IPv6 skips that half.
+            let Ok(link) = UdpSocket::bind(lo) else { continue };
+            let link_addr = link.local_addr().unwrap();
+            let s = crate::session::relay_socket(link_addr).unwrap();
+            let mine = s.local_addr().unwrap();
+            assert!(mine.ip().is_loopback(), "{mine}");
+            assert_eq!(s.peer_addr().unwrap(), link_addr);
+            // Another program on this machine sends first: its datagram never arrives.
+            let stray = UdpSocket::bind(lo).unwrap();
+            stray.send_to(b"stray", mine).unwrap();
+            link.send_to(b"link", mine).unwrap();
+            s.set_nonblocking(false).unwrap();
+            s.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+            let mut buf = [0u8; 16];
+            let n = s.recv(&mut buf).unwrap();
+            assert_eq!(&buf[..n], b"link");
+            assert!(s.recv(&mut buf).is_err(), "a stray datagram got in");
+            // What the session sends reaches the link and nobody else.
+            s.send(b"out").unwrap();
+            link.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+            let (n, from) = link.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..n], b"out");
+            assert_eq!(from, mine);
+            stray.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+            assert!(stray.recv(&mut buf).is_err());
+        }
+        assert!(crate::session::relay_socket("192.0.2.1:9".parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn one_socket_for_the_links_whole_life() {
+        // Nothing listens there: the link keeps trying in the background.
+        let mut r = Relay::new("ws://127.0.0.1:9/v1".into(), Key::from_bytes([7; 32]));
+        let (a, link) = r.start().expect("the link starts");
+        let (b, again) = r.start().expect("the same link");
+        assert_eq!(link, again);
+        assert!(link.ip().is_loopback());
+        assert_eq!(a.local_addr().unwrap(), b.local_addr().unwrap());
+        assert_eq!(a.peer_addr().unwrap(), link);
+        assert!(a.local_addr().unwrap().ip().is_loopback());
+        r.stop();
+        assert!(r.status().is_none());
+        assert!(r.sock.is_none());
     }
 
     #[test]

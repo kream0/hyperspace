@@ -229,7 +229,7 @@ C_PID=$RELAY_PID RELAY_PID=$MAIN_RELAY
 rpair rc-c "hs1.$KEY.$DEAD,relay=ws://127.0.0.1:47812/v1"
 rclient 20 relay-c.client.log rc-c --frames 1 --connect-timeout 4
 [ $RC = 1 ] || ERRS+="  client exited with $RC, expected 1"$'\n'
-expect "$LOGS/relay-c.client.log" "this relay does not serve this PC yet: its operator must add the PC's relay id .shown by hyperspace-host --relay-id.\." "the not-allowed line"
+expect "$LOGS/relay-c.client.log" "this relay does not serve this PC yet: its operator must add the PC.s relay id .hyperspace-host --relay-id prints it.\." "the not-allowed line"
 grep -h "relay ws" "$LOGS/relay-c.client.log" || true
 stop_pid $C_PID
 end_case relay-c "$LOGS/relay-c.client.log" "$LOGS/relay-c.relay.log"
@@ -271,6 +271,10 @@ expect "$LOGS/relay-f.client.log" "CLIENT OK" "CLIENT OK"
 expect "$LOGS/relay-f.client.log" "relay link reconnected \([0-9]+ reconnects so far\); it had closed: " "the reconnect line"
 expect "$LOGS/relay-f.client.log" "relay link: up [0-9]+ s, [1-9][0-9]* reconnects, last close: " "the reconnect count at exit"
 [ "$(grep -c "relay: connected to" "$LOGS/relay-f.host.log")" -ge 2 ] || ERRS+="  relay-f.host.log: the host's relay link did not come back"$'\n'
+# The second session goes through the same link (and so the same local socket).
+[ "$(grep -c "authenticated with the host through the relay" "$LOGS/relay-f.client.log")" -ge 2 ] \
+  || ERRS+="  relay-f.client.log: no second session through the relay"$'\n'
+reject "$LOGS/relay-f.client.log" "starting a new relay link" "a new relay link"
 grep -h -E "relay link|connecting again|authenticated" "$LOGS/relay-f.client.log" || true
 end_case relay-f "$LOGS/relay-f.client.log" "$LOGS/relay-f.host.log" "$LOGS/relay-f.relay.log"
 
@@ -299,8 +303,31 @@ code=0; timeout 20 "$BIN/hyperspace-client" --relay-check ws://127.0.0.1:47819 >
 [ $code = 1 ] || ERRS+="  --relay-check on no relay exited with $code, expected 1"$'\n'
 cat "$LOGS/relay-g5.client.log" "$LOGS/relay-g6.client.log"
 stop_pid $HOST_PID
-stop_pid $RELAY_PID
 end_case relay-g "$LOGS"/relay-g[1-6].client.log "$LOGS/relay-f.host.log" "$LOGS/relay-f.relay.log"
+
+echo "=== relay-h (the host restarts mid-session: the client connects again over the same relay link)"
+start_rhost relay-h1 45974 || true
+rpair rc-h "hs1.$KEY.$DEAD,relay=$RELAY/v1"
+timeout 90 "$BIN/hyperspace-client" --headless --no-lookup --stats --frames 600 --config-dir "$LOGS/rc-h" >"$LOGS/relay-h.client.log" 2>&1 &
+CLIENT_PID=$!
+for _ in $(seq 150); do grep -q "via relay" "$LOGS/relay-h.client.log" && break; sleep 0.1; done
+kill -9 $HOST_PID 2>/dev/null || true
+wait $HOST_PID 2>/dev/null || true
+sleep 0.5
+start_rhost relay-h2 45974 || true
+RC=0
+wait $CLIENT_PID || RC=$?
+[ $RC = 0 ] || ERRS+="  client exited with $RC"$'\n'
+expect "$LOGS/relay-h.client.log" "CLIENT OK" "CLIENT OK"
+[ "$(grep -c "authenticated with the host through the relay" "$LOGS/relay-h.client.log")" -ge 2 ] \
+  || ERRS+="  relay-h.client.log: no second session through the relay"$'\n'
+expect "$LOGS/relay-h.client.log" "relay link: up [0-9]+ s, 0 reconnects, " "the same link at exit"
+reject "$LOGS/relay-h.client.log" "starting a new relay link" "a new relay link"
+expect "$LOGS/relay-h2.host.log" "client .* connected through the relay" "the second session at the host"
+grep -h -E "relay|connecting again|authenticated" "$LOGS/relay-h.client.log" | grep -v "fps " || true
+stop_pid $HOST_PID
+stop_pid $RELAY_PID
+end_case relay-h "$LOGS/relay-h.client.log" "$LOGS/relay-h1.host.log" "$LOGS/relay-h2.host.log" "$LOGS/relay-f.relay.log"
 
 if [ -n "$RELAY_FAILED" ]; then echo "FAILED relay cases:$RELAY_FAILED"; exit 1; fi
 echo "ALL E2E TESTS PASSED"

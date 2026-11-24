@@ -15,7 +15,7 @@ use hyperspace_proto::wire::{self, bye, pt, Hello, Packet, Welcome, FRAG_HEADER_
 use hyperspace_proto::{log, rendezvous, DEFAULT_PORT};
 use std::cell::RefCell;
 use std::io::ErrorKind;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -109,6 +109,23 @@ fn answer(init: &mut Initiator, data: &[u8]) -> Result<Option<secure::Session>, 
 }
 
 fn make_socket(host: SocketAddr) -> std::io::Result<UdpSocket> {
+    let any = if host.is_ipv4() { IpAddr::from(Ipv4Addr::UNSPECIFIED) } else { IpAddr::from(Ipv6Addr::UNSPECIFIED) };
+    socket_to(host, any)
+}
+
+/// The session's end of the relay link: bound to loopback in the family of
+/// the link's address and connected to it, so the system drops datagrams
+/// from any other program on this machine, and ours go to the link only.
+pub fn relay_socket(link: SocketAddr) -> std::io::Result<UdpSocket> {
+    if !link.ip().is_loopback() {
+        return Err(std::io::Error::new(ErrorKind::InvalidInput, format!("{link} is not a loopback address")));
+    }
+    let lo = if link.is_ipv4() { IpAddr::from(Ipv4Addr::LOCALHOST) } else { IpAddr::from(Ipv6Addr::LOCALHOST) };
+    socket_to(link, lo)
+}
+
+/// A non-blocking UDP socket bound to `local` (any port) and connected to `host`.
+fn socket_to(host: SocketAddr, local: IpAddr) -> std::io::Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let s = Socket::new(Domain::for_address(host), Type::DGRAM, Some(Protocol::UDP))?;
     // Room for a burst of keyframe datagrams while the decode thread is busy.
@@ -117,8 +134,7 @@ fn make_socket(host: SocketAddr) -> std::io::Result<UdpSocket> {
             break;
         }
     }
-    let local: SocketAddr = if host.is_ipv4() { ([0, 0, 0, 0], 0).into() } else { ([0u16; 8], 0).into() };
-    s.bind(&local.into())?;
+    s.bind(&SocketAddr::new(local, 0).into())?;
     s.connect(&host.into())?;
     s.set_nonblocking(true)?;
     Ok(s.into())
@@ -192,16 +208,9 @@ pub fn connect(opts: &Options, mut relay: Option<&mut Relay>, stop: &AtomicBool)
     }
     let list = |socks: &[(UdpSocket, SocketAddr)]| socks.iter().map(|(_, a)| a.to_string()).collect::<Vec<_>>().join(", ");
 
-    // The relay's end on this machine: a loopback address that stands for the host.
-    let mut relay_sock: Option<(UdpSocket, SocketAddr)> = None;
-    if let Some(r) = relay.as_deref_mut() {
-        if let Some(addr) = r.start() {
-            match make_socket(addr) {
-                Ok(s) => relay_sock = Some((s, addr)),
-                Err(e) => log!("cannot use the relay: no local socket for it ({e})"),
-            }
-        }
-    }
+    // The relay's end on this machine: a loopback address that stands for
+    // the host, reached through the link's one socket.
+    let mut relay_sock: Option<(UdpSocket, SocketAddr)> = relay.as_deref_mut().and_then(Relay::start);
     let relay_line = |relay: Option<&Relay>| relay.map(|r| format!("\n  relay {}: {}", r.url(), r.diagnose())).unwrap_or_default();
     if socks.is_empty() && !opts.lookup && relay_sock.is_none() {
         return Err(format!("no usable address for the host{}", relay_line(relay.as_deref())));
@@ -309,7 +318,10 @@ pub fn connect(opts: &Options, mut relay: Option<&mut Relay>, stop: &AtomicBool)
             }
         }
         if let Some((s, _)) = relay_sock.as_ref().filter(|_| relay_joined) {
-            if let Ok(n) = s.recv(&mut buf) {
+            // A few at a time: the link's socket outlives sessions, and the
+            // last one's datagrams may still trickle in.
+            for _ in 0..64 {
+                let Ok(n) = s.recv(&mut buf) else { break };
                 if let Some(session) = answer(&mut init, &buf[..n])? {
                     break 'handshake (session, Via::Relay);
                 }
