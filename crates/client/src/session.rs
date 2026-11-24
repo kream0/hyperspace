@@ -372,8 +372,9 @@ pub fn connect(opts: &Options, mut relay: Option<&mut Relay>, stop: &AtomicBool)
             return Err("stopped".into());
         }
         // On a timer, not once per datagram: stray ones (the last session's,
-        // on the relay link) must not set off a burst.
-        if last_req.is_none_or(|t| t.elapsed() >= Duration::from_millis(100)) {
+        // on the relay link) must not set off a burst. Shorter than the
+        // 100 ms read timeout, so a quiet link still asks every 100 ms.
+        if last_req.is_none_or(|t| t.elapsed() >= Duration::from_millis(80)) {
             last_req = Some(Instant::now());
             link.send(&wire::req_welcome());
         }
