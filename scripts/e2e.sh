@@ -308,9 +308,17 @@ code=0; timeout 20 "$BIN/hyperspace-client" --relay-check "$RELAY" >"$LOGS/relay
 expect "$LOGS/relay-g5.client.log" "relay reachable" "the check line"
 code=0; timeout 20 "$BIN/hyperspace-client" --relay-check ws://127.0.0.1:47819 >"$LOGS/relay-g6.client.log" 2>&1 || code=$?
 [ $code = 1 ] || ERRS+="  --relay-check on no relay exited with $code, expected 1"$'\n'
+reject "$LOGS/relay-g6.client.log" "os error" "an OS error number"
+# A relay that is not there: the plain reason, with nothing repeated.
+rpair rc-g7 "hs1.$KEY.$DEAD,relay=ws://127.0.0.1:47819/v1"
+rclient 20 relay-g7.client.log rc-g7 --frames 1 --connect-timeout 2
+[ $RC = 1 ] || ERRS+="  client with no relay there exited with $RC, expected 1"$'\n'
+expect "$LOGS/relay-g7.client.log" "the relay is not reachable: cannot connect to 127\.0\.0\.1 port 47819: Connection refused\. On a company network, ask IT to allow 127\.0\.0\.1\.$" "the not-reachable line"
+reject "$LOGS/relay-g7.client.log" "not reachable.*(os error|47819 \()" "an OS error number or a repeated address"
 cat "$LOGS/relay-g5.client.log" "$LOGS/relay-g6.client.log"
+grep -h "not reachable" "$LOGS/relay-g7.client.log" || true
 stop_pid $HOST_PID
-end_case relay-g "$LOGS"/relay-g[1-6].client.log "$LOGS/relay-f.host.log" "$LOGS/relay-f.relay.log"
+end_case relay-g "$LOGS"/relay-g[1-7].client.log "$LOGS/relay-f.host.log" "$LOGS/relay-f.relay.log"
 
 echo "=== relay-h (the host restarts mid-session: the client connects again over the same relay link)"
 start_rhost relay-h1 45974 || true
