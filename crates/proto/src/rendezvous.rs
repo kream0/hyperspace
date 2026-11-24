@@ -133,8 +133,10 @@ mod tests {
     fn publish_and_resolve_over_a_local_dht() {
         // Bound to localhost explicitly: only Linux lets you send to 0.0.0.0.
         let testnet = mainline::Testnet::builder(8).build().expect("local dht");
-        let host = Dht::builder().bootstrap(&testnet.bootstrap).build().unwrap();
-        let client = Dht::builder().bootstrap(&testnet.bootstrap).build().unwrap();
+        let node = || {
+            Dht::builder().bootstrap(&testnet.bootstrap).bind_address(std::net::Ipv4Addr::LOCALHOST).build().unwrap()
+        };
+        let (host, client) = (node(), node());
         let key = Key::generate();
         assert_eq!(resolve(&client, &key), None);
 

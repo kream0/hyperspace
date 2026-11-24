@@ -60,6 +60,19 @@ jobs:
           sleep 2
           echo "--- host log"; cat host.log
           exit $status
+      - name: Find the host through the public lookup network (live internet)
+        # Depends on the public BitTorrent DHT being reachable from the runner.
+        continue-on-error: true
+        shell: bash
+        run: |
+          target/release/hyperspace-host.exe --file testdata/testsrc_720p.h264 --once --port 45990 --no-upnp --config-dir lookup-host > lookup-host.log 2>&1 &
+          for i in $(seq 90); do grep -q "address published" lookup-host.log && break; sleep 1; done
+          cat lookup-host.log
+          grep -q "address published" lookup-host.log
+          KEY=$(cut -d. -f2 lookup-host/pairing.txt)
+          target/release/hyperspace-client.exe pair "hs1.$KEY." --config-dir lookup-client
+          target/release/hyperspace-client.exe --headless --frames 60 --connect-timeout 60 --config-dir lookup-client
+          echo "--- remembered for next time:"; cut -d. -f3- lookup-client/host.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
