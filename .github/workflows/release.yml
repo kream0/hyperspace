@@ -7,6 +7,13 @@ name: Release
 #     Cargo.toml has no release yet (bump the version to cut a release).
 # The tag of a release must be `v` followed by the workspace version.
 #
+# The files of a release that exists are never replaced unless asked: a tag
+# push, or a manual run with `publish` ticked, for a release that exists
+# fails without touching it. To replace its files, run the workflow manually
+# with both `publish` and `replace_assets` ticked. A version counts as
+# unpublished only when GitHub answers "not found" for its tag; any other
+# answer stops the run.
+#
 # Run manually without `publish` (the default), the workflow is a dry run:
 # it builds and packages everything, then uploads the files it would
 # publish as the `release-dry-run` workflow artifact, and publishes nothing.
@@ -26,9 +33,15 @@ on:
         type: boolean
         required: false
         default: false
+      replace_assets:
+        description: "With publish: replace the files of a release that already exists (unticked: such a run fails)"
+        type: boolean
+        required: false
+        default: false
 
+# Read-only everywhere; only the publish job may write.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -41,8 +54,11 @@ jobs:
       tag: ${{ steps.plan.outputs.tag }}
       release: ${{ steps.plan.outputs.release }}
       build: ${{ steps.plan.outputs.build }}
+      replace: ${{ steps.plan.outputs.replace }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - id: plan
         env:
           GH_TOKEN: ${{ github.token }}
@@ -52,27 +68,50 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_PUBLISH: ${{ inputs.publish }}
+          INPUT_REPLACE: ${{ inputs.replace_assets }}
         run: |
           version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version *= *"\(.*\)"/\1/p' Cargo.toml)
           release=false
           build=false
+          replace=false
+          # Whether to ask GitHub if the tag has a release.
+          lookup=false
           if [ "$EVENT" = "workflow_dispatch" ]; then
             tag="${INPUT_VERSION:-v$version}"
             build=true
             if [ "$INPUT_PUBLISH" = "true" ]; then release=true; fi
+            if [ "$INPUT_REPLACE" = "true" ]; then
+              if [ "$release" = "true" ]; then
+                replace=true
+              else
+                echo "::notice::replace_assets applies only with publish: this dry run replaces nothing"
+              fi
+            fi
           elif [ "$REF_TYPE" = "tag" ]; then
             tag="$REF_NAME"; release=true
           else
             tag="v$version"
-            if [ "$REF_NAME" = "$DEFAULT_BRANCH" ] && [ -n "$version" ] && ! gh release view "$tag" >/dev/null 2>&1; then
-              release=true
-            fi
+            if [ "$REF_NAME" = "$DEFAULT_BRANCH" ] && [ -n "$version" ]; then lookup=true; fi
           fi
-          if [ "$release" = "true" ]; then build=true; fi
-          echo "tag=$tag release=$release build=$build"
           if ! [[ "$tag" =~ ^v[0-9][0-9A-Za-z.+-]*$ ]]; then
             echo "::error::invalid tag '$tag'"; exit 1
           fi
+          if [ "$release" = "true" ]; then lookup=true; fi
+          published=
+          if [ "$lookup" = "true" ]; then
+            # Only "not found" means the tag has no release: a failed lookup
+            # must never pass for an unpublished version.
+            status=$(curl -sS -o /dev/null -w '%{http_code}' --retry 3 \
+              -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/$tag") || true
+            case "$status" in
+              200) published=true ;;
+              404) published=false; release=true ;;
+              *) echo "::error::cannot tell whether $tag has a release: GitHub answered HTTP $status (expected 200 or 404)"; exit 1 ;;
+            esac
+          fi
+          if [ "$release" = "true" ]; then build=true; fi
+          echo "tag=$tag release=$release build=$build replace_assets=$replace"
           if [ "$build" = "true" ]; then
             if [ -z "$version" ] || [ "$tag" != "v$version" ]; then
               if [ "$release" = "true" ]; then
@@ -82,9 +121,14 @@ jobs:
               echo "::warning::the tag '$tag' is not v + the workspace version in Cargo.toml ('$version'): publishing it would fail"
             fi
           fi
+          if [ "$release" = "true" ] && [ "$published" = "true" ] && [ "$replace" != "true" ]; then
+            echo "::error::the release $tag already exists and its files are kept: to replace them, run this workflow manually with publish and replace_assets ticked"
+            exit 1
+          fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "release=$release" >> "$GITHUB_OUTPUT"
           echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "replace=$replace" >> "$GITHUB_OUTPUT"
 
   windows:
     name: Windows x64
@@ -93,8 +137,10 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release -p hyperspace-host -p hyperspace-client
+      - run: cargo build --release -p hyperspace-host
       - name: Package
         shell: pwsh
         run: |
@@ -115,6 +161,8 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "12.0"
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: Swatinem/rust-cache@v2
       - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - run: cargo build --release -p hyperspace-client --target aarch64-apple-darwin
@@ -126,6 +174,9 @@ jobs:
             target/aarch64-apple-darwin/release/hyperspace-client \
             target/x86_64-apple-darwin/release/hyperspace-client
           lipo -info dist/hyperspace-client
+          if ! lipo dist/hyperspace-client -verify_arch x86_64 arm64; then
+            echo "::error::the macOS client is missing its x86_64 or arm64 part"; exit 1
+          fi
           codesign --force --sign - dist/hyperspace-client
           codesign --verify --verbose dist/hyperspace-client
           cp README.md dist/
@@ -142,6 +193,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: Swatinem/rust-cache@v2
       - name: Build a static musl binary
         run: |
@@ -161,15 +214,14 @@ jobs:
           name: linux
           path: hyperspace-relay-*.tar.gz
 
-  publish:
-    name: Assemble, then publish the release or keep the dry run
+  assemble:
+    name: Assemble the release files (kept as an artifact on a dry run)
     needs: [plan, windows, macos, linux]
     if: needs.plan.outputs.build == 'true'
     runs-on: ubuntu-latest
     env:
       TAG: ${{ needs.plan.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
@@ -198,27 +250,62 @@ jobs:
 
           Host and client must be the same version. See the README for options, shortcuts and limitations. \`SHA256SUMS.txt\` lists the checksum of every file.
           NOTES
-          sed -i 's/^          //' notes.md
           ls -la assets
           cat notes.md
-      # Dry run: what would be published is kept as a workflow artifact.
-      - name: Keep the dry run
-        if: needs.plan.outputs.release != 'true'
+      # A dry run keeps what would be published as `release-dry-run`; a
+      # release hands the same files to the publish job as `release-files`.
+      - name: Keep the dry run, or hand the files to the publish job
         uses: actions/upload-artifact@v4
         with:
-          name: release-dry-run
+          name: ${{ needs.plan.outputs.release == 'true' && 'release-files' || 'release-dry-run' }}
           path: |
             assets
             notes.md
           if-no-files-found: error
-      # The only step that creates, uploads to or edits a GitHub release.
+
+  publish:
+    name: Publish the GitHub release
+    needs: [plan, assemble]
+    if: needs.plan.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    # The only job that creates, uploads to or edits a GitHub release.
+    permissions:
+      contents: write
+    # Two runs for one tag (a tag push and a default-branch push of the same
+    # version) publish one after the other, never at once: the second finds
+    # the release and fails without touching it.
+    concurrency:
+      group: release-publish-${{ needs.plan.outputs.tag }}
+      cancel-in-progress: false
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      REPLACE: ${{ needs.plan.outputs.replace }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-files
+          path: release
       - name: Publish the release
-        if: needs.plan.outputs.release == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" assets/* --clobber
-          else
-            gh release create "$TAG" assets/* --target "$GITHUB_SHA" --title "hyperspace $TAG" --notes-file notes.md
-          fi
+          ls -la release release/assets
+          status=$(curl -sS -o /dev/null -w '%{http_code}' --retry 3 \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/$TAG") || true
+          case "$status" in
+            404)
+              gh release create "$TAG" release/assets/* --target "$GITHUB_SHA" --title "hyperspace $TAG" --notes-file release/notes.md
+              ;;
+            200)
+              if [ "$REPLACE" != "true" ]; then
+                echo "::error::the release $TAG already exists (another run may have just published it) and its files are kept: to replace them, run this workflow manually with publish and replace_assets ticked"
+                exit 1
+              fi
+              gh release upload "$TAG" release/assets/* --clobber
+              ;;
+            *)
+              echo "::error::cannot tell whether $TAG has a release: GitHub answered HTTP $status (expected 200 or 404); nothing was published"
+              exit 1
+              ;;
+          esac
