@@ -20,8 +20,45 @@ jobs:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cargo-lock
+          path: Cargo.lock
+          retention-days: 1
       - run: cargo build --release --workspace
       - run: bash scripts/e2e.sh target/release
+      - name: Relay as a static musl binary
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release -p hyperspace-relay --target x86_64-unknown-linux-musl
+          file target/x86_64-unknown-linux-musl/release/hyperspace-relay
+          file target/x86_64-unknown-linux-musl/release/hyperspace-relay | grep -Eq 'statically linked|static-pie linked'
+      - name: Relay smoke test
+        run: |
+          RELAY=target/x86_64-unknown-linux-musl/release/hyperspace-relay
+          $RELAY --version
+          if $RELAY > relay.log 2>&1; then echo "started without --allow or --open"; exit 1; fi
+          $RELAY --open --listen 127.0.0.1:47800 > relay.log 2>&1 &
+          PID=$!
+          curl -fsS --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:47800/health
+          curl -fsS http://127.0.0.1:47800/
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:47800/nope)" = 404
+          kill $PID
+          echo "--- relay log"; cat relay.log
+      - name: Collect the Linux binaries
+        run: |
+          mkdir -p dist
+          cp target/release/hyperspace-host target/release/hyperspace-client dist/
+          cp target/x86_64-unknown-linux-musl/release/hyperspace-relay dist/
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: dist/
+          retention-days: 7
       - name: Find the host through the public lookup network (live internet)
         # Depends on the public BitTorrent DHT being reachable from the runner.
         continue-on-error: true

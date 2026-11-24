@@ -103,9 +103,35 @@ jobs:
           name: macos
           path: hyperspace-client-*.tar.gz
 
+  linux:
+    name: Relay (Linux x64, static)
+    needs: plan
+    if: needs.plan.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Build a static musl binary
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release -p hyperspace-relay --target x86_64-unknown-linux-musl
+          file target/x86_64-unknown-linux-musl/release/hyperspace-relay
+          file target/x86_64-unknown-linux-musl/release/hyperspace-relay | grep -Eq 'statically linked|static-pie linked'
+      - name: Package
+        run: |
+          mkdir dist
+          cp target/x86_64-unknown-linux-musl/release/hyperspace-relay README.md dist/
+          tar -czf "hyperspace-relay-linux-x64.tar.gz" -C dist .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: hyperspace-relay-*.tar.gz
+
   publish:
     name: Publish GitHub release
-    needs: [plan, windows, macos]
+    needs: [plan, windows, macos, linux]
     runs-on: ubuntu-latest
     env:
       TAG: ${{ needs.plan.outputs.tag }}
@@ -115,6 +141,11 @@ jobs:
         with:
           merge-multiple: true
           path: assets
+      - name: Checksums
+        run: |
+          (cd assets && sha256sum *) > SHA256SUMS.txt
+          mv SHA256SUMS.txt assets/
+          cat assets/SHA256SUMS.txt
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -133,7 +164,9 @@ jobs:
 
           Paste the pairing command the host printed (once), then connect from anywhere with \`./hyperspace-client\`.
 
-          Host and client must be the same version. See the README for options, shortcuts and limitations.
+          **Relay** (optional, only for networks that block UDP): \`hyperspace-relay-linux-x64.tar.gz\` is a static Linux x64 binary to run behind a TLS reverse proxy.
+
+          Host and client must be the same version. See the README for options, shortcuts and limitations. \`SHA256SUMS.txt\` lists the checksum of every file.
           NOTES
           sed -i 's/^          //' notes.md
           if gh release view "$TAG" >/dev/null 2>&1; then

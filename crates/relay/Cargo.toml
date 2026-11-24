@@ -1,0 +1,26 @@
+[package]
+name = "hyperspace-relay"
+version.workspace = true
+edition.workspace = true
+description = "Relay for hyperspace hosts and clients that cannot reach each other over UDP"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "hyperspace-relay"
+path = "src/main.rs"
+
+[dependencies]
+hyperspace-proto = { path = "../proto" }
+# No TLS here: TLS ends at the reverse proxy in front of the relay. Keeping
+# the default features off also keeps tracing, serde and the extractors we
+# do not use out of the binary.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
+# Plain ws:// only (default features: connect + handshake, no TLS).
+tokio-tungstenite = "0.29"
