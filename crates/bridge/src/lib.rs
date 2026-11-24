@@ -84,6 +84,14 @@ impl RelayedPeers {
     }
 }
 
+/// An error's message for a log line: without the " (os error N)" std adds
+/// to I/O errors, whose number differs from one OS to the next for the same
+/// failure, and with OpenSSL's error entries cut down to their reason.
+/// Everything else is kept as it is.
+pub fn plain_error(e: &dyn std::fmt::Display) -> String {
+    errors::plain(e)
+}
+
 /// Checks that a relay answers at `url`: DNS, TCP, TLS (for `wss://`), the
 /// WebSocket upgrade and the relay's challenge. It closes without
 /// authenticating, so it needs no key. Returns one line saying what worked,

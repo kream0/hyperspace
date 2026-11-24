@@ -2,13 +2,14 @@
 //! transport and the client be exercised on any OS without a capture stack.
 
 use crate::pipeline::{Config, Control, Sink, StreamInfo, StreamRequest};
+use hyperspace_bridge::plain_error;
 use hyperspace_proto::{annexb, clock::now_us};
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 pub fn run(cfg: &Config, path: &Path, req: StreamRequest, ctl: &Control, sink: &dyn Sink) -> Result<(), String> {
-    let data = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let data = std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path.display(), plain_error(&e)))?;
     let codec = annexb::sniff_codec(&data).ok_or("file is not an H.264/HEVC Annex B elementary stream")?;
     if let Some(forced) = cfg.codec {
         if forced != codec {

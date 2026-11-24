@@ -8,6 +8,7 @@
 //!   paired client still finds the host after its home IP address changes.
 
 use crate::server::{PROBE_SEEN, PROBE_TOKEN, PT_PROBE, SHUTDOWN};
+use hyperspace_bridge::plain_error;
 use hyperspace_proto::pairing::{format_addr, is_behind_nat, is_relay_entry, Pairing};
 use hyperspace_proto::secure::Key;
 use hyperspace_proto::{log, rendezvous};
@@ -215,7 +216,7 @@ impl Reach {
             }
         }
         if let Err(e) = pairing.save(&path) {
-            log!("cannot write {}: {e}", path.display());
+            log!("cannot write {}: {}", path.display(), plain_error(&e));
         }
         if first {
             log!("pair a client once with:");

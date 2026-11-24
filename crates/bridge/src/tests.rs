@@ -18,8 +18,10 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::MaybeTlsStream;
 
+use crate::client::Refusals;
 use crate::errors::{self, UNTRUSTED};
-use crate::link::{self, secs, Backoff, Timing};
+use crate::host::Takeovers;
+use crate::link::{self, jitter, secs, spread, Backoff, Timing};
 use crate::queue;
 use crate::{check, ClientBridge, HostBridge, LinkStats, RelayUrl, RelayedPeers, Status};
 
@@ -889,6 +891,98 @@ fn the_client_reconnects_fast_then_every_5_s() {
     b.reset();
     let d = b.next();
     assert!(about(d, 250), "{d:?}");
+}
+
+#[test]
+fn jitter_stays_within_20_percent_and_above_zero() {
+    let mut waits = vec![Duration::from_millis(1)];
+    for t in [Timing::host(), Timing::client(), fast()] {
+        waits.extend([t.backoff_min, t.backoff_max, t.refused_wait, t.refused_wait * 10]);
+    }
+    for d in waits {
+        // Whole milliseconds: 0.8 and 1.2 times them are whole nanoseconds.
+        let (low, high) = (d * 4 / 5, d * 6 / 5);
+        assert_eq!(spread(d, 0), low, "{d:?}");
+        assert_eq!(spread(d, u16::MAX), high, "{d:?}");
+        let mut last = Duration::ZERO;
+        for r in 0..=u16::MAX {
+            let got = spread(d, r);
+            assert!(got >= low && got <= high && got >= last, "{d:?} with {r}: {got:?}");
+            last = got;
+        }
+        assert!(spread(d, 0x8000) >= d && spread(d, 0x7fff) <= d, "{d:?}");
+        for _ in 0..100 {
+            let got = jitter(d);
+            assert!(got >= low && got <= high, "{d:?}: {got:?}");
+        }
+    }
+    // Even the shortest wait does not round down to none.
+    for r in [0, 0x8000, u16::MAX] {
+        assert_eq!(spread(Duration::from_nanos(1), r), Duration::from_nanos(1));
+    }
+    assert_eq!(spread(Duration::ZERO, u16::MAX), Duration::ZERO);
+}
+
+#[test]
+fn a_host_replaced_three_times_in_a_row_waits_ten_times_longer() {
+    let t = Timing::host();
+    let mut takeovers = Takeovers::default();
+    // About 60 s twice, then about 600 s, saying so once.
+    for (ms, said) in [(60_000, false), (60_000, false), (600_000, true), (600_000, false), (600_000, false)] {
+        let (d, shared_key) = takeovers.wait(&t, Duration::ZERO);
+        assert!(about(d, ms) && shared_key == said, "{d:?} {shared_key}: expected about {ms} ms, {said}");
+    }
+    // A link lost any other way ends the series.
+    takeovers.clear();
+    for (ms, said) in [(60_000, false), (60_000, false), (600_000, true)] {
+        let (d, shared_key) = takeovers.wait(&t, Duration::ZERO);
+        assert!(about(d, ms) && shared_key == said, "{d:?} {shared_key}: expected about {ms} ms, {said}");
+    }
+}
+
+#[test]
+fn a_replaced_host_never_comes_back_sooner_than_its_backoff() {
+    let t = Timing { refused_wait: Duration::from_secs(1), ..Timing::host() };
+    let floor = Duration::from_secs(30);
+    let mut takeovers = Takeovers::default();
+    assert_eq!(takeovers.wait(&t, floor), (floor, false));
+    assert_eq!(takeovers.wait(&t, floor), (floor, false));
+    // 10 times 1 s is still less than the backoff.
+    assert_eq!(takeovers.wait(&t, floor), (floor, true));
+    let (d, _) = takeovers.wait(&t, Duration::from_millis(1));
+    assert!(about(d, 10_000), "{d:?}");
+}
+
+#[test]
+fn a_client_retries_five_passing_refusals_with_the_backoff_then_slowly() {
+    let t = Timing::client();
+    let mut backoff = Backoff::new(&t);
+    let mut refusals = Refusals::default();
+    let passing = [refused::TIMEOUT, refused::ROOM_FULL, refused::RELAY_FULL, refused::TIMEOUT, refused::ROOM_FULL];
+    for (reason, ms) in passing.into_iter().zip([250, 500, 1000, 2000, 4000]) {
+        let d = refusals.wait(reason, &t, &mut backoff);
+        assert!(about(d, ms), "refusal {reason}: {d:?} is not about {ms} ms");
+    }
+    for reason in [refused::RELAY_FULL, refused::TIMEOUT, refused::ROOM_FULL] {
+        let d = refusals.wait(reason, &t, &mut backoff);
+        assert!(about(d, 60_000), "refusal {reason}: {d:?} is not about 60 s");
+    }
+    // A link, a busy relay or an unreachable one ends the series.
+    refusals.clear();
+    for _ in 0..5 {
+        let d = refusals.wait(refused::ROOM_FULL, &t, &mut backoff);
+        assert!(about(d, 5000), "{d:?} is not about 5 s");
+    }
+    let d = refusals.wait(refused::ROOM_FULL, &t, &mut backoff);
+    assert!(about(d, 60_000), "{d:?} is not about 60 s");
+    // Refusals that do not go away by themselves wait long from the first,
+    // and end the series too.
+    for reason in [refused::NOT_ALLOWED, refused::PROTOCOL, refused::BAD_SIGNATURE, refused::VERSION_MISMATCH, 99] {
+        let d = refusals.wait(reason, &t, &mut backoff);
+        assert!(about(d, 60_000), "refusal {reason}: {d:?} is not about 60 s");
+    }
+    let d = refusals.wait(refused::TIMEOUT, &t, &mut backoff);
+    assert!(about(d, 5000), "{d:?} is not about 5 s");
 }
 
 #[test]

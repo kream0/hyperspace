@@ -18,7 +18,7 @@ use hyperspace_proto::input::InputReceiver;
 use hyperspace_proto::pairing::is_local;
 use hyperspace_proto::secure::{self, Responder, DATA_OVERHEAD, PT_DATA, PT_INIT};
 use hyperspace_proto::wire::{self, bye, pt, Hello, Packet, FLAG_KEYFRAME, FRAG_HEADER_LEN};
-use hyperspace_bridge::RelayedPeers;
+use hyperspace_bridge::{plain_error, RelayedPeers};
 use hyperspace_proto::{annexb, log, Codec};
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -327,15 +327,26 @@ pub fn bind_socket(bind: Option<SocketAddr>, port: u16) -> std::io::Result<UdpSo
 }
 
 /// Whether a client at `from` is across the internet. One through the relay
-/// is, though its datagrams come from a loopback socket of the relay bridge.
-fn is_wan(relayed: &RelayedPeers, from: SocketAddr) -> bool {
-    !is_local(from.ip()) || relayed.contains(from)
+/// (`relayed`: `from` is one of [`RelayedPeers`]) is, though its datagrams
+/// come from a loopback socket of the relay bridge.
+fn is_wan(from: SocketAddr, relayed: bool) -> bool {
+    relayed || !is_local(from.ip())
+}
+
+/// The session's client, so far across the internet or not (`was_wan`),
+/// moved to `from`: the line saying so, and the new value of `wan` if the
+/// move took it between the local network and the internet.
+fn roamed(from: SocketAddr, relayed: bool, was_wan: bool) -> (String, Option<bool>) {
+    let via = if relayed { " (through the relay)" } else { "" };
+    let wan = is_wan(from, relayed);
+    (format!("client moved to {}{via}", pretty(from)), (wan != was_wan).then_some(wan))
 }
 
 impl Server {
     pub fn new(cfg: Config) -> Result<Server, String> {
-        let sock = bind_socket(cfg.bind, cfg.port).map_err(|e| format!("cannot bind UDP port {}: {e}", cfg.port))?;
-        sock.set_read_timeout(Some(Duration::from_millis(20))).map_err(|e| e.to_string())?;
+        let sock =
+            bind_socket(cfg.bind, cfg.port).map_err(|e| format!("cannot bind UDP port {}: {}", cfg.port, plain_error(&e)))?;
+        sock.set_read_timeout(Some(Duration::from_millis(20))).map_err(|e| plain_error(&e))?;
         Ok(Server {
             cfg,
             sock: Arc::new(sock),
@@ -367,7 +378,7 @@ impl Server {
                 Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => {}
                 // Windows reports ICMP port-unreachable for earlier sends as a recv error.
                 Err(e) if e.kind() == ErrorKind::ConnectionReset => {}
-                Err(e) => return Err(format!("socket error: {e}")),
+                Err(e) => return Err(format!("socket error: {}", plain_error(&e))),
             }
             if SHUTDOWN.load(Ordering::Relaxed) {
                 log!("shutting down");
@@ -434,11 +445,10 @@ impl Server {
             if s.shared.secure.open(buf, &mut plain).is_some() {
                 if s.shared.addr() != from {
                     // Authenticated packets from a new address: the client moved networks.
-                    let via = if self.relayed.contains(from) { " (through the relay)" } else { "" };
-                    log!("client moved to {}{via}", pretty(from));
+                    let (moved, flipped) = roamed(from, self.relayed.contains(from), s.wan);
+                    log!("{moved}");
                     *s.shared.addr.write().unwrap() = from;
-                    let wan = is_wan(&self.relayed, from);
-                    if wan != s.wan {
+                    if let Some(wan) = flipped {
                         // The packet size and the start bitrate were set for
                         // the old path. The size cannot change mid-session (the
                         // client reassembles with it) and the relay carries
@@ -527,7 +537,7 @@ impl Server {
         }
         let h = p.hello;
         let relayed = self.relayed.contains(from);
-        let wan = is_wan(&self.relayed, from);
+        let wan = is_wan(from, relayed);
         let mut datagram = self.cfg.packet_size;
         if wan {
             datagram = datagram.min(wire::WAN_DATAGRAM);
@@ -539,7 +549,7 @@ impl Server {
         let dump = self.cfg.dump.as_ref().and_then(|p| match std::fs::File::create(p) {
             Ok(f) => Some(f),
             Err(e) => {
-                log!("cannot create dump file {}: {e}", p.display());
+                log!("cannot create dump file {}: {}", p.display(), plain_error(&e));
                 None
             }
         });
@@ -697,12 +707,42 @@ mod tests {
 
     #[test]
     fn a_client_is_on_the_internet_unless_its_address_is_local() {
-        let none = RelayedPeers::new();
         for a in ["192.0.2.7:45800", "[2001:db8::7]:45800", "[::ffff:192.0.2.7]:45800"] {
-            assert!(is_wan(&none, a.parse().unwrap()), "{a}");
+            assert!(is_wan(a.parse().unwrap(), false), "{a}");
+            assert!(is_wan(a.parse().unwrap(), true), "{a}");
         }
         for a in ["127.0.0.1:50000", "192.168.1.20:45800", "10.0.0.2:45800", "[::1]:50000", "[fe80::1]:45800", "[::ffff:192.168.1.20]:45800"] {
-            assert!(!is_wan(&none, a.parse().unwrap()), "{a}");
+            assert!(!is_wan(a.parse().unwrap(), false), "{a}");
         }
+        // Through the relay, from a loopback socket of the relay bridge.
+        for a in ["127.0.0.1:50000", "[::1]:50000", "[::ffff:127.0.0.1]:50000"] {
+            assert!(is_wan(a.parse().unwrap(), true), "{a}");
+        }
+    }
+
+    #[test]
+    fn a_client_that_moves_to_or_from_the_relay_changes_path() {
+        let at = |a: &str| -> SocketAddr { a.parse().unwrap() };
+        let line = |a: &str| a.to_string();
+        // From the local network to the relay, and back.
+        assert_eq!(
+            roamed(at("127.0.0.1:50000"), true, false),
+            (line("client moved to 127.0.0.1:50000 (through the relay)"), Some(true))
+        );
+        assert_eq!(roamed(at("192.168.1.20:45801"), false, true), (line("client moved to 192.168.1.20:45801"), Some(false)));
+        // From the internet to the relay, or to a new socket of the relay
+        // bridge after a new relay link: still across the internet.
+        assert_eq!(
+            roamed(at("[::ffff:127.0.0.1]:50001"), true, true),
+            (line("client moved to 127.0.0.1:50001 (through the relay)"), None)
+        );
+        // From the relay to a direct path across the internet.
+        assert_eq!(roamed(at("192.0.2.7:45800"), false, true), (line("client moved to 192.0.2.7:45800"), None));
+        // Directly, from the local network to the internet and between two
+        // local addresses.
+        assert_eq!(roamed(at("[2001:db8::7]:45800"), false, false).1, Some(true));
+        assert_eq!(roamed(at("10.0.0.2:45800"), false, false).1, None);
+        // A loopback address that is not one of the relay bridge's is local.
+        assert_eq!(roamed(at("127.0.0.1:50002"), false, true).1, Some(false));
     }
 }

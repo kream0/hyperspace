@@ -9,7 +9,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use hyperspace_proto::log;
@@ -332,18 +332,49 @@ enum End {
     Fatal(String),
 }
 
+/// Refusals in a row that usually clear up soon (TIMEOUT, ROOM_FULL,
+/// RELAY_FULL): a seat the relay has not freed yet (a link cut without its
+/// noticing) or a slow moment.
+#[derive(Default)]
+pub(crate) struct Refusals(u32);
+
+impl Refusals {
+    /// How long to wait after the relay refused with `reason`: the backoff
+    /// for the first [`QUICK_RETRIES`] such refusals in a row, about
+    /// `refused_wait` after more of them and after any other reason
+    /// (NOT_ALLOWED, PROTOCOL, BAD_SIGNATURE, VERSION_MISMATCH and reasons
+    /// this program does not know do not go away by themselves). Another
+    /// reason also ends the series.
+    pub(crate) fn wait(&mut self, reason: u8, t: &Timing, backoff: &mut Backoff) -> Duration {
+        if matches!(reason, refused::TIMEOUT | refused::ROOM_FULL | refused::RELAY_FULL) {
+            self.0 = self.0.saturating_add(1);
+            if self.0 <= QUICK_RETRIES {
+                return backoff.next();
+            }
+        } else {
+            self.0 = 0;
+        }
+        jitter(t.refused_wait)
+    }
+
+    /// Anything but a refusal (a link, a busy relay, an unreachable one)
+    /// ends the series.
+    pub(crate) fn clear(&mut self) {
+        self.0 = 0;
+    }
+}
+
 async fn run(url: RelayUrl, room: RoomKey, sock: UdpSocket, shared: Arc<Shared>, t: Timing) {
     let mut local = Local { sock, app: None, buf: vec![0u8; 64 * 1024] };
     let mut backoff = Backoff::new(&t);
     // Whether the host was online when the last link ended.
     let mut host_online = false;
     let mut first = true;
-    // Refusals in a row that usually clear up soon.
-    let mut soon = 0;
+    let mut refusals = Refusals::default();
     loop {
         let attempt = draining(link::connect(&url, &room, Role::Client), &mut local, &shared).await;
-        if !matches!(attempt, Err(Failure::Refused(refused::TIMEOUT | refused::ROOM_FULL | refused::RELAY_FULL))) {
-            soon = 0;
+        if !matches!(attempt, Err(Failure::Refused(_))) {
+            refusals.clear();
         }
         let wait = match attempt {
             Ok(ws) => {
@@ -388,23 +419,7 @@ async fn run(url: RelayUrl, room: RoomKey, sock: UdpSocket, shared: Arc<Shared>,
             }
             Err(Failure::Refused(reason)) => {
                 shared.set(Status::Refused(reason));
-                match reason {
-                    // A seat the relay has not freed yet (a link cut without
-                    // its noticing) or a slow moment: soon gone, unless it
-                    // keeps coming back.
-                    refused::TIMEOUT | refused::ROOM_FULL | refused::RELAY_FULL => {
-                        soon += 1;
-                        if soon < QUICK_RETRIES {
-                            backoff.next()
-                        } else {
-                            jitter(t.refused_wait)
-                        }
-                    }
-                    // NOT_ALLOWED, PROTOCOL, BAD_SIGNATURE, VERSION_MISMATCH
-                    // and reasons this program does not know: not gone by
-                    // themselves.
-                    _ => jitter(t.refused_wait),
-                }
+                refusals.wait(reason, &t, &mut backoff)
             }
             Err(Failure::Busy) => {
                 shared.set(Status::RelayBusy);

@@ -117,9 +117,17 @@ impl Backoff {
 pub fn jitter(d: Duration) -> Duration {
     let mut b = [0u8; 2];
     let r = if getrandom::fill(&mut b).is_ok() { u16::from_le_bytes(b) } else { 0x8000 };
-    // 0.8 .. 1.2
-    let factor = 0.8 + 0.4 * (f64::from(r) / f64::from(u16::MAX));
-    d.mul_f64(factor)
+    spread(d, r)
+}
+
+/// `d` times a factor that goes from 0.8 (`r` = 0) to 1.2 (`r` = 65535),
+/// rounded to the nanosecond. In integers, so that the bounds are exact.
+pub(crate) fn spread(d: Duration, r: u16) -> Duration {
+    const STEPS: u128 = u16::MAX as u128;
+    let den = 5 * STEPS;
+    let nanos = (d.as_nanos() * (4 * STEPS + 2 * u128::from(r)) + den / 2) / den;
+    let secs = u64::try_from(nanos / 1_000_000_000).unwrap_or(u64::MAX);
+    Duration::new(secs, (nanos % 1_000_000_000) as u32)
 }
 
 /// Why a link could not be set up.

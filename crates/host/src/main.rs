@@ -14,7 +14,7 @@ mod yuv;
 use hyperspace_proto::{log, wire, Codec, DEFAULT_PORT};
 use pipeline::{Config, EncoderPref, SourceKind};
 use hyperspace_proto::pairing::{config_dir, Pairing};
-use hyperspace_bridge::{HostBridge, RelayUrl};
+use hyperspace_bridge::{plain_error, HostBridge, RelayUrl};
 use hyperspace_proto::relay::RoomKey;
 use hyperspace_proto::secure::Key;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -237,7 +237,7 @@ fn load_key(extra: &Extra) -> Result<Key, String> {
     let key = Key::generate();
     Pairing { key: key.clone(), addrs: Vec::new() }
         .save(&path)
-        .map_err(|e| format!("cannot store the pairing key in {}: {e}", path.display()))?;
+        .map_err(|e| format!("cannot store the pairing key in {}: {}", path.display(), plain_error(&e)))?;
     log!("generated a new pairing key ({})", path.display());
     Ok(key)
 }
@@ -270,7 +270,11 @@ fn relay_setting(extra: &Extra) -> Option<RelayUrl> {
             let saved = std::fs::create_dir_all(&extra.config_dir).and_then(|_| std::fs::write(&path, format!("{url}\n")));
             match saved {
                 Ok(()) => log!("relay setting saved to {} (--relay off removes it)", path.display()),
-                Err(e) => log!("cannot save the relay setting to {}: {e}; using it for this run only", path.display()),
+                Err(e) => log!(
+                    "cannot save the relay setting to {}: {}; using it for this run only",
+                    path.display(),
+                    plain_error(&e)
+                ),
             }
             Some(url.clone())
         }
@@ -278,7 +282,7 @@ fn relay_setting(extra: &Extra) -> Option<RelayUrl> {
             match std::fs::remove_file(&path) {
                 Ok(()) => log!("relay setting removed: clients connect over UDP only"),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => log!("cannot remove {}: {e}; not using a relay for this run", path.display()),
+                Err(e) => log!("cannot remove {}: {}; not using a relay for this run", path.display(), plain_error(&e)),
             }
             None
         }
@@ -293,7 +297,7 @@ fn relay_setting(extra: &Extra) -> Option<RelayUrl> {
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
-                log!("cannot read {}: {e}; not using a relay", path.display());
+                log!("cannot read {}: {}; not using a relay", path.display(), plain_error(&e));
                 None
             }
         },
@@ -313,19 +317,25 @@ fn relay_target(local: SocketAddr) -> SocketAddr {
     }
 }
 
+/// Binds the server's socket, then takes the relay setting: a run that fails
+/// to start saves nothing.
+fn start_server(cfg: &Config, extra: &Extra) -> Result<(server::Server, Option<RelayUrl>), String> {
+    let server = server::Server::new(cfg.clone())?;
+    log!(
+        "hyperspace-host {} listening on udp {}",
+        env!("CARGO_PKG_VERSION"),
+        server.local_addr().map(|a| a.to_string()).unwrap_or_else(|| cfg.port.to_string())
+    );
+    let relay = relay_setting(extra);
+    Ok((server, relay))
+}
+
 fn serve(mut cfg: Config, extra: Extra) -> Result<(), String> {
     #[cfg(windows)]
     win::process_setup();
     cfg.key = load_key(&extra)?;
-    let mut server = server::Server::new(cfg.clone())?;
+    let (mut server, relay) = start_server(&cfg, &extra)?;
     let local = server.local_addr();
-    log!(
-        "hyperspace-host {} listening on udp {}",
-        env!("CARGO_PKG_VERSION"),
-        local.map(|a| a.to_string()).unwrap_or_else(|| cfg.port.to_string())
-    );
-    // Only once the server is up: a run that fails to start saves nothing.
-    let relay = relay_setting(&extra);
     // Kept until the server stops: dropping it closes the relay link.
     let mut bridge = None;
     if let Some(url) = &relay {
@@ -424,7 +434,8 @@ fn self_test(cfg: Config, frames: u32) -> Result<(), String> {
     win::process_setup();
     let sink = Arc::new(TestSink::default());
     if let Some(p) = &cfg.dump {
-        *sink.dump.lock().unwrap() = Some(std::fs::File::create(p).map_err(|e| format!("{}: {e}", p.display()))?);
+        *sink.dump.lock().unwrap() =
+            Some(std::fs::File::create(p).map_err(|e| format!("{}: {}", p.display(), plain_error(&e)))?);
     }
     let ctl = Arc::new(Control::default());
     let req = StreamRequest { codecs: wire::CODEC_MASK_ALL, fps: 60, bitrate_kbps: 0, wan: false };
@@ -475,10 +486,54 @@ mod tests {
         Extra { upnp: false, dht: false, public_host: None, new_key: false, config_dir: dir.to_path_buf(), relay }
     }
 
+    /// A directory of this test's own, not created yet.
+    fn temp_dir(test: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        std::env::temp_dir().join(format!("hyperspace-host-{test}-{}-{nanos}", std::process::id()))
+    }
+
+    fn listening_on(bind: SocketAddr) -> Config {
+        Config {
+            bind: Some(bind),
+            port: bind.port(),
+            key: Key::generate(),
+            source: SourceKind::Desktop,
+            display: usize::MAX,
+            codec: None,
+            encoder: EncoderPref::Auto,
+            bitrate_kbps: 0,
+            max_fps: 0,
+            packet_size: wire::DEFAULT_DATAGRAM,
+            dump: None,
+            once: false,
+            view_only: false,
+            file_size: (1280, 720),
+        }
+    }
+
+    #[test]
+    fn a_host_that_cannot_bind_saves_no_relay_setting() {
+        let dir = temp_dir("bind");
+        let file = dir.join("relay.txt");
+        let url = RelayUrl::parse("wss://relay.example").unwrap();
+        let taken = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = taken.local_addr().unwrap();
+        let e = start_server(&listening_on(addr), &extra(&dir, RelayArg::Set(url.clone()))).err().expect("the port is taken");
+        assert!(e.starts_with(&format!("cannot bind UDP port {}: ", addr.port())), "{e}");
+        assert!(!e.contains("os error"), "{e}");
+        assert!(!file.exists(), "{e}");
+        // The same run on a free port saves it.
+        let (server, relay) = start_server(&listening_on("127.0.0.1:0".parse().unwrap()), &extra(&dir, RelayArg::Set(url))).unwrap();
+        assert!(server.local_addr().is_some_and(|a| a.port() != 0));
+        assert_eq!(relay.map(|u| u.to_string()).as_deref(), Some("wss://relay.example/v1"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "wss://relay.example/v1\n");
+        drop((server, taken));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_relay_setting_is_kept_until_turned_off() {
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-        let dir = std::env::temp_dir().join(format!("hyperspace-host-test-{}-{nanos}", std::process::id()));
+        let dir = temp_dir("setting");
         let file = dir.join("relay.txt");
         let url = RelayUrl::parse("wss://relay.example").unwrap();
         let setting = |relay: RelayArg| relay_setting(&extra(&dir, relay)).map(|u| u.to_string());

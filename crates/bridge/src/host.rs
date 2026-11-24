@@ -7,7 +7,7 @@ use std::io;
 use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use hyperspace_proto::log;
@@ -104,12 +104,34 @@ impl End {
     }
 }
 
+/// Links in a row that ended with another host taking the room.
+#[derive(Default)]
+pub(crate) struct Takeovers(u32);
+
+impl Takeovers {
+    /// After one more link that another host took: how long to wait, and
+    /// whether to say that two hosts share the key (once, at the
+    /// [`REPLACED_LIMIT`]th in a row). About `refused_wait`, ten times that
+    /// from the [`REPLACED_LIMIT`]th on, so that two hosts with one key do not
+    /// take the room from each other forever; and never less than `floor`,
+    /// the wait after any other lost link.
+    pub(crate) fn wait(&mut self, t: &Timing, floor: Duration) -> (Duration, bool) {
+        self.0 = self.0.saturating_add(1);
+        let pause = if self.0 < REPLACED_LIMIT { t.refused_wait } else { t.refused_wait * 10 };
+        (jitter(pause).max(floor), self.0 == REPLACED_LIMIT)
+    }
+
+    /// A link that ended any other way ends the series.
+    pub(crate) fn clear(&mut self) {
+        self.0 = 0;
+    }
+}
+
 async fn run(url: RelayUrl, room: RoomKey, target: SocketAddr, peers: RelayedPeers, t: Timing) {
     let mut backoff = Backoff::new(&t);
     let mut quiet = Quiet::default();
     let wait_secs = t.refused_wait.as_secs();
-    // Links in a row that ended with another host taking the room.
-    let mut replaced = 0;
+    let mut takeovers = Takeovers::default();
     loop {
         let wait = match link::connect(&url, &room, Role::Host).await {
             Ok(ws) => {
@@ -121,22 +143,15 @@ async fn run(url: RelayUrl, room: RoomKey, target: SocketAddr, peers: RelayedPee
                 if lived >= t.stable {
                     backoff.reset();
                 }
-                // Backs off at length when replaced, so that two hosts with
-                // one key do not take the room from each other forever, and
-                // never sooner than after any other lost link.
-                let wait = match end {
-                    End::Replaced => {
-                        replaced += 1;
-                        let pause = if replaced < REPLACED_LIMIT { t.refused_wait } else { t.refused_wait * 10 };
-                        jitter(pause).max(backoff.next())
-                    }
+                let (wait, shared_key) = match end {
+                    End::Replaced => takeovers.wait(&t, backoff.next()),
                     End::Lost(_) => {
-                        replaced = 0;
-                        backoff.next()
+                        takeovers.clear();
+                        (backoff.next(), false)
                     }
                 };
                 log!("relay link closed after {}: {}; reconnecting in {}", secs(lived), end.why(), secs(wait));
-                if replaced == REPLACED_LIMIT {
+                if shared_key {
                     log!("relay: another host with the same key is using this relay: stop one of them");
                 }
                 wait
