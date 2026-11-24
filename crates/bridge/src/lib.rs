@@ -18,6 +18,7 @@
 //!   were the host's.
 
 mod client;
+mod errors;
 mod host;
 mod link;
 mod queue;

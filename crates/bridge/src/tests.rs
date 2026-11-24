@@ -16,6 +16,7 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::MaybeTlsStream;
 
+use crate::errors::{self, UNTRUSTED};
 use crate::link::{self, secs, Backoff, Timing};
 use crate::queue;
 use crate::{check, ClientBridge, HostBridge, LinkStats, RelayUrl, RelayedPeers, Status};
@@ -561,6 +562,9 @@ fn close_frames_are_told_apart() {
     assert!(link::is_closed_by_host(&frame(1000, "closed by the host")));
     assert!(!link::is_closed_by_host(&frame(hyperspace_proto::relay::close::REPLACED, "replaced")));
     assert!(!link::is_closed_by_host(&frame(1008, "refused")));
+    // A normal close from anything else (a proxy, say) is a lost link.
+    assert!(!link::is_closed_by_host(&frame(1000, "")));
+    assert!(!link::is_closed_by_host(&frame(1000, "bye")));
     assert!(!link::is_closed_by_host(&None));
     assert_eq!(link::close_text(&frame(1008, "")), " (code 1008)");
     assert_eq!(link::close_text(&frame(1008, "bad\nline")), " (code 1008: bad?line)");
@@ -725,4 +729,123 @@ fn durations_read_well() {
     assert_eq!(secs(Duration::from_millis(600)), "0.6 s");
     assert_eq!(secs(Duration::from_millis(1500)), "1.5 s");
     assert_eq!(secs(Duration::ZERO), "0 s");
+}
+
+/// What native-tls's OpenSSL backend (Linux) prints for a verify failure:
+/// the error stack, then the verify result in parentheses.
+fn openssl(verify: &str, code: u32) -> (String, String) {
+    let display = format!(
+        "error:0A000086:SSL routines:tls_post_process_server_certificate:certificate verify failed:\
+         ../ssl/statem/statem_clnt.c:1889: ({verify})"
+    );
+    let debug = format!(
+        "Ssl(Error {{ code: ErrorCode(1), cause: Some(Ssl(ErrorStack([Error {{ code: 167772294, library: \
+         \"SSL routines\", function: \"tls_post_process_server_certificate\", reason: \"certificate verify \
+         failed\", file: \"../ssl/statem/statem_clnt.c\", line: 1889 }}]))) }}, X509VerifyResult {{ code: \
+         {code}, error: \"{verify}\" }})"
+    );
+    (display, debug)
+}
+
+/// macOS (Security framework): Display is the message alone, in the user's
+/// language; the number is only in Debug.
+fn macos(code: i32, message: &str) -> (String, String) {
+    (message.to_string(), format!("Error {{ code: {code}, message: {message:?} }}"))
+}
+
+/// Windows (SChannel): std's io::Error, with a translated message.
+fn windows(hresult: u32, message: &str) -> (String, String) {
+    let code = hresult as i32;
+    (format!("{message} (os error {code})"), format!("Os {{ code: {code}, kind: Uncategorized, message: {message:?} }}"))
+}
+
+fn tls_line(error: (String, String)) -> String {
+    let line = errors::tls_error("relay.example", &error.0, &error.1);
+    for raw in ["routines", ".c:", "error:0", "ssl", "SSL", "Error {", "os error"] {
+        assert!(!line.contains(raw), "{line:?} contains {raw:?}");
+    }
+    line
+}
+
+#[test]
+fn tls_failures_read_the_same_on_every_os() {
+    let name = "the relay's certificate is not valid for relay.example";
+    let expired = "the relay's certificate has expired";
+
+    // Linux, OpenSSL 3 (the hostname case is a line seen on a real run).
+    assert_eq!(tls_line(openssl("hostname mismatch", 62)), name);
+    assert_eq!(tls_line(openssl("IP address mismatch", 64)), name);
+    assert_eq!(tls_line(openssl("certificate has expired", 10)), expired);
+    assert_eq!(tls_line(openssl("unable to get local issuer certificate", 20)), UNTRUSTED);
+    assert_eq!(tls_line(openssl("self-signed certificate", 18)), UNTRUSTED);
+    assert_eq!(tls_line(openssl("self-signed certificate in certificate chain", 19)), UNTRUSTED);
+    // OpenSSL 1.1 spells it without the hyphen.
+    assert_eq!(tls_line(openssl("self signed certificate", 18)), UNTRUSTED);
+
+    // macOS, with messages in French: only the numbers count.
+    assert_eq!(tls_line(macos(-67602, "Le nom d'hôte ne correspond pas.")), name);
+    assert_eq!(tls_line(macos(-67818, "Un certificat expiré a été détecté.")), expired);
+    assert_eq!(tls_line(macos(-67843, "Le certificat n'était pas fiable.")), UNTRUSTED);
+    assert_eq!(tls_line(macos(-9807, "chaîne de certificats non valide")), UNTRUSTED);
+
+    // Windows, in French as well.
+    assert_eq!(tls_line(windows(0x800B_010F, "Le nom CN du certificat ne correspond pas.")), name);
+    assert_eq!(tls_line(windows(0x8009_0322, "Le nom principal cible est incorrect.")), name);
+    assert_eq!(tls_line(windows(0x800B_0101, "Le certificat a expiré.")), expired);
+    assert_eq!(tls_line(windows(0x800B_0109, "Une chaîne de certificats ... non approuvée.")), UNTRUSTED);
+    assert_eq!(tls_line(windows(0x8009_0325, "La chaîne de certificats n'est pas approuvée.")), UNTRUSTED);
+}
+
+#[test]
+fn other_tls_failures_keep_a_short_detail() {
+    let failed = "secure connection to relay.example failed";
+    // Linux: the verify result, or OpenSSL's reason without its codes and paths.
+    assert_eq!(tls_line(openssl("certificate is not yet valid", 9)), format!("{failed} (certificate is not yet valid)"));
+    let wrong = "error:0A00010B:SSL routines::wrong version number:../ssl/record/ssl3_record.c:354:".to_string();
+    assert_eq!(tls_line((wrong.clone(), wrong)), format!("{failed} (wrong version number)"));
+    let reset = "Connection reset by peer (os error 104)".to_string();
+    assert_eq!(errors::tls_error("relay.example", &reset, &reset), format!("{failed} (Connection reset by peer (os error 104))"));
+    // macOS and Windows: the number, since their messages are translated.
+    assert_eq!(tls_line(macos(-9800, "erreur de protocole SSL")), format!("{failed} (error -9800)"));
+    assert_eq!(tls_line(windows(0x8009_0326, "Le message reçu était inattendu.")), format!("{failed} (error 0x80090326)"));
+    // Nothing usable: no detail at all.
+    let odd = "error:0A000126:SSL routines::unexpected eof:../ssl/x.c:1:, func_name(): /path/x".to_string();
+    assert_eq!(tls_line((odd.clone(), String::new())), failed);
+}
+
+#[test]
+fn openssl_text_is_cut_to_its_reason() {
+    assert_eq!(
+        errors::clean(
+            "error:0A000086:SSL routines:tls_post_process_server_certificate:certificate verify failed:\
+             ../ssl/statem/statem_clnt.c:1889: (hostname mismatch)"
+        ),
+        "certificate verify failed (hostname mismatch)"
+    );
+    assert_eq!(
+        errors::clean("error:0A000126:SSL routines::unexpected eof while reading:../ssl/record/rec_layer_s3.c:303:"),
+        "unexpected eof while reading"
+    );
+    assert_eq!(
+        errors::clean("error:0A000126:SSL routines::a:../x.c:1:, error:0A000127:SSL routines::b:../y.c:2:data"),
+        "a, b"
+    );
+    // Not OpenSSL: kept as it is.
+    for text in ["IO error: Connection reset by peer (os error 104)", "error: something", "network error:"] {
+        assert_eq!(errors::clean(text), text);
+    }
+}
+
+#[test]
+fn a_connect_failure_names_the_address_only_for_a_host_name() {
+    let addr: SocketAddr = "192.0.2.7:443".parse().unwrap();
+    assert_eq!(
+        errors::connect_error("relay.example", 443, &addr, "timed out"),
+        "cannot connect to relay.example port 443 (192.0.2.7): timed out"
+    );
+    let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    assert_eq!(
+        errors::connect_error("127.0.0.1", 9, &addr, "connection refused"),
+        "cannot connect to 127.0.0.1 port 9: connection refused"
+    );
 }

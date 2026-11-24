@@ -13,6 +13,7 @@ use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{self, Bytes, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+use crate::errors;
 use crate::queue::Rx;
 use crate::url::RelayUrl;
 
@@ -161,21 +162,23 @@ pub async fn open(url: &RelayUrl) -> Result<Ws, Failure> {
                 tcp = Some(s);
                 break;
             }
-            Ok(Err(e)) => last = format!("cannot connect to {host} port {port} ({}): {e}", addr.ip()),
-            Err(_) => last = format!("cannot connect to {host} port {port} ({}): timed out", addr.ip()),
+            Ok(Err(e)) => last = errors::connect_error(host, port, addr, &e.to_string()),
+            Err(_) => last = errors::connect_error(host, port, addr, "timed out"),
         }
     }
     let Some(tcp) = tcp else { return Err(last.into()) };
     let _ = tcp.set_nodelay(true);
 
     let stream = if url.tls() {
-        let connector = tokio_native_tls::native_tls::TlsConnector::new()
-            .map_err(|e| format!("cannot set up TLS on this machine: {e}"))?;
+        let connector = tokio_native_tls::native_tls::TlsConnector::new().map_err(|e| {
+            let detail = errors::detail(&e.to_string(), &format!("{e:?}"));
+            format!("cannot set up secure connections on this computer{detail}")
+        })?;
         let connector = tokio_native_tls::TlsConnector::from(connector);
         match timeout(CONNECT_TIMEOUT, connector.connect(host, tcp)).await {
             Ok(Ok(tls)) => MaybeTlsStream::NativeTls(tls),
-            Ok(Err(e)) => return Err(format!("TLS handshake with {host} failed: {e}").into()),
-            Err(_) => return Err(format!("TLS handshake with {host} timed out").into()),
+            Ok(Err(e)) => return Err(errors::tls_error(host, &e.to_string(), &format!("{e:?}")).into()),
+            Err(_) => return Err(format!("secure connection to {host} timed out").into()),
         }
     } else {
         MaybeTlsStream::Plain(tcp)
@@ -190,7 +193,7 @@ pub async fn open(url: &RelayUrl) -> Result<Ws, Failure> {
             response.status()
         )
         .into()),
-        Ok(Err(e)) => Err(format!("WebSocket upgrade with {host} failed: {e}").into()),
+        Ok(Err(e)) => Err(format!("WebSocket upgrade with {host} failed: {}", errors::clean(&e.to_string())).into()),
         Err(_) => Err(format!("WebSocket upgrade with {host} timed out").into()),
     }
 }
@@ -204,9 +207,13 @@ pub fn read_error(e: &tungstenite::Error) -> String {
         tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => {
             "the relay closed the connection".into()
         }
-        tungstenite::Error::Io(e) => format!("network error: {e}"),
-        e => format!("connection to the relay failed: {e}"),
+        tungstenite::Error::Io(e) => format!("network error: {}", errors::clean(&e.to_string())),
+        e => format!("connection to the relay failed: {}", errors::clean(&e.to_string())),
     }
+}
+
+fn write_error(e: &tungstenite::Error) -> String {
+    format!("cannot write to the relay: {}", errors::clean(&e.to_string()))
 }
 
 /// The next binary message; pings, pongs and text are skipped.
@@ -242,7 +249,7 @@ pub async fn connect(url: &RelayUrl, room: &RoomKey, role: Role) -> Result<Ws, F
         let hello = Msg::Hello(room.hello(role, &nonce)).encode();
         ws.send(Message::binary(hello))
             .await
-            .map_err(|e| Failure::Unreachable(format!("cannot write to the relay: {e}")))?;
+            .map_err(|e| Failure::Unreachable(write_error(&e)))?;
         let answer = next_binary(&mut ws).await.map_err(Failure::Unreachable)?;
         match Msg::decode(&answer) {
             Some(Msg::Ok) => Ok(()),
@@ -285,7 +292,7 @@ pub async fn writer(mut sink: SplitSink<Ws, Message>, rx: Rx, ping: Duration) ->
         };
         match timeout(WRITE_TIMEOUT, batch).await {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => return format!("cannot write to the relay: {e}"),
+            Ok(Err(e)) => return write_error(&e),
             Err(_) => return format!("the relay took no data for {} s", WRITE_TIMEOUT.as_secs()),
         }
     }
@@ -310,10 +317,12 @@ pub fn is_replaced(frame: &Option<CloseFrame>) -> bool {
     matches!(frame, Some(f) if u16::from(f.code) == relay::close::REPLACED)
 }
 
-/// True if the close frame says the host let this client go (1000, sent to
-/// clients only).
+/// True if the close frame says the host let this client go (1000 "closed by
+/// the host", sent to clients only). Another normal close, from a proxy say,
+/// is a lost link.
 pub fn is_closed_by_host(frame: &Option<CloseFrame>) -> bool {
-    matches!(frame, Some(f) if u16::from(f.code) == relay::close::CLOSED_BY_HOST)
+    matches!(frame, Some(f) if u16::from(f.code) == relay::close::CLOSED_BY_HOST
+        && f.reason.as_str() == relay::close::CLOSED_BY_HOST_REASON)
 }
 
 /// Errors on a UDP socket that do not mean the socket is broken: an ICMP

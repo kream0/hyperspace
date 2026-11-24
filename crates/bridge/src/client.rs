@@ -236,7 +236,8 @@ impl ClientBridge {
     /// handshake. It does not rise when the bridge's own link was cut and
     /// came back to a host that was online before the cut, so the session
     /// carries on. A host that restarted or was replaced during such a cut
-    /// goes unnoticed here: the session's own timeout has to catch it.
+    /// goes unnoticed here: it drops the old session's datagrams, so the
+    /// client relies on its existing silence timeout, which re-handshakes.
     pub fn hosts_seen(&self) -> u64 {
         self.shared.hosts_seen.load(Ordering::Relaxed)
     }
