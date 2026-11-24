@@ -142,4 +142,5 @@ crates/host     session server; Windows capture → convert → encode → injec
 crates/client   session loop; macOS window, VideoToolbox, Metal, input capture
 ```
 
-Releases are built by GitHub Actions when a `v*` tag is pushed.
+Releases are built and published by GitHub Actions: bump `version` in the
+root `Cargo.toml` and push the default branch (or push a `v*` tag).
