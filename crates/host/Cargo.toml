@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 hyperspace-proto = { path = "../proto" }
+hyperspace-bridge = { path = "../bridge" }
 socket2 = "0.6"
 igd-next = { version = "0.18", features = ["ipv6"] }
 if-addrs = "0.15"

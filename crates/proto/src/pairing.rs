@@ -4,6 +4,11 @@
 //! Format: `hs1.<key>.<addr>/<port>,<addr>/<port>,...` where each address is
 //! an IPv4/IPv6 literal or a DNS name. It contains only characters that
 //! shells leave alone.
+//!
+//! A host that also takes clients through a relay adds one last entry,
+//! `relay=<ws:// or wss:// URL>`. Older clients do not know it: for them it is
+//! an address that does not parse ([`resolve_addr`] returns nothing), so they
+//! skip it. It is never published to the DHT.
 
 use crate::secure::Key;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
@@ -40,6 +45,34 @@ pub fn split_host_port(s: &str, default_port: u16) -> Option<(String, u16)> {
     }
 }
 
+/// Prefix of the address entry that names a relay.
+pub const RELAY_PREFIX: &str = "relay=";
+
+/// True for a `relay=...` entry (valid or not): never a UDP address.
+pub fn is_relay_entry(entry: &str) -> bool {
+    entry.starts_with(RELAY_PREFIX)
+}
+
+/// Checks that `url` can be carried by a pairing string, and that clients that
+/// predate relays cannot mistake the entry for an address: a `ws://` or
+/// `wss://` URL of visible ASCII characters without ',' and whose last path
+/// segment is not a bare number (which would read as `host/port`).
+pub fn check_relay_url(url: &str) -> Result<(), String> {
+    let lower = url.to_ascii_lowercase();
+    if !lower.starts_with("wss://") && !lower.starts_with("ws://") {
+        return Err(format!("the relay address must start with wss:// (or ws://), not {url:?}"));
+    }
+    if let Some(c) = url.chars().find(|c| !c.is_ascii_graphic() || *c == ',') {
+        return Err(format!("the relay address cannot contain {c:?}"));
+    }
+    if let Some((_, last)) = url.rsplit_once('/') {
+        if !last.is_empty() && last.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!("the relay address cannot end in a number after '/' ({url})"));
+        }
+    }
+    Ok(())
+}
+
 /// Resolve one entry to socket addresses (DNS names may yield several).
 pub fn resolve_addr(entry: &str, default_port: u16) -> Vec<SocketAddr> {
     let Some((host, port)) = split_host_port(entry, default_port) else { return Vec::new() };
@@ -62,6 +95,34 @@ impl Pairing {
         let key = Key::decode(parts.next()?)?;
         let addrs = parts.next().unwrap_or("").split(',').filter(|a| !a.is_empty()).map(str::to_string).collect();
         Some(Pairing { key, addrs })
+    }
+
+    /// The relay this host can also be reached through, if the pairing names
+    /// one (the first valid `relay=` entry).
+    pub fn relay(&self) -> Option<String> {
+        self.addrs
+            .iter()
+            .filter_map(|a| a.strip_prefix(RELAY_PREFIX))
+            .find(|url| check_relay_url(url).is_ok())
+            .map(str::to_string)
+    }
+
+    /// The UDP address entries, without the relay entry.
+    pub fn addresses(&self) -> impl Iterator<Item = &str> {
+        self.addrs.iter().map(String::as_str).filter(|a| !is_relay_entry(a))
+    }
+
+    /// Replaces the relay entry (`None` removes it). The entry goes last, so
+    /// that older clients try every real address first.
+    pub fn set_relay(&mut self, url: Option<&str>) -> Result<(), String> {
+        if let Some(url) = url {
+            check_relay_url(url)?;
+        }
+        self.addrs.retain(|a| !is_relay_entry(a));
+        if let Some(url) = url {
+            self.addrs.push(format!("{RELAY_PREFIX}{url}"));
+        }
+        Ok(())
     }
 
     pub fn looks_like(s: &str) -> bool {
@@ -164,6 +225,61 @@ mod tests {
         assert_eq!(split_host_port("", d), None);
         assert_eq!(resolve_addr("2a01::5/7", d), vec!["[2a01::5]:7".parse().unwrap()]);
         assert_eq!(format_addr(&"[::ffff:10.0.0.1]:9".parse().unwrap()), "10.0.0.1/9");
+    }
+
+    #[test]
+    fn relay_entry() {
+        let mut p = Pairing { key: Key::generate(), addrs: vec!["192.0.2.10/45800".into(), "2001:db8::5/45800".into()] };
+        p.set_relay(Some("wss://relay.example/v1")).unwrap();
+        assert_eq!(p.addrs.last().map(String::as_str), Some("relay=wss://relay.example/v1"));
+        let s = p.encode();
+        assert!(s.chars().all(|c| c.is_ascii_alphanumeric() || "._-/:,=".contains(c)), "{s}");
+        let back = Pairing::parse(&s).unwrap();
+        assert_eq!(back, p);
+        assert_eq!(back.relay().as_deref(), Some("wss://relay.example/v1"));
+        assert_eq!(back.addresses().collect::<Vec<_>>(), ["192.0.2.10/45800", "2001:db8::5/45800"]);
+
+        // replacing keeps a single entry, still last; None removes it
+        p.set_relay(Some("ws://relay.example:8080/v1")).unwrap();
+        assert_eq!(p.addrs.iter().filter(|a| is_relay_entry(a)).count(), 1);
+        assert_eq!(p.relay().as_deref(), Some("ws://relay.example:8080/v1"));
+        p.set_relay(None).unwrap();
+        assert_eq!(p.relay(), None);
+        assert_eq!(p.addrs, ["192.0.2.10/45800", "2001:db8::5/45800"]);
+
+        // what a pairing string cannot carry
+        for bad in ["https://relay.example/v1", "wss://relay.example/a,b", "wss://relay.example/a b", "wss://relay.example/7", ""] {
+            assert!(check_relay_url(bad).is_err(), "{bad:?}");
+            assert!(p.set_relay(Some(bad)).is_err(), "{bad:?}");
+        }
+        assert_eq!(p.relay(), None);
+        // an invalid entry someone typed by hand is not a relay
+        let odd = Pairing { key: Key::generate(), addrs: vec!["relay=ftp://relay.example".into()] };
+        assert_eq!(odd.relay(), None);
+        assert_eq!(odd.addresses().count(), 0);
+    }
+
+    /// A client that predates relays resolves every entry with resolve_addr:
+    /// the relay entry must give it nothing (and no DNS query).
+    #[test]
+    fn old_clients_ignore_the_relay_entry() {
+        let d = 45800;
+        for url in [
+            "wss://relay.example",
+            "wss://relay.example/",
+            "wss://relay.example/v1",
+            "wss://relay.example:8443",
+            "wss://relay.example:8443/v1",
+            "ws://relay.example/hyperspace/v1",
+        ] {
+            let entry = format!("{RELAY_PREFIX}{url}");
+            assert_eq!(split_host_port(&entry, d), None, "{entry}");
+            assert!(resolve_addr(&entry, d).is_empty(), "{entry}");
+        }
+        let s = format!("hs1.{}.192.0.2.10/45800,relay=wss://relay.example/v1", Key::generate().encode());
+        let p = Pairing::parse(&s).unwrap();
+        let resolved: Vec<SocketAddr> = p.addrs.iter().flat_map(|a| resolve_addr(a, d)).collect();
+        assert_eq!(resolved, vec!["192.0.2.10:45800".parse::<SocketAddr>().unwrap()]);
     }
 
     #[test]

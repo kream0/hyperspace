@@ -8,7 +8,7 @@
 //!   paired client still finds the host after its home IP address changes.
 
 use crate::server::{PROBE_SEEN, PROBE_TOKEN, PT_PROBE, SHUTDOWN};
-use hyperspace_proto::pairing::{format_addr, is_behind_nat, Pairing};
+use hyperspace_proto::pairing::{format_addr, is_behind_nat, is_relay_entry, Pairing};
 use hyperspace_proto::secure::Key;
 use hyperspace_proto::{log, rendezvous};
 use igd_next::{PortMappingProtocol, SearchOptions};
@@ -25,6 +25,9 @@ pub struct Options {
     /// DNS name (optionally `name:port`) that always points at this host.
     pub public_host: Option<String>,
     pub config_dir: PathBuf,
+    /// Relay URL this host also takes clients through: added last to the
+    /// pairing string, never published to the DHT.
+    pub relay: Option<String>,
 }
 
 const LEASE_SECS: u32 = 3600;
@@ -195,7 +198,7 @@ impl Reach {
     }
 
     fn pairing(&self, addrs: &[String]) -> Pairing {
-        Pairing { key: self.opts.key.clone(), addrs: addrs.to_vec() }
+        pairing_for(&self.opts.key, addrs, self.opts.relay.as_deref())
     }
 
     fn announce(&mut self, first: bool) {
@@ -207,6 +210,9 @@ impl Reach {
         let path = self.opts.config_dir.join("pairing.txt");
         if first {
             self.explain();
+            if let Some(url) = &self.opts.relay {
+                log!("clients that cannot reach these addresses connect through the relay at {url}");
+            }
         }
         if let Err(e) = pairing.save(&path) {
             log!("cannot write {}: {e}", path.display());
@@ -300,7 +306,7 @@ impl Reach {
         if self.last_addrs.is_empty() {
             return false;
         }
-        match rendezvous::publish(dht, &self.opts.key, &self.last_addrs, rendezvous::unix_time()) {
+        match rendezvous::publish(dht, &self.opts.key, &dht_addrs(&self.last_addrs), rendezvous::unix_time()) {
             Ok(()) => true,
             Err(e) => {
                 log!("could not publish this host's address for roaming clients: {e}");
@@ -308,6 +314,21 @@ impl Reach {
             }
         }
     }
+}
+
+/// The pairing string for `addrs`, with the relay entry (if any) last so
+/// that clients try every direct address first.
+fn pairing_for(key: &Key, addrs: &[String], relay: Option<&str>) -> Pairing {
+    let mut pairing = Pairing { key: key.clone(), addrs: dht_addrs(addrs) };
+    if let Err(e) = pairing.set_relay(relay) {
+        log!("the relay is left out of the pairing string: {e}");
+    }
+    pairing
+}
+
+/// What may go into the DHT: addresses only, never the relay entry.
+fn dht_addrs(addrs: &[String]) -> Vec<String> {
+    addrs.iter().filter(|a| !is_relay_entry(a)).cloned().collect()
 }
 
 /// Run until shutdown. Never fails: every step is best-effort.
@@ -381,5 +402,25 @@ pub fn run(opts: Options) {
     }
     if let Some(m) = reach.mapping.as_mut() {
         m.remove();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_entry_goes_last_and_never_to_the_dht() {
+        let key = Key::generate();
+        let addrs = vec!["192.0.2.10/45800".to_string(), "2001:db8::5/45800".to_string()];
+        let p = pairing_for(&key, &addrs, Some("wss://relay.example/v1"));
+        assert_eq!(p.addrs.last().map(String::as_str), Some("relay=wss://relay.example/v1"));
+        assert_eq!(p.relay().as_deref(), Some("wss://relay.example/v1"));
+        assert_eq!(p.addresses().collect::<Vec<_>>(), ["192.0.2.10/45800", "2001:db8::5/45800"]);
+        assert_eq!(Pairing::parse(&p.encode()), Some(p.clone()));
+        assert_eq!(dht_addrs(&p.addrs), addrs);
+        assert_eq!(pairing_for(&key, &addrs, None).addrs, addrs);
+        // a relay alone still makes a usable pairing string
+        assert_eq!(pairing_for(&key, &[], Some("wss://relay.example/v1")).addrs, ["relay=wss://relay.example/v1"]);
     }
 }

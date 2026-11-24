@@ -14,8 +14,10 @@ mod yuv;
 use hyperspace_proto::{log, wire, Codec, DEFAULT_PORT};
 use pipeline::{Config, EncoderPref, SourceKind};
 use hyperspace_proto::pairing::{config_dir, Pairing};
+use hyperspace_bridge::{HostBridge, RelayUrl};
+use hyperspace_proto::relay::RoomKey;
 use hyperspace_proto::secure::Key;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 
 const HELP: &str = "\
@@ -33,6 +35,13 @@ OPTIONS:
     --no-dht              Do not publish this host's address for roaming clients
     --new-key             Replace the pairing key (every client must pair again)
     --config-dir <DIR>    Where the key and pairing string are kept
+    --relay <URL|off>     Also take clients through the relay at URL (wss://...), for
+                          clients that cannot reach this PC over UDP; remembered until
+                          --relay off
+    --relay-id            Print this host's relay id (the relay's operator adds it to the
+                          relay's allow list), then exit
+    --relay-check <URL>   Check that a relay answers at URL (DNS, TCP, TLS, WebSocket),
+                          then exit
     --display <N>         Display to capture, see --list [default: primary]
     --codec <h264|hevc>   Force a codec [default: hevc if both sides support it]
     --encoder <auto|hw|sw>  Encoder selection [default: auto = hardware, else software]
@@ -54,6 +63,16 @@ enum Mode {
     Serve,
     List,
     SelfTest(u32),
+    RelayId,
+    RelayCheck(String),
+}
+
+/// What `--relay` asked for.
+enum RelayArg {
+    /// No flag: use the saved setting, if any.
+    Unset,
+    Off,
+    Set(RelayUrl),
 }
 
 struct Extra {
@@ -62,10 +81,18 @@ struct Extra {
     public_host: Option<String>,
     new_key: bool,
     config_dir: PathBuf,
+    relay: RelayArg,
 }
 
 fn parse_args() -> Result<(Config, Mode, Extra), String> {
-    let mut extra = Extra { upnp: true, dht: true, public_host: None, new_key: false, config_dir: config_dir() };
+    let mut extra = Extra {
+        upnp: true,
+        dht: true,
+        public_host: None,
+        new_key: false,
+        config_dir: config_dir(),
+        relay: RelayArg::Unset,
+    };
     let mut cfg = Config {
         bind: None,
         port: DEFAULT_PORT,
@@ -111,6 +138,16 @@ fn parse_args() -> Result<(Config, Mode, Extra), String> {
             "--no-dht" => extra.dht = false,
             "--new-key" => extra.new_key = true,
             "--config-dir" => extra.config_dir = val("--config-dir")?.into(),
+            "--relay" => {
+                let v = val("--relay")?;
+                extra.relay = if v.eq_ignore_ascii_case("off") {
+                    RelayArg::Off
+                } else {
+                    RelayArg::Set(RelayUrl::parse(&v).map_err(|e| format!("invalid --relay: {e}"))?)
+                };
+            }
+            "--relay-id" => mode = Mode::RelayId,
+            "--relay-check" => mode = Mode::RelayCheck(val("--relay-check")?),
             "--display" => cfg.display = val("--display")?.parse().map_err(|_| "invalid --display")?,
             "--codec" => {
                 cfg.codec = Some(match val("--codec")?.as_str() {
@@ -180,6 +217,8 @@ fn main() {
         Mode::Serve => serve(cfg, extra),
         Mode::List => list(),
         Mode::SelfTest(n) => self_test(cfg, n),
+        Mode::RelayId => relay_id(&extra),
+        Mode::RelayCheck(url) => relay_check(&url),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
@@ -203,16 +242,99 @@ fn load_key(extra: &Extra) -> Result<Key, String> {
     Ok(key)
 }
 
+/// `--relay-check`: needs no key and touches no file.
+fn relay_check(url: &str) -> Result<(), String> {
+    let line = hyperspace_bridge::check(url)?;
+    println!("{line}");
+    Ok(())
+}
+
+/// `--relay-id`: the id the relay's operator adds to its allow list. It is
+/// derived from the pairing key but does not reveal it.
+fn relay_id(extra: &Extra) -> Result<(), String> {
+    if extra.new_key {
+        return Err("--relay-id cannot be combined with --new-key".into());
+    }
+    let key = load_key(extra)?;
+    println!("{}", RoomKey::derive(&key).id().hex());
+    eprintln!("(give this relay id to the operator of the relay; it changes only with --new-key)");
+    Ok(())
+}
+
+/// The relay to use: from `--relay` (and saved for the next runs), else the
+/// saved setting. There is no default relay.
+fn relay_setting(extra: &Extra) -> Option<RelayUrl> {
+    let path = extra.config_dir.join("relay.txt");
+    match &extra.relay {
+        RelayArg::Set(url) => {
+            let saved = std::fs::create_dir_all(&extra.config_dir).and_then(|_| std::fs::write(&path, format!("{url}\n")));
+            match saved {
+                Ok(()) => log!("relay setting saved to {} (--relay off removes it)", path.display()),
+                Err(e) => log!("cannot save the relay setting to {}: {e}; using it for this run only", path.display()),
+            }
+            Some(url.clone())
+        }
+        RelayArg::Off => {
+            match std::fs::remove_file(&path) {
+                Ok(()) => log!("relay setting removed: clients connect over UDP only"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => log!("cannot remove {}: {e}; not using a relay for this run", path.display()),
+            }
+            None
+        }
+        RelayArg::Unset => match std::fs::read_to_string(&path) {
+            Ok(text) if text.trim().is_empty() => None,
+            Ok(text) => match RelayUrl::parse(text.trim()) {
+                Ok(url) => Some(url),
+                Err(e) => {
+                    log!("ignoring the relay setting in {}: {e}", path.display());
+                    None
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                log!("cannot read {}: {e}; not using a relay", path.display());
+                None
+            }
+        },
+    }
+}
+
+/// Where the relay bridge sends its clients' datagrams: the server's own
+/// address, or loopback when the server listens on every address.
+fn relay_target(local: SocketAddr) -> SocketAddr {
+    let port = local.port();
+    let can_bind = |ip: IpAddr| std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok();
+    match local.ip() {
+        ip if !ip.is_unspecified() => local,
+        // A dual-stack socket takes both; ::1 also reaches a v6-only one.
+        IpAddr::V6(_) if can_bind(Ipv6Addr::LOCALHOST.into()) => SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
+        _ => SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+    }
+}
+
 fn serve(mut cfg: Config, extra: Extra) -> Result<(), String> {
     #[cfg(windows)]
     win::process_setup();
     cfg.key = load_key(&extra)?;
+    let relay = relay_setting(&extra);
     let mut server = server::Server::new(cfg.clone())?;
+    let local = server.local_addr();
     log!(
         "hyperspace-host {} listening on udp {}",
         env!("CARGO_PKG_VERSION"),
-        server.local_addr().map(|a| a.to_string()).unwrap_or_else(|| cfg.port.to_string())
+        local.map(|a| a.to_string()).unwrap_or_else(|| cfg.port.to_string())
     );
+    // Kept until the server stops: dropping it closes the relay link.
+    let mut bridge = None;
+    if let Some(url) = &relay {
+        log!("relay: {url} (relay id {})", RoomKey::derive(&cfg.key).id().hex());
+        let target = relay_target(local.unwrap_or_else(|| SocketAddr::from((Ipv4Addr::LOCALHOST, cfg.port))));
+        match HostBridge::start(&url.to_string(), &cfg.key, target, server.relayed_peers()) {
+            Ok(b) => bridge = Some(b),
+            Err(e) => log!("relay: cannot start the relay link: {e}"),
+        }
+    }
     let reach = {
         let opts = reach::Options {
             key: cfg.key.clone(),
@@ -221,12 +343,14 @@ fn serve(mut cfg: Config, extra: Extra) -> Result<(), String> {
             dht: extra.dht,
             public_host: extra.public_host,
             config_dir: extra.config_dir,
+            relay: relay.as_ref().map(|u| u.to_string()),
         };
         std::thread::Builder::new().name("reach".into()).spawn(move || reach::run(opts)).map_err(|e| e.to_string())?
     };
     let result = server.run();
     // Let the reach thread withdraw the router's port mapping.
     server::SHUTDOWN.store(true, std::sync::atomic::Ordering::Relaxed);
+    drop(bridge);
     let _ = reach.join();
     result
 }

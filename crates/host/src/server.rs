@@ -18,6 +18,7 @@ use hyperspace_proto::input::InputReceiver;
 use hyperspace_proto::pairing::is_local;
 use hyperspace_proto::secure::{self, Responder, DATA_OVERHEAD, PT_DATA, PT_INIT};
 use hyperspace_proto::wire::{self, bye, pt, Hello, Packet, FLAG_KEYFRAME, FRAG_HEADER_LEN};
+use hyperspace_bridge::RelayedPeers;
 use hyperspace_proto::{annexb, log, Codec};
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -293,6 +294,8 @@ pub struct Server {
     pending: Vec<Pending>,
     next_session_id: u32,
     plain: Vec<u8>,
+    /// Loopback addresses of clients that come through the relay.
+    relayed: RelayedPeers,
 }
 
 /// Bind the listening socket. With no explicit address this is one
@@ -324,7 +327,21 @@ impl Server {
     pub fn new(cfg: Config) -> Result<Server, String> {
         let sock = bind_socket(cfg.bind, cfg.port).map_err(|e| format!("cannot bind UDP port {}: {e}", cfg.port))?;
         sock.set_read_timeout(Some(Duration::from_millis(20))).map_err(|e| e.to_string())?;
-        Ok(Server { cfg, sock: Arc::new(sock), session: None, pending: Vec::new(), next_session_id: 1, plain: Vec::new() })
+        Ok(Server {
+            cfg,
+            sock: Arc::new(sock),
+            session: None,
+            pending: Vec::new(),
+            next_session_id: 1,
+            plain: Vec::new(),
+            relayed: RelayedPeers::new(),
+        })
+    }
+
+    /// The set the relay bridge fills with the addresses its clients come
+    /// from; the server treats those clients as being on the internet.
+    pub fn relayed_peers(&self) -> RelayedPeers {
+        self.relayed.clone()
     }
 
     pub fn local_addr(&self) -> Option<SocketAddr> {
@@ -408,7 +425,8 @@ impl Server {
             if s.shared.secure.open(buf, &mut plain).is_some() {
                 if s.shared.addr() != from {
                     // Authenticated packets from a new address: the client moved networks.
-                    log!("client moved to {}", pretty(from));
+                    let via = if self.relayed.contains(from) { " (through the relay)" } else { "" };
+                    log!("client moved to {}{via}", pretty(from));
                     *s.shared.addr.write().unwrap() = from;
                 }
                 self.on_packet(&plain);
@@ -485,7 +503,10 @@ impl Server {
             self.end_session(Some(bye::REPLACED));
         }
         let h = p.hello;
-        let wan = !is_local(from.ip());
+        // A client through the relay is on the internet, though its datagrams
+        // come from a loopback socket of the relay bridge.
+        let relayed = self.relayed.contains(from);
+        let wan = !is_local(from.ip()) || relayed;
         let mut datagram = self.cfg.packet_size;
         if wan {
             datagram = datagram.min(wire::WAN_DATAGRAM);
@@ -519,7 +540,13 @@ impl Server {
         log!(
             "client {} connected{} (fps {}, bitrate {}, codecs {:#b})",
             pretty(from),
-            if wan { " over the internet" } else { "" },
+            if relayed {
+                " through the relay"
+            } else if wan {
+                " over the internet"
+            } else {
+                ""
+            },
             if h.fps == 0 { "auto".to_string() } else { h.fps.to_string() },
             if h.bitrate_kbps == 0 { "auto".to_string() } else { format!("{} kbit/s", h.bitrate_kbps) },
             h.codecs
