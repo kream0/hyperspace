@@ -45,6 +45,9 @@ pub struct Options {
     pub bitrate_kbps: u32,
     pub codecs: u8,
     pub max_datagram: u16,
+    /// Testing: end the first session this long after it starts, without a
+    /// goodbye, as if it were lost (with a relay set, a new connect follows).
+    pub cut_first_session: Option<Duration>,
 }
 
 /// An established, encrypted path to the host.
@@ -541,15 +544,18 @@ impl Exit {
 
 /// Run until `stop` is set, the host goes away, or the socket fails. Sends BYE
 /// on the way out when the exit is ours. `keyframe_every_us` periodically asks
-/// the host for a keyframe (testing only).
+/// the host for a keyframe, and `cut_after` ends the session without a
+/// goodbye (testing only).
 fn receive_loop(
     conn: &Connection,
     input: &InputTx,
     stop: &AtomicBool,
     handler: &mut dyn Handler,
     keyframe_every_us: Option<u64>,
+    cut_after: Option<Duration>,
     mut relay: Option<&mut Relay>,
 ) -> Exit {
+    let cut_at = cut_after.map(|d| Instant::now() + d);
     let link = &*conn.link;
     let sock = &link.sock;
     let chunk = conn.welcome.chunk as usize;
@@ -709,6 +715,9 @@ fn receive_loop(
         if last_rx.elapsed() > HOST_TIMEOUT {
             break Exit::HostTimeout;
         }
+        if cut_at.is_some_and(|t| Instant::now() >= t) {
+            break Exit::Error("test: dropped the session without a goodbye (--test-reconnect)".into());
+        }
 
         if now - st_start >= 1_000_000 {
             let dt = (now - st_start) as f64 / 1e6;
@@ -812,9 +821,10 @@ pub fn run_sessions(
     on_connect: &mut dyn FnMut(&Connection),
 ) -> Exit {
     let mut wait = RETRY_FIRST;
+    let mut cut = opts.cut_first_session;
     loop {
         let began = Instant::now();
-        let exit = receive_loop(&conn, input, stop, handler, keyframe_every_us, relay.as_deref_mut());
+        let exit = receive_loop(&conn, input, stop, handler, keyframe_every_us, cut.take(), relay.as_deref_mut());
         if relay.is_none() || stop.load(Ordering::Relaxed) || !retryable(&exit) {
             if exit == Exit::Local && conn.relayed {
                 // The goodbyes are queued on the relay link: give it a moment

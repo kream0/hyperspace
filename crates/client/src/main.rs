@@ -41,6 +41,8 @@ OPTIONS:
     --frames <N>          Exit after N frames (testing)
     --test-input          Headless: send a few synthetic input events
     --test-keyframes      Headless: request a keyframe every 150 ms
+    --test-reconnect      End the first session 2 s in without a goodbye, then
+                          connect again (with a relay set; testing)
     -h, --help            Show this help
     -V, --version         Show version
 
@@ -73,6 +75,7 @@ pub struct Args {
     pub frames: Option<u64>,
     pub test_input: bool,
     pub test_keyframes: bool,
+    pub test_reconnect: bool,
     /// The relay to fall back on (canonical address), if any.
     pub relay: Option<String>,
     /// The relay entry of the saved pairing string, kept when it is updated.
@@ -100,6 +103,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         frames: None,
         test_input: false,
         test_keyframes: false,
+        test_reconnect: false,
         relay: None,
         pairing_relay: None,
     };
@@ -157,6 +161,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--frames" => a.frames = Some(val("--frames")?.parse().map_err(|_| "invalid --frames")?),
             "--test-input" => a.test_input = true,
             "--test-keyframes" => a.test_keyframes = true,
+            "--test-reconnect" => a.test_reconnect = true,
             "--relay" => relay_arg = relay::RelayArg::parse(&val("--relay")?)?,
             "--relay-check" => relay_check = Some(val("--relay-check")?),
             s if s.starts_with('-') => return Err(format!("unknown option '{s}' (try --help)")),
@@ -240,6 +245,7 @@ impl Args {
             bitrate_kbps: self.bitrate_kbps,
             codecs: self.codecs,
             max_datagram: self.max_datagram,
+            cut_first_session: self.test_reconnect.then_some(std::time::Duration::from_secs(2)),
         }
     }
 

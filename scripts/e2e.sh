@@ -123,7 +123,7 @@ if command -v python3 >/dev/null; then
   done
 fi
 
-# ---- Relay fallback: host and client each reach a relay on loopback (cases a-h).
+# ---- Relay fallback: host and client each reach a relay on loopback (cases a-k).
 # Port 47800 is left alone (the CI smoke test and a live relay use it).
 # Failures are collected, each with both logs, so one run shows them all.
 RELAY_PORT=47811
@@ -143,6 +143,18 @@ expect() { # file ERE what
 reject() { # file ERE what
   if grep -qE -- "$2" "$1"; then ERRS+="  $(basename "$1"): unexpected $3"$'\n'; fi
 }
+in_order() { # file what ERE...: each pattern on a line after the last one's
+  local f=$1 what=$2 at=0 n pat
+  shift 2
+  for pat in "$@"; do
+    n=$(tail -n +$((at + 1)) "$f" | grep -nE -m1 -- "$pat" | cut -d: -f1 || true)
+    if [ -z "$n" ]; then
+      ERRS+="  $(basename "$f"): $what: no \"$pat\" after line $at"$'\n'
+      return 0
+    fi
+    at=$((at + n))
+  done
+}
 end_case() { # name logs...
   local name=$1 f; shift
   for f in "$@"; do
@@ -158,23 +170,25 @@ end_case() { # name logs...
   ERRS=
 }
 stop_pid() { [ -n "${1:-}" ] || return 0; kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }
-start_relay() { # log port allow-file; retries the bind (after a kill -9, say)
+start_relay() { # log port allow-file [relay options]; retries the bind (after a kill -9, say)
+  local log=$1 port=$2 allow=$3
+  shift 3
   for _ in $(seq 20); do
-    "$BIN/hyperspace-relay" --listen "127.0.0.1:$2" --allow "$3" >"$1" 2>&1 &
+    "$BIN/hyperspace-relay" --listen "127.0.0.1:$port" --allow "$allow" "$@" >"$log" 2>&1 &
     RELAY_PID=$!
     for _ in $(seq 20); do
-      grep -q "listening on 127.0.0.1:$2" "$1" && return 0
+      grep -q "listening on 127.0.0.1:$port" "$log" && return 0
       kill -0 $RELAY_PID 2>/dev/null || break
       sleep 0.1
     done
     stop_pid $RELAY_PID
     sleep 0.3
   done
-  ERRS+="  $(basename "$1"): the relay did not start"$'\n'
+  ERRS+="  $(basename "$log"): the relay did not start"$'\n'
   return 1
 }
-start_rhost() { # name port: a host with the relay set, until its link is up
-  "$BIN/hyperspace-host" --file testdata/testsrc_720p.h264 --port "$2" --no-upnp --no-dht --relay "$RELAY" \
+start_rhost() { # name port [relay]: a host with the relay set, until its link is up
+  "$BIN/hyperspace-host" --file testdata/testsrc_720p.h264 --port "$2" --no-upnp --no-dht --relay "${3:-$RELAY}" \
     --config-dir "$RHOST" >"$LOGS/$1.host.log" 2>&1 &
   HOST_PID=$!
   for _ in $(seq 100); do grep -q "relay: connected to" "$LOGS/$1.host.log" && return 0; sleep 0.1; done
@@ -341,8 +355,92 @@ reject "$LOGS/relay-h.client.log" "starting a new relay link" "a new relay link"
 expect "$LOGS/relay-h2.host.log" "client .* connected through the relay" "the second session at the host"
 grep -h -E "relay|connecting again|authenticated" "$LOGS/relay-h.client.log" | grep -v "fps " || true
 stop_pid $HOST_PID
-stop_pid $RELAY_PID
 end_case relay-h "$LOGS/relay-h.client.log" "$LOGS/relay-h1.host.log" "$LOGS/relay-h2.host.log" "$LOGS/relay-f.relay.log"
+
+echo "=== relay-i (the direct path is cut mid-session: the client connects again, through a new relay link)"
+if command -v python3 >/dev/null; then
+  # The direct path runs through a forwarder (no loss), so it can be cut
+  # while the host, its relay link and its session stay up.
+  start_rhost relay-i 45975 || true
+  python3 scripts/lossy_relay.py 45977 45975 0 2>"$LOGS/relay-i.forward.log" &
+  FWD_PID=$!
+  rpair rc-i "hs1.$KEY.127.0.0.1/45977,relay=$RELAY/v1"
+  timeout 90 "$BIN/hyperspace-client" --headless --no-lookup --stats --frames 600 --config-dir "$LOGS/rc-i" >"$LOGS/relay-i.client.log" 2>&1 &
+  CLIENT_PID=$!
+  for _ in $(seq 150); do grep -q "connected directly" "$LOGS/relay-i.client.log" && break; sleep 0.1; done
+  sleep 1
+  stop_pid $FWD_PID
+  RC=0
+  wait $CLIENT_PID || RC=$?
+  [ $RC = 0 ] || ERRS+="  client exited with $RC"$'\n'
+  in_order "$LOGS/relay-i.client.log" "direct, then the relay" \
+    "relay link closed: the host answered directly" "connected directly at 127\.0\.0\.1:45977" \
+    "lost contact with the host; connecting again" "relay: connected to ws://127\.0\.0\.1:$RELAY_PORT" \
+    "authenticated with the host through the relay" "connected through the relay: [0-9]+x[0-9]+" "CLIENT OK"
+  reject "$LOGS/relay-i.client.log" "starting a new relay link" "a stopped relay link"
+  in_order "$LOGS/relay-i.host.log" "direct, then the relay" \
+    "client 127\.0\.0\.1:[0-9]+ connected \(fps" "client [^ ]+ connected through the relay"
+  grep -h -E "relay|directly|connecting again|authenticated" "$LOGS/relay-i.client.log" | grep -v "fps " || true
+  stop_pid $HOST_PID
+  end_case relay-i "$LOGS/relay-i.client.log" "$LOGS/relay-i.host.log" "$LOGS/relay-i.forward.log" "$LOGS/relay-f.relay.log"
+else
+  echo "skipped (no python3 for the forwarder)"
+fi
+
+echo "=== relay-j (the client drops its session: the live host takes a second handshake over the same link)"
+start_rhost relay-j 45978 || true
+rpair rc-j "hs1.$KEY.$DEAD,relay=$RELAY/v1"
+rclient 60 relay-j.client.log rc-j --stats --frames 360 --test-reconnect
+[ $RC = 0 ] || ERRS+="  client exited with $RC"$'\n'
+in_order "$LOGS/relay-j.client.log" "two sessions over one link" \
+  "authenticated with the host through the relay" \
+  "test: dropped the session without a goodbye \(--test-reconnect\); connecting again" \
+  "authenticated with the host through the relay" "CLIENT OK"
+expect "$LOGS/relay-j.client.log" "relay link: up [0-9]+ s, 0 reconnects, " "the same link at exit"
+reject "$LOGS/relay-j.client.log" "starting a new relay link|lost contact" "a new link or a lost session"
+# The second handshake comes from the same relayed address while the first
+# session is still live, and replaces it.
+pair=$(sed -nE '/new client .* replaces /{s/.*new client ([^ ]+) replaces ([^ ]+)$/\1 \2/p;q}' "$LOGS/relay-j.host.log")
+if [ -z "$pair" ]; then
+  ERRS+="  relay-j.host.log: missing the new session replacing the live one"$'\n'
+elif [ "${pair% *}" != "${pair#* }" ]; then
+  ERRS+="  relay-j.host.log: the second session came from another address ($pair)"$'\n'
+fi
+[ "$(grep -c "client .* connected through the relay" "$LOGS/relay-j.host.log")" -ge 2 ] \
+  || ERRS+="  relay-j.host.log: no second session at the host"$'\n'
+[ "$(grep -c "joined through the relay" "$LOGS/relay-j.host.log")" = 1 ] \
+  || ERRS+="  relay-j.host.log: the client did not stay on one relay link"$'\n'
+grep -h -E "relay|connecting again|authenticated" "$LOGS/relay-j.client.log" | grep -v "fps " || true
+grep -h -E "replaces|connected through" "$LOGS/relay-j.host.log" || true
+stop_pid $HOST_PID
+stop_pid $RELAY_PID
+end_case relay-j "$LOGS/relay-j.client.log" "$LOGS/relay-j.host.log" "$LOGS/relay-f.relay.log"
+
+echo "=== relay-k (the relay's room for this PC is full: say so, and retry with a growing wait)"
+start_relay "$LOGS/relay-k.relay.log" 47815 "$LOGS/relay.allow" --max-clients 1 || true
+start_rhost relay-k 45979 ws://127.0.0.1:47815 || true
+rpair rc-k1 "hs1.$KEY.$DEAD,relay=ws://127.0.0.1:47815/v1"
+rpair rc-k2 "hs1.$KEY.$DEAD,relay=ws://127.0.0.1:47815/v1"
+# The first client takes the room's one seat and keeps it past the second's run.
+timeout 60 "$BIN/hyperspace-client" --headless --no-lookup --frames 720 --config-dir "$LOGS/rc-k1" >"$LOGS/relay-k1.client.log" 2>&1 &
+CLIENT_PID=$!
+for _ in $(seq 150); do grep -q "connected through the relay" "$LOGS/relay-k1.client.log" && break; sleep 0.1; done
+rclient 30 relay-k2.client.log rc-k2 --frames 1 --connect-timeout 6
+[ $RC = 1 ] || ERRS+="  second client exited with $RC, expected 1"$'\n'
+expect "$LOGS/relay-k2.client.log" "relay ws://127\.0\.0\.1:47815/v1: the relay refused the connection: too many clients are already connected to this host through the relay\.$" "the room-full line"
+# Quick retries at 0.25, 0.5, 1, 2 s (and 4 s, then a minute): a handful in
+# 6 s, not one every few milliseconds.
+n=$(grep -c "refused client for room" "$LOGS/relay-k.relay.log" || true)
+[ "$n" -ge 3 ] && [ "$n" -le 8 ] || ERRS+="  relay-k.relay.log: $n refusals in 6 s, expected 3 to 8"$'\n'
+RC=0
+wait $CLIENT_PID || RC=$?
+[ $RC = 0 ] || ERRS+="  first client exited with $RC"$'\n'
+expect "$LOGS/relay-k1.client.log" "CLIENT OK" "CLIENT OK for the client in the seat"
+grep -h "relay ws" "$LOGS/relay-k2.client.log" || true
+echo "$n refusals"
+stop_pid $HOST_PID
+stop_pid $RELAY_PID
+end_case relay-k "$LOGS/relay-k1.client.log" "$LOGS/relay-k2.client.log" "$LOGS/relay-k.host.log" "$LOGS/relay-k.relay.log"
 
 if [ -n "$RELAY_FAILED" ]; then echo "FAILED relay cases:$RELAY_FAILED"; exit 1; fi
 echo "ALL E2E TESTS PASSED"
