@@ -4,6 +4,7 @@
 
 use hyperspace_bridge::{ClientBridge, LinkStats, RelayUrl, Status};
 use hyperspace_proto::log;
+use hyperspace_proto::pairing::{check_relay_url, Pairing, RELAY_PREFIX};
 use hyperspace_proto::relay::refused;
 use hyperspace_proto::secure::Key;
 use std::net::{SocketAddr, UdpSocket};
@@ -31,6 +32,18 @@ impl RelayArg {
             RelayUrl::parse(value).map(RelayArg::Set).map_err(|e| format!("invalid --relay: {e}"))
         }
     }
+}
+
+/// The pairing string's relay. `Pairing::relay` skips an entry that the
+/// pairing format rejects: say why in one line rather than drop it unseen.
+pub fn from_pairing(p: &Pairing) -> Option<String> {
+    let found = p.relay();
+    if found.is_none() {
+        if let Some(Err(why)) = p.addrs.iter().find_map(|a| a.strip_prefix(RELAY_PREFIX)).map(check_relay_url) {
+            log!("ignoring the relay in the pairing string: {why}");
+        }
+    }
+    found
 }
 
 /// The relay to use, in its canonical form: `--relay` (saved to `path`),
@@ -510,6 +523,17 @@ mod tests {
         r.stop();
         assert!(r.status().is_none());
         assert!(r.sock.is_none());
+    }
+
+    #[test]
+    fn a_pairings_bad_relay_entry_is_skipped() {
+        let key = Key::from_bytes([7; 32]);
+        let p = |addrs: &[&str]| Pairing { key: key.clone(), addrs: addrs.iter().map(|a| a.to_string()).collect() };
+        assert_eq!(from_pairing(&p(&["192.0.2.1/45800", "relay=ftp://relay.example"])), None);
+        assert_eq!(from_pairing(&p(&["relay="])), None);
+        assert_eq!(from_pairing(&p(&["192.0.2.1/45800"])), None);
+        let first_good = from_pairing(&p(&["relay=ftp://relay.example", "relay=wss://relay.example/v1"]));
+        assert_eq!(first_good.as_deref(), Some("wss://relay.example/v1"));
     }
 
     #[test]

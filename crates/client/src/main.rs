@@ -220,7 +220,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             }
         }
     }
-    a.pairing_relay = pairing.relay();
+    a.pairing_relay = relay::from_pairing(&pairing);
     a.relay = relay::setting(&relay_arg, &relay_path, a.pairing_relay.as_deref());
     if a.candidates.is_empty() && !a.lookup && a.relay.is_none() {
         return Err(format!("cannot resolve '{}'", pairing.addresses().collect::<Vec<_>>().join(", ")));

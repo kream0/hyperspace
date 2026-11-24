@@ -123,7 +123,7 @@ if command -v python3 >/dev/null; then
   done
 fi
 
-# ---- Relay fallback: host and client each reach a relay on loopback (cases a-g).
+# ---- Relay fallback: host and client each reach a relay on loopback (cases a-h).
 # Port 47800 is left alone (the CI smoke test and a live relay use it).
 # Failures are collected, each with both logs, so one run shows them all.
 RELAY_PORT=47811
@@ -220,8 +220,15 @@ expect "$LOGS/relay-b.client.log" "relay link closed: the host answered directly
 expect "$LOGS/relay-b.client.log" "connected directly at 127.0.0.1:45971" "the connected line"
 reject "$LOGS/relay-b.client.log" "authenticated with the host through the relay" "a relayed session"
 grep -h -E "authenticated|answered directly" "$LOGS/relay-b.client.log" || true
+# A relay entry this client cannot use: one line, then the direct path as usual.
+rpair rc-b2 "hs1.$KEY.127.0.0.1/45971,relay=ftp://relay.example"
+rclient 40 relay-b2.client.log rc-b2 --frames 30
+[ $RC = 0 ] || ERRS+="  client exited with $RC (bad relay entry)"$'\n'
+expect "$LOGS/relay-b2.client.log" "CLIENT OK" "CLIENT OK despite a bad relay entry"
+expect "$LOGS/relay-b2.client.log" "ignoring the relay in the pairing string: the relay address must start with wss://" "the bad relay entry's line"
+grep -h "ignoring the relay" "$LOGS/relay-b2.client.log" || true
 stop_pid $HOST_PID
-end_case relay-b "$LOGS/relay-b.client.log" "$LOGS/relay-a.host.log"
+end_case relay-b "$LOGS/relay-b.client.log" "$LOGS/relay-b2.client.log" "$LOGS/relay-a.host.log"
 
 echo "=== relay-c (the relay does not allow this PC: say who can fix it)"
 start_relay "$LOGS/relay-c.relay.log" 47812 "$LOGS/relay-empty.allow" || true
