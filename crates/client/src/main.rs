@@ -41,8 +41,6 @@ OPTIONS:
     --frames <N>          Exit after N frames (testing)
     --test-input          Headless: send a few synthetic input events
     --test-keyframes      Headless: request a keyframe every 150 ms
-    --test-reconnect      End the first session 2 s in without a goodbye, then
-                          connect again (with a relay set; testing)
     -h, --help            Show this help
     -V, --version         Show version
 
@@ -161,6 +159,8 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--frames" => a.frames = Some(val("--frames")?.parse().map_err(|_| "invalid --frames")?),
             "--test-input" => a.test_input = true,
             "--test-keyframes" => a.test_keyframes = true,
+            // Not in the help: e2e only. Ends the first session 2 s in
+            // without a goodbye, so the client connects again (with a relay).
             "--test-reconnect" => a.test_reconnect = true,
             "--relay" => relay_arg = relay::RelayArg::parse(&val("--relay")?)?,
             "--relay-check" => relay_check = Some(val("--relay-check")?),

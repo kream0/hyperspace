@@ -390,12 +390,15 @@ fi
 echo "=== relay-j (the client drops its session: the live host takes a second handshake over the same link)"
 start_rhost relay-j 45978 || true
 rpair rc-j "hs1.$KEY.$DEAD,relay=$RELAY/v1"
+# 360 frames: the first session is cut after 2 s (about 120 at 60 fps), so
+# CLIENT OK needs video on the second one too; the stats line after the
+# second handshake shows it arriving.
 rclient 60 relay-j.client.log rc-j --stats --frames 360 --test-reconnect
 [ $RC = 0 ] || ERRS+="  client exited with $RC"$'\n'
-in_order "$LOGS/relay-j.client.log" "two sessions over one link" \
-  "authenticated with the host through the relay" \
+in_order "$LOGS/relay-j.client.log" "two sessions over one link, video on both" \
+  "authenticated with the host through the relay" "\] [1-9][0-9]* fps  [0-9.]+ Mbit/s" \
   "test: dropped the session without a goodbye \(--test-reconnect\); connecting again" \
-  "authenticated with the host through the relay" "CLIENT OK"
+  "authenticated with the host through the relay" "\] [1-9][0-9]* fps  [0-9.]+ Mbit/s" "CLIENT OK"
 expect "$LOGS/relay-j.client.log" "relay link: up [0-9]+ s, 0 reconnects, " "the same link at exit"
 reject "$LOGS/relay-j.client.log" "starting a new relay link|lost contact" "a new link or a lost session"
 # The second handshake comes from the same relayed address while the first
@@ -410,8 +413,8 @@ fi
   || ERRS+="  relay-j.host.log: no second session at the host"$'\n'
 [ "$(grep -c "joined through the relay" "$LOGS/relay-j.host.log")" = 1 ] \
   || ERRS+="  relay-j.host.log: the client did not stay on one relay link"$'\n'
-grep -h -E "relay|connecting again|authenticated" "$LOGS/relay-j.client.log" | grep -v "fps " || true
-grep -h -E "replaces|connected through" "$LOGS/relay-j.host.log" || true
+grep -h -E "relay|connecting again|authenticated|frames \(" "$LOGS/relay-j.client.log" | grep -v "fps  " || true
+grep -h -E "replaces|connected through|session [0-9]+ ended" "$LOGS/relay-j.host.log" || true
 stop_pid $HOST_PID
 stop_pid $RELAY_PID
 end_case relay-j "$LOGS/relay-j.client.log" "$LOGS/relay-j.host.log" "$LOGS/relay-f.relay.log"
