@@ -5,6 +5,10 @@
 
 use std::net::{IpAddr, SocketAddr};
 
+use tokio_tungstenite::tungstenite::http::StatusCode;
+
+use crate::RelayUrl;
+
 /// A certificate the system's trust store does not lead to.
 pub const UNTRUSTED: &str =
     "this computer does not trust the relay's certificate (on a company network that inspects HTTPS, ask IT)";
@@ -14,6 +18,8 @@ enum Problem {
     Name,
     Expired,
     Untrusted,
+    /// Something answered, but not in TLS: a plain HTTP port, most often.
+    NotTls,
 }
 
 /// A Windows HRESULT as std prints it (a signed 32-bit number).
@@ -34,6 +40,10 @@ const CODES: &[(i64, Problem)] = &[
     (-9807, Problem::Untrusted),  // errSSLXCertChainInvalid
     (-9812, Problem::Untrusted),  // errSSLUnknownRootCert
     (-9813, Problem::Untrusted),  // errSSLNoRootCert
+    // Secure Transport reads the first 5 bytes as a record header, so an
+    // HTTP answer ("HTTP/") announces a 20,527-byte record, more than its
+    // 18,432-byte read buffer (SSLRecordInternal.c).
+    (-9847, Problem::NotTls), // errSSLRecordOverflow
     // Windows: certificate chain policy and SChannel.
     (hr(0x800B_010F), Problem::Name),      // CERT_E_CN_NO_MATCH
     (hr(0x8009_0322), Problem::Name),      // SEC_E_WRONG_PRINCIPAL
@@ -43,11 +53,14 @@ const CODES: &[(i64, Problem)] = &[
     (hr(0x800B_010A), Problem::Untrusted), // CERT_E_CHAINING
     (hr(0x800B_0112), Problem::Untrusted), // CERT_E_UNTRUSTEDCA
     (hr(0x8009_0325), Problem::Untrusted), // SEC_E_UNTRUSTED_ROOT
+    (hr(0x8009_0308), Problem::NotTls),    // SEC_E_INVALID_TOKEN: what came back is not TLS
 ];
 
-/// OpenSSL's certificate verify results (Linux), lowercase. OpenSSL 1.1
-/// writes "self signed", 3.x "self-signed".
+/// OpenSSL's certificate verify results and record reasons (Linux),
+/// lowercase. OpenSSL 1.1 writes "self signed", 3.x "self-signed".
 const TEXTS: &[(&str, Problem)] = &[
+    // The first bytes are not a TLS record header.
+    ("wrong version number", Problem::NotTls),
     ("hostname mismatch", Problem::Name),
     ("ip address mismatch", Problem::Name),
     ("certificate has expired", Problem::Expired),
@@ -59,13 +72,14 @@ const TEXTS: &[(&str, Problem)] = &[
     ("certificate not trusted", Problem::Untrusted),
 ];
 
-/// A failed TLS handshake with the relay at `host`, from the error's Display
-/// and Debug forms.
-pub fn tls_error(host: &str, display: &str, debug: &str) -> String {
+/// A failed TLS handshake with the relay at `host` and `port`, from the
+/// error's Display and Debug forms.
+pub fn tls_error(host: &str, port: u16, display: &str, debug: &str) -> String {
     match problem(display, debug) {
         Some(Problem::Name) => format!("the relay's certificate is not valid for {host}"),
         Some(Problem::Expired) => "the relay's certificate has expired".to_string(),
         Some(Problem::Untrusted) => UNTRUSTED.to_string(),
+        Some(Problem::NotTls) => format!("the server at {host} port {port} did not answer with TLS (wrong port?)"),
         None => format!("secure connection to {host} failed{}", detail(display, debug)),
     }
 }
@@ -196,6 +210,14 @@ fn without_os_error(text: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// An HTTP answer to the WebSocket upgrade other than 101 (and 503, which
+/// means busy). A redirect of a ws:// URL is most often a web server sending
+/// plain HTTP to HTTPS.
+pub fn http_answer(url: &RelayUrl, status: StatusCode) -> String {
+    let hint = if !url.tls() && matches!(status.as_u16(), 301 | 302 | 307 | 308) { " (try wss://)" } else { "" };
+    format!("the server at {url} answered HTTP {status} instead of opening a WebSocket{hint}")
 }
 
 /// A TCP connect failure. The address is named only when `host` is a name.

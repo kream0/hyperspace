@@ -177,7 +177,7 @@ pub async fn open(url: &RelayUrl) -> Result<Ws, Failure> {
         let connector = tokio_native_tls::TlsConnector::from(connector);
         match timeout(CONNECT_TIMEOUT, connector.connect(host, tcp)).await {
             Ok(Ok(tls)) => MaybeTlsStream::NativeTls(tls),
-            Ok(Err(e)) => return Err(errors::tls_error(host, &e.to_string(), &format!("{e:?}")).into()),
+            Ok(Err(e)) => return Err(errors::tls_error(host, port, &e.to_string(), &format!("{e:?}")).into()),
             Err(_) => return Err(format!("secure connection to {host} timed out").into()),
         }
     } else {
@@ -188,11 +188,7 @@ pub async fn open(url: &RelayUrl) -> Result<Ws, Failure> {
     match timeout(CONNECT_TIMEOUT, tokio_tungstenite::client_async_with_config(url.to_string(), stream, Some(config))).await {
         Ok(Ok((ws, _))) => Ok(ws),
         Ok(Err(tungstenite::Error::Http(response))) if response.status().as_u16() == 503 => Err(Failure::Busy),
-        Ok(Err(tungstenite::Error::Http(response))) => Err(format!(
-            "the server at {url} answered HTTP {} instead of opening a WebSocket",
-            response.status()
-        )
-        .into()),
+        Ok(Err(tungstenite::Error::Http(response))) => Err(errors::http_answer(url, response.status()).into()),
         Ok(Err(e)) => Err(format!("WebSocket upgrade with {host} failed: {}", errors::clean(&e.to_string())).into()),
         Err(_) => Err(format!("WebSocket upgrade with {host} timed out").into()),
     }

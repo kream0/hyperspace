@@ -1,7 +1,8 @@
 //! The bridges against a real relay on loopback, with a UDP echo standing in
 //! for the host's server.
 
-use std::net::{SocketAddr, TcpListener as StdTcpListener, UdpSocket};
+use std::io::{Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpListener as StdTcpListener, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -12,6 +13,7 @@ use hyperspace_proto::relay::{self, refused, Msg, Role, RoomKey};
 use hyperspace_proto::secure::Key;
 use hyperspace_relay::{Allow, Config};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::MaybeTlsStream;
@@ -168,6 +170,61 @@ impl Drop for Silent {
         if let Some(rt) = self.rt.take() {
             rt.shutdown_background();
         }
+    }
+}
+
+/// What nginx answers on its plain HTTP port to anything that is not HTTP, a
+/// TLS ClientHello included (seen on a real server), before it closes.
+const HTTP_400: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\nContent-Length: 155\r\n\
+    Connection: close\r\n\r\n<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n\
+    <center><h1>400 Bad Request</h1></center>\r\n<hr><center>web server</center>\r\n</body>\r\n</html>\r\n";
+
+/// A plain HTTP site's answer to anything on its HTTP port: go to HTTPS.
+const HTTP_301: &[u8] =
+    b"HTTP/1.1 301 Moved Permanently\r\nLocation: https://relay.example/v1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+/// A TCP server that gives every connection the same answer, as a web
+/// server would: it reads what the client sends first, answers, then closes
+/// its side and reads to the end, so the answer is not cut by a reset.
+struct OneReply {
+    addr: SocketAddr,
+}
+
+impl OneReply {
+    fn start(reply: &'static [u8]) -> OneReply {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for tcp in listener.incoming() {
+                let Ok(mut tcp) = tcp else { return };
+                std::thread::spawn(move || {
+                    let _ = tcp.set_read_timeout(Some(WAIT));
+                    let mut buf = [0; 16 * 1024];
+                    if !matches!(tcp.read(&mut buf), Ok(n) if n > 0) {
+                        return;
+                    }
+                    let _ = tcp.write_all(reply);
+                    let _ = tcp.shutdown(Shutdown::Write);
+                    while matches!(tcp.read(&mut buf), Ok(n) if n > 0) {}
+                });
+            }
+        });
+        OneReply { addr }
+    }
+
+    /// What this OS's TLS library itself says when it meets this server,
+    /// for test failure messages.
+    fn raw_tls_error(&self) -> String {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let tcp = tokio::net::TcpStream::connect(self.addr).await.unwrap();
+            let connector = tokio_native_tls::TlsConnector::from(tokio_native_tls::native_tls::TlsConnector::new().unwrap());
+            match tokio::time::timeout(WAIT, connector.connect("127.0.0.1", tcp)).await {
+                Ok(Ok(_)) => "no error".to_string(),
+                Ok(Err(e)) => format!("display {:?}, debug {:?}", e.to_string(), format!("{e:?}")),
+                Err(_) => "timed out".to_string(),
+            }
+        })
     }
 }
 
@@ -678,6 +735,58 @@ fn check_tells_what_works() {
     assert!(check("https://relay.example").is_err());
 }
 
+/// wss:// to a plain HTTP port, against this OS's own TLS library.
+#[test]
+fn a_server_that_does_not_answer_with_tls_is_named_on_every_os() {
+    let server = OneReply::start(HTTP_400);
+    let port = server.addr.port();
+    let line = check(&format!("wss://127.0.0.1:{port}")).unwrap_err();
+    assert_eq!(
+        line,
+        format!("the server at 127.0.0.1 port {port} did not answer with TLS (wrong port?)"),
+        "the TLS library said: {}",
+        server.raw_tls_error()
+    );
+}
+
+#[test]
+fn a_redirect_of_ws_suggests_wss() {
+    let server = OneReply::start(HTTP_301);
+    let err = check(&format!("ws://{}", server.addr)).unwrap_err();
+    assert_eq!(
+        err,
+        format!(
+            "the server at ws://{}/v1 answered HTTP 301 Moved Permanently instead of opening a WebSocket (try wss://)",
+            server.addr
+        )
+    );
+}
+
+#[test]
+fn only_a_redirect_of_ws_gets_the_wss_hint() {
+    let line = |url: &str, code: u16| errors::http_answer(&RelayUrl::parse(url).unwrap(), StatusCode::from_u16(code).unwrap());
+    let hint = " (try wss://)";
+    assert_eq!(
+        line("ws://relay.example", 301),
+        format!("the server at ws://relay.example/v1 answered HTTP 301 Moved Permanently instead of opening a WebSocket{hint}")
+    );
+    for code in [302, 307, 308] {
+        assert!(line("ws://relay.example", code).ends_with(hint), "{code}");
+    }
+    // Already wss://, or not a redirect: the line as it was.
+    assert_eq!(
+        line("wss://relay.example", 301),
+        "the server at wss://relay.example/v1 answered HTTP 301 Moved Permanently instead of opening a WebSocket"
+    );
+    assert_eq!(
+        line("ws://relay.example", 200),
+        "the server at ws://relay.example/v1 answered HTTP 200 OK instead of opening a WebSocket"
+    );
+    for code in [303, 404] {
+        assert!(!line("ws://relay.example", code).contains("try"), "{code}");
+    }
+}
+
 #[test]
 fn relay_urls() {
     let ok = |s: &str| RelayUrl::parse(s).unwrap_or_else(|e| panic!("{s}: {e}")).to_string();
@@ -822,7 +931,7 @@ fn windows(hresult: u32, message: &str) -> (String, String) {
 }
 
 fn tls_line(error: (String, String)) -> String {
-    let line = errors::tls_error("relay.example", &error.0, &error.1);
+    let line = errors::tls_error("relay.example", 443, &error.0, &error.1);
     for raw in ["routines", ".c:", "error:0", "ssl", "SSL", "Error {", "os error"] {
         assert!(!line.contains(raw), "{line:?} contains {raw:?}");
     }
@@ -863,8 +972,8 @@ fn other_tls_failures_keep_a_short_detail() {
     let failed = "secure connection to relay.example failed";
     // Linux: the verify result, or OpenSSL's reason without its codes and paths.
     assert_eq!(tls_line(openssl("certificate is not yet valid", 9)), format!("{failed} (certificate is not yet valid)"));
-    let wrong = "error:0A00010B:SSL routines::wrong version number:../ssl/record/ssl3_record.c:354:".to_string();
-    assert_eq!(tls_line((wrong.clone(), wrong)), format!("{failed} (wrong version number)"));
+    let eof = "error:0A000126:SSL routines::unexpected eof while reading:../ssl/record/rec_layer_s3.c:303:".to_string();
+    assert_eq!(tls_line((eof.clone(), eof)), format!("{failed} (unexpected eof while reading)"));
     // An OS error: its message, without the number, which differs between
     // OSes.
     let reset = "Connection reset by peer (os error 104)".to_string();
@@ -875,6 +984,23 @@ fn other_tls_failures_keep_a_short_detail() {
     // Nothing usable: no detail at all.
     let odd = "error:0A000126:SSL routines::unexpected eof:../ssl/x.c:1:, func_name(): /path/x".to_string();
     assert_eq!(tls_line((odd.clone(), String::new())), failed);
+}
+
+#[test]
+fn an_answer_that_is_not_tls_reads_the_same_on_every_os() {
+    let not_tls = "the server at relay.example port 443 did not answer with TLS (wrong port?)";
+    // Linux: OpenSSL 3.0 (seen on a real run against an HTTP port), and a
+    // later one that adds a second entry.
+    let wrong = "error:0A00010B:SSL routines::wrong version number:../ssl/record/ssl3_record.c:354:".to_string();
+    assert_eq!(tls_line((wrong.clone(), wrong)), not_tls);
+    let stacked = "error:0A00010B:SSL routines:tls_get_more_records:wrong version number:\
+                   ../ssl/record/methods/tls_common.c:605:, error:0A000139:SSL routines::record layer failure:\
+                   ../ssl/record/rec_layer_s3.c:696:"
+        .to_string();
+    assert_eq!(tls_line((stacked.clone(), stacked)), not_tls);
+    // macOS and Windows, by number.
+    assert_eq!(tls_line(macos(-9847, "dépassement d'enregistrement")), not_tls);
+    assert_eq!(tls_line(windows(0x8009_0308, "Le jeton fourni à la fonction n'est pas valide")), not_tls);
 }
 
 #[test]
