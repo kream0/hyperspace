@@ -7,20 +7,28 @@ mod keymap;
 mod mac;
 mod session;
 
+use hyperspace_proto::pairing::{config_dir, resolve_addr, Pairing};
+use hyperspace_proto::secure::Key;
 use hyperspace_proto::{wire, Codec, DEFAULT_PORT};
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
+use std::path::PathBuf;
 
 const HELP: &str = "\
 hyperspace-client - low-latency remote desktop client
 
 USAGE:
-    hyperspace-client <HOST[:PORT]> [OPTIONS]
+    hyperspace-client pair <PAIRING-STRING>   Remember a host (once; the host prints the string)
+    hyperspace-client [OPTIONS]               Connect to the remembered host, wherever you are
+    hyperspace-client <HOST[:PORT]> [OPTIONS] Connect to the remembered host at this address
 
 OPTIONS:
     --fps <N>             Frame rate to request [default: this display's refresh rate]
     --bitrate <MBIT>      Video bitrate to request [default: host picks from resolution]
     --codec <h264|hevc>   Only accept this codec [default: either, host prefers hevc]
-    --packet-size <N>     Largest UDP payload to receive [default: host's, 1400]
+    --packet-size <N>     Largest UDP payload to receive [default: host decides]
+    --no-lookup           Only try the addresses already known for the host
+    --connect-timeout <S> Give up connecting after S seconds [default: 15]
+    --config-dir <DIR>    Where the remembered host is kept
     --fullscreen          Start in fullscreen
     --cmd-as-ctrl         Send the Command key as Ctrl instead of the Windows key
     --stats               Print stream statistics every second
@@ -39,8 +47,15 @@ SHORTCUTS (macOS window):
 
 #[derive(Clone, Debug)]
 pub struct Args {
-    pub host: SocketAddr,
+    pub key: Key,
+    /// Addresses to try for the host.
+    pub candidates: Vec<SocketAddr>,
+    /// Allow looking up the host's current address.
+    pub lookup: bool,
+    pub connect_timeout: std::time::Duration,
     pub host_name: String,
+    /// Where the remembered host is stored.
+    pub saved_path: PathBuf,
     /// 0 = auto.
     pub fps: u16,
     pub bitrate_kbps: u32,
@@ -55,11 +70,16 @@ pub struct Args {
     pub test_keyframes: bool,
 }
 
-fn parse_args() -> Result<Args, String> {
-    let mut host_name: Option<String> = None;
+fn parse_args() -> Result<Option<Args>, String> {
+    let mut positional: Vec<String> = Vec::new();
+    let mut dir = config_dir();
     let mut a = Args {
-        host: SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT)),
+        key: Key::from_bytes([0; 32]),
+        candidates: Vec::new(),
+        lookup: true,
+        connect_timeout: std::time::Duration::from_secs(15),
         host_name: String::new(),
+        saved_path: PathBuf::new(),
         fps: 0,
         bitrate_kbps: 0,
         codecs: wire::CODEC_MASK_ALL,
@@ -111,6 +131,12 @@ fn parse_args() -> Result<Args, String> {
                 }
                 a.max_datagram = n as u16;
             }
+            "--no-lookup" => a.lookup = false,
+            "--connect-timeout" => {
+                let secs: f64 = val("--connect-timeout")?.parse().map_err(|_| "invalid --connect-timeout")?;
+                a.connect_timeout = std::time::Duration::from_secs_f64(secs.clamp(0.5, 600.0));
+            }
+            "--config-dir" => dir = val("--config-dir")?.into(),
             "--fullscreen" => a.fullscreen = true,
             "--cmd-as-ctrl" => a.cmd_as_ctrl = true,
             "--stats" => a.stats = true,
@@ -119,47 +145,83 @@ fn parse_args() -> Result<Args, String> {
             "--test-input" => a.test_input = true,
             "--test-keyframes" => a.test_keyframes = true,
             s if s.starts_with('-') => return Err(format!("unknown option '{s}' (try --help)")),
-            s => {
-                if host_name.is_some() {
-                    return Err("only one host may be given".into());
-                }
-                host_name = Some(s.to_string());
+            s => positional.push(s.to_string()),
+        }
+    }
+    a.saved_path = dir.join("host.txt");
+    let saved = Pairing::load(&a.saved_path);
+    let save = |p: &Pairing| p.save(&a.saved_path).map_err(|e| format!("cannot save to {}: {e}", a.saved_path.display()));
+
+    let pos: Vec<&str> = positional.iter().map(String::as_str).collect();
+    let pairing = match pos.as_slice() {
+        ["pair", s] => {
+            let p = Pairing::parse(s).ok_or("that is not a pairing string (it starts with 'hs1.')")?;
+            save(&p)?;
+            println!("Paired. Run `hyperspace-client` to connect.");
+            return Ok(None);
+        }
+        ["pair", ..] => return Err("usage: hyperspace-client pair <PAIRING-STRING>".into()),
+        [] => saved.ok_or(
+            "no host is paired yet.\nRun hyperspace-host on the PC, then: hyperspace-client pair <the string it prints>",
+        )?,
+        [s] if Pairing::looks_like(s) => {
+            let p = Pairing::parse(s).ok_or("invalid pairing string")?;
+            save(&p)?;
+            p
+        }
+        [host] => {
+            // An explicit address, authenticated with the remembered key.
+            let key = saved.ok_or("no host is paired yet: run `hyperspace-client pair <PAIRING-STRING>` first")?.key;
+            a.lookup = false;
+            Pairing { key, addrs: vec![host.to_string()] }
+        }
+        _ => return Err("too many arguments (try --help)".into()),
+    };
+    a.key = pairing.key.clone();
+    for entry in &pairing.addrs {
+        for addr in resolve_addr(entry, DEFAULT_PORT) {
+            if !a.candidates.contains(&addr) {
+                a.candidates.push(addr);
             }
         }
     }
-    let name = host_name.ok_or("missing host address (try --help)")?;
-    a.host = resolve(&name)?;
-    a.host_name = name;
-    Ok(a)
+    if a.candidates.is_empty() && !a.lookup {
+        return Err(format!("cannot resolve '{}'", pairing.addrs.join(", ")));
+    }
+    a.host_name = pairing.addrs.first().cloned().unwrap_or_else(|| "host".into()).replace('/', ":");
+    Ok(Some(a))
 }
 
-/// Accepts `host`, `host:port`, `1.2.3.4`, `[::1]:port`.
-fn resolve(name: &str) -> Result<SocketAddr, String> {
-    if let Ok(addr) = name.parse::<SocketAddr>() {
-        return Ok(addr);
+impl Args {
+    pub fn session_options(&self, fps: u16) -> session::Options {
+        session::Options {
+            key: self.key.clone(),
+            candidates: self.candidates.clone(),
+            lookup: self.lookup,
+            timeout: self.connect_timeout,
+            fps,
+            bitrate_kbps: self.bitrate_kbps,
+            codecs: self.codecs,
+            max_datagram: self.max_datagram,
+        }
     }
-    if let Ok(ip) = name.parse::<std::net::IpAddr>() {
-        return Ok(SocketAddr::new(ip, DEFAULT_PORT));
+
+    /// Remember addresses the lookup service returned, so the next connect is direct.
+    pub fn remember(&self, conn: &session::Connection) {
+        if conn.learned.is_empty() {
+            return;
+        }
+        let p = Pairing { key: self.key.clone(), addrs: conn.learned.clone() };
+        if let Err(e) = p.save(&self.saved_path) {
+            hyperspace_proto::log!("could not update {}: {e}", self.saved_path.display());
+        }
     }
-    let with_port = if name.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok()) {
-        name.to_string()
-    } else {
-        format!("{name}:{DEFAULT_PORT}")
-    };
-    let addrs: Vec<SocketAddr> =
-        with_port.to_socket_addrs().map_err(|e| format!("cannot resolve '{name}': {e}"))?.collect();
-    // Prefer IPv4: it is what a LAN host is most likely listening on.
-    addrs
-        .iter()
-        .find(|a| a.is_ipv4())
-        .or(addrs.first())
-        .copied()
-        .ok_or(format!("cannot resolve '{name}'"))
 }
 
 fn main() {
     let args = match parse_args() {
-        Ok(a) => a,
+        Ok(Some(a)) => a,
+        Ok(None) => return,
         Err(e) => {
             eprintln!("error: {e}");
             std::process::exit(2);
@@ -180,17 +242,3 @@ fn main() {
     std::process::exit(code);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resolves_literals() {
-        assert_eq!(resolve("192.168.1.20").unwrap(), "192.168.1.20:45800".parse().unwrap());
-        assert_eq!(resolve("192.168.1.20:5000").unwrap(), "192.168.1.20:5000".parse().unwrap());
-        assert_eq!(resolve("[::1]:7").unwrap(), "[::1]:7".parse().unwrap());
-        assert_eq!(resolve("::1").unwrap().port(), DEFAULT_PORT);
-        assert_eq!(resolve("localhost").unwrap().port(), DEFAULT_PORT);
-        assert_eq!(resolve("localhost:99").unwrap().port(), 99);
-    }
-}

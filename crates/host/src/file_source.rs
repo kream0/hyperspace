@@ -34,6 +34,7 @@ pub fn run(cfg: &Config, path: &Path, req: StreamRequest, ctl: &Control, sink: &
         height: cfg.file_size.1,
         fps,
         bitrate_kbps: 0,
+        max_bitrate_kbps: 0,
         desktop_rect: None,
     };
     hyperspace_proto::log!(

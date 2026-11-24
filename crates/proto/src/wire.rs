@@ -3,11 +3,14 @@
 use crate::input::InputEvent;
 
 pub const MAGIC: [u8; 4] = *b"HYSP";
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
-/// Largest UDP payload we ever send. 1400 fits a 1500 MTU with room for
-/// tunnels; lower it with `--packet-size` for VPNs with small MTUs.
+/// Largest UDP payload we ever send on a local network. 1400 fits a 1500 MTU
+/// with room to spare; lower it with `--packet-size` if needed.
 pub const DEFAULT_DATAGRAM: usize = 1400;
+/// Largest UDP payload sent across the internet: fits the IPv6 minimum MTU
+/// (1280), so it survives PPPoE, tunnels and mobile networks unfragmented.
+pub const WAN_DATAGRAM: usize = 1232;
 pub const MIN_DATAGRAM: usize = 576;
 pub const MAX_DATAGRAM: usize = 8192;
 
@@ -24,6 +27,8 @@ pub mod pt {
     pub const PONG: u8 = 10;
     pub const BYE: u8 = 11;
     pub const STATUS: u8 = 12;
+    pub const REQ_WELCOME: u8 = 13;
+    pub const SET_BITRATE: u8 = 14;
 }
 
 pub mod bye {
@@ -102,6 +107,8 @@ pub struct Welcome {
     pub height: u16,
     pub fps: u16,
     pub bitrate_kbps: u32,
+    /// Ceiling for bitrate requests made with SET_BITRATE.
+    pub max_bitrate_kbps: u32,
     /// Fragment payload size used for every non-final fragment.
     pub chunk: u16,
 }
@@ -197,6 +204,8 @@ pub enum Packet<'a> {
     Pong { id: u32, t_us: u64, peer_t_us: u64 },
     Bye(u8),
     Status { cursor_serial: u32, cursor_visible: bool },
+    RequestWelcome,
+    SetBitrate(u32),
 }
 
 struct R<'a>(&'a [u8]);
@@ -260,6 +269,8 @@ pub fn parse(buf: &[u8]) -> Option<Packet<'_>> {
         pt::PONG => Packet::Pong { id: r.u32()?, t_us: r.u64()?, peer_t_us: r.u64()? },
         pt::BYE => Packet::Bye(r.u8()?),
         pt::STATUS => Packet::Status { cursor_serial: r.u32()?, cursor_visible: r.u8()? != 0 },
+        pt::REQ_WELCOME => Packet::RequestWelcome,
+        pt::SET_BITRATE => Packet::SetBitrate(r.u32()?),
         pt::HELLO => {
             r.magic()?;
             if r.u16()? != PROTOCOL_VERSION {
@@ -286,6 +297,7 @@ pub fn parse(buf: &[u8]) -> Option<Packet<'_>> {
                 height: r.u16()?,
                 fps: r.u16()?,
                 bitrate_kbps: r.u32()?,
+                max_bitrate_kbps: r.u32()?,
                 chunk: r.u16()?,
             })
         }
@@ -320,6 +332,7 @@ pub fn welcome(w: &Welcome) -> Vec<u8> {
     v.extend_from_slice(&w.height.to_le_bytes());
     v.extend_from_slice(&w.fps.to_le_bytes());
     v.extend_from_slice(&w.bitrate_kbps.to_le_bytes());
+    v.extend_from_slice(&w.max_bitrate_kbps.to_le_bytes());
     v.extend_from_slice(&w.chunk.to_le_bytes());
     v
 }
@@ -383,6 +396,25 @@ pub fn pong(id: u32, t_us: u64, peer_t_us: u64) -> [u8; 21] {
     b
 }
 
+pub fn req_welcome() -> [u8; 1] {
+    [pt::REQ_WELCOME]
+}
+
+pub fn set_bitrate(kbps: u32) -> [u8; 5] {
+    let mut b = [pt::SET_BITRATE, 0, 0, 0, 0];
+    b[1..].copy_from_slice(&kbps.to_le_bytes());
+    b
+}
+
+/// Payload of the host's handshake answer.
+pub const ACCEPT_OK: u8 = 0;
+pub const ACCEPT_VERSION_MISMATCH: u8 = 1;
+
+pub fn accept(status: u8) -> [u8; 3] {
+    let v = PROTOCOL_VERSION.to_le_bytes();
+    [status, v[0], v[1]]
+}
+
 pub fn bye(reason: u8) -> [u8; 2] {
     [pt::BYE, reason]
 }
@@ -411,6 +443,7 @@ mod tests {
             height: 2160,
             fps: 120,
             bitrate_kbps: 50000,
+            max_bitrate_kbps: 70000,
             chunk: 1380,
         };
         assert_eq!(parse(&welcome(&w)), Some(Packet::Welcome(w)));
@@ -432,6 +465,8 @@ mod tests {
         assert_eq!(parse(&status(8, true)), Some(Packet::Status { cursor_serial: 8, cursor_visible: true }));
         assert_eq!(parse(&input_ack(77)), Some(Packet::InputAck(77)));
         assert_eq!(parse(&req_keyframe()), Some(Packet::RequestKeyframe));
+        assert_eq!(parse(&req_welcome()), Some(Packet::RequestWelcome));
+        assert_eq!(parse(&set_bitrate(12345)), Some(Packet::SetBitrate(12345)));
         let mut v = Vec::new();
         nack(&mut v, pt::VIDEO, 12, &[1, 5, 9]);
         match parse(&v) {

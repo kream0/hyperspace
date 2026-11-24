@@ -9,7 +9,7 @@ mod render;
 mod video;
 
 use crate::keymap::{scancode, EXT, SC_CAPS, SC_RCTRL};
-use crate::session::{self, Exit, Handler, InputTx, Options, Stats};
+use crate::session::{self, Exit, Handler, InputTx, Stats};
 use crate::Args;
 use hyperspace_proto::cursor::CursorShape;
 use hyperspace_proto::frag::Frame;
@@ -182,13 +182,8 @@ impl App {
             let hz = monitor.as_ref().and_then(|m| m.refresh_rate_millihertz()).map(|m| (m + 500) / 1000).unwrap_or(60);
             hz.clamp(30, 240) as u16
         };
-        let conn = session::connect(&Options {
-            host: self.args.host,
-            fps,
-            bitrate_kbps: self.args.bitrate_kbps,
-            codecs: self.args.codecs,
-            max_datagram: self.args.max_datagram,
-        })?;
+        let conn = session::connect(&self.args.session_options(fps))?;
+        self.args.remember(&conn);
         let w = conn.welcome;
         log!(
             "connected: {}x{} @ {} fps, {}, {:.1} Mbit/s",
@@ -231,7 +226,7 @@ impl App {
         shared.surface_w.store(size.width, Ordering::Relaxed);
         shared.surface_h.store(size.height, Ordering::Relaxed);
 
-        let input = Arc::new(InputTx::new(conn.sock.clone()));
+        let input = Arc::new(InputTx::new(conn.link.clone()));
         let stop = Arc::new(AtomicBool::new(false));
         let net = {
             let (input, stop, shared, proxy) = (input.clone(), stop.clone(), shared.clone(), self.proxy.clone());

@@ -36,8 +36,10 @@ try:
             except OSError:
                 continue
             seen += 1
-            # Never drop the handshake: connection setup has its own retry test.
-            if data[:1] not in (b"\x01", b"\x02") and rng.random() < loss:
+            # The stream is encrypted, so the relay cannot tell packets apart
+            # beyond the outer type; the two handshake messages (0x80, 0x81)
+            # are let through, everything else is fair game.
+            if data[:1] not in (b"\x80", b"\x81") and rng.random() < loss:
                 dropped += 1
                 continue
             try:

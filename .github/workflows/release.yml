@@ -123,16 +123,17 @@ jobs:
           cat > notes.md <<NOTES
           ## Install
 
-          **Windows host** (the machine you want to control): unzip \`hyperspace-host-windows-x64.zip\` and run \`hyperspace-host.exe\`. Allow it through the firewall on private networks when Windows asks.
+          **Windows host** (the machine you want to control): unzip \`hyperspace-host-windows-x64.zip\` and run \`hyperspace-host.exe\`. Allow it through the firewall when Windows asks. It prints a pairing command.
 
           **macOS client** (the machine you sit at):
 
           \`\`\`bash
           curl -L https://github.com/${{ github.repository }}/releases/download/$TAG/hyperspace-client-macos-universal.tar.gz | tar -xz
-          ./hyperspace-client <windows-ip>
           \`\`\`
 
-          See the README for options, shortcuts and limitations.
+          Paste the pairing command the host printed (once), then connect from anywhere with \`./hyperspace-client\`.
+
+          Host and client must be the same version. See the README for options, shortcuts and limitations.
           NOTES
           sed -i 's/^          //' notes.md
           if gh release view "$TAG" >/dev/null 2>&1; then

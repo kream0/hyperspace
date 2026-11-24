@@ -1,7 +1,7 @@
 //! Windowless client: receives and validates the stream. Used for automated
 //! tests and for measuring the transport on machines without the GUI backend.
 
-use crate::session::{self, Exit, Handler, InputTx, Options, Stats};
+use crate::session::{self, Exit, Handler, InputTx, Stats};
 use crate::Args;
 use hyperspace_proto::cursor::CursorShape;
 use hyperspace_proto::frag::Frame;
@@ -65,20 +65,14 @@ impl Handler for Headless {
 }
 
 pub fn run(args: &Args) -> i32 {
-    let opts = Options {
-        host: args.host,
-        fps: if args.fps == 0 { 60 } else { args.fps },
-        bitrate_kbps: args.bitrate_kbps,
-        codecs: args.codecs,
-        max_datagram: args.max_datagram,
-    };
-    let conn = match session::connect(&opts) {
+    let conn = match session::connect(&args.session_options(if args.fps == 0 { 60 } else { args.fps })) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: {e}");
             return 1;
         }
     };
+    args.remember(&conn);
     let w = conn.welcome;
     log!(
         "connected: {}x{} @ {} fps, {}, {:.1} Mbit/s (headless)",
@@ -88,7 +82,7 @@ pub fn run(args: &Args) -> i32 {
         w.codec.name(),
         w.bitrate_kbps as f64 / 1000.0
     );
-    let input = InputTx::new(conn.sock.clone());
+    let input = InputTx::new(conn.link.clone());
     if args.test_input {
         // Harmless on a real host: nudge the pointer, tap and release Shift.
         input.send_all(&[

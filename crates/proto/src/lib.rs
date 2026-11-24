@@ -10,6 +10,10 @@ pub mod clock;
 pub mod cursor;
 pub mod frag;
 pub mod input;
+pub mod pairing;
+pub mod rate;
+pub mod rendezvous;
+pub mod secure;
 pub mod wire;
 
 pub use wire::{Codec, FragHeader, Hello, Packet, Welcome};

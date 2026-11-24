@@ -338,6 +338,12 @@ impl Encoder {
         }
     }
 
+    /// Change the target bitrate while streaming. False if the transform does
+    /// not support that (the caller then restarts the encoder).
+    pub fn set_bitrate(&self, kbps: u32) -> bool {
+        self.set(&CODECAPI_AVEncCommonMeanBitRate, VARIANT::from(kbps.saturating_mul(1000)), "bitrate", false)
+    }
+
     pub fn failure(&self) -> Option<String> {
         self.error.lock().unwrap().clone()
     }

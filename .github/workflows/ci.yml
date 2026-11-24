@@ -22,6 +22,20 @@ jobs:
       - run: cargo test --workspace
       - run: cargo build --release --workspace
       - run: bash scripts/e2e.sh target/release
+      - name: Find the host through the public lookup network (live internet)
+        # Depends on the public BitTorrent DHT being reachable from the runner.
+        continue-on-error: true
+        run: |
+          D=$(mktemp -d)
+          target/release/hyperspace-host --file testdata/testsrc_720p.h264 --once --port 45990 --no-upnp --config-dir $D/host > host.log 2>&1 &
+          for i in $(seq 90); do grep -q "address published" host.log && break; sleep 1; done
+          cat host.log
+          grep -q "address published" host.log
+          # The client knows only the key - no address at all.
+          KEY=$(cut -d. -f2 $D/host/pairing.txt)
+          target/release/hyperspace-client pair "hs1.$KEY." --config-dir $D/client
+          target/release/hyperspace-client --headless --frames 60 --connect-timeout 60 --config-dir $D/client
+          echo "--- remembered for next time:"; cut -d. -f3- $D/client/host.txt
 
   windows:
     name: Host (Windows)
@@ -38,10 +52,11 @@ jobs:
       - name: Desktop streaming over loopback
         shell: bash
         run: |
-          target/release/hyperspace-host.exe --once --port 45811 --dump desktop.bin > host.log 2>&1 &
-          sleep 1
+          target/release/hyperspace-host.exe --once --port 45811 --dump desktop.bin --no-dht --config-dir hostcfg > host.log 2>&1 &
+          for i in $(seq 100); do [ -s hostcfg/pairing.txt ] && break; sleep 0.2; done
+          target/release/hyperspace-client.exe pair "$(cat hostcfg/pairing.txt)" --config-dir clientcfg
           status=0
-          target/release/hyperspace-client.exe 127.0.0.1:45811 --headless --frames 30 --test-input --test-keyframes --stats || status=$?
+          target/release/hyperspace-client.exe 127.0.0.1:45811 --config-dir clientcfg --headless --frames 30 --test-input --test-keyframes --stats || status=$?
           sleep 2
           echo "--- host log"; cat host.log
           exit $status
@@ -65,11 +80,12 @@ jobs:
       - name: Window + VideoToolbox + Metal over loopback
         run: |
           for codec in h264 h265; do
-            target/release/hyperspace-host --file testdata/testsrc_720p.$codec --once --port 45812 > host-$codec.log 2>&1 &
-            sleep 1
+            target/release/hyperspace-host --file testdata/testsrc_720p.$codec --once --port 45812 --no-upnp --no-dht --config-dir hostcfg > host-$codec.log 2>&1 &
+            for i in $(seq 50); do [ -s hostcfg/pairing.txt ] && break; sleep 0.2; done
+            target/release/hyperspace-client pair "$(cat hostcfg/pairing.txt)" --config-dir clientcfg
             (sleep 3; screencapture -x shot-$codec.png || true) &
             status=0
-            target/release/hyperspace-client 127.0.0.1:45812 --frames 360 --stats > client-$codec.log 2>&1 || status=$?
+            target/release/hyperspace-client 127.0.0.1:45812 --config-dir clientcfg --frames 360 --stats > client-$codec.log 2>&1 || status=$?
             cat client-$codec.log
             echo "--- host log"; cat host-$codec.log
             grep -q "CLIENT OK" client-$codec.log || status=1

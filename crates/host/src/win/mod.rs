@@ -6,7 +6,7 @@ mod convert;
 mod encoder;
 pub mod input;
 
-use crate::pipeline::{default_bitrate_kbps, Config, Control, EncoderPref, Sink, StreamInfo, StreamRequest};
+use crate::pipeline::{choose_bitrate, Config, Control, EncoderPref, Sink, StreamInfo, StreamRequest};
 use capture::{Acquired, Capture};
 use convert::GpuConverter;
 use encoder::{Encoder, EncoderParams};
@@ -205,8 +205,10 @@ pub fn run(cfg: &Config, req: StreamRequest, ctl: Arc<Control>, sink: Arc<dyn Si
             if cap.software_adapter { " [software adapter]" } else { "" }
         );
         let mut force_software = cfg.encoder == EncoderPref::Software;
+        // Bitrate the client last asked for; survives encoder restarts.
+        let mut bitrate_override = None;
         loop {
-            match run_mode(cfg, req, &ctl, &sink, &mut cap, force_software)? {
+            match run_mode(cfg, req, &ctl, &sink, &mut cap, force_software, &mut bitrate_override)? {
                 Outcome::Stopped => return Ok(()),
                 Outcome::ModeChanged => log!("display mode changed to {}x{}: restarting encoder", cap.width, cap.height),
                 Outcome::HardwareFailed(e) => {
@@ -238,6 +240,7 @@ fn run_mode(
     sink: &Arc<dyn Sink>,
     cap: &mut Capture,
     force_software: bool,
+    bitrate_override: &mut Option<u32>,
 ) -> Result<Outcome, String> {
     let (cap_w, cap_h) = (cap.width, cap.height);
     let (w, h) = (cap_w & !1, cap_h & !1);
@@ -250,13 +253,8 @@ fn run_mode(
         fps = fps.min(cfg.max_fps);
     }
     let fps = fps.max(1);
-    let bitrate_kbps = if cfg.bitrate_kbps != 0 {
-        cfg.bitrate_kbps
-    } else if req.bitrate_kbps != 0 {
-        req.bitrate_kbps
-    } else {
-        default_bitrate_kbps(w, h, fps)
-    };
+    let (start_kbps, max_bitrate_kbps) = choose_bitrate(cfg, &req, w, h, fps);
+    let bitrate_kbps = bitrate_override.unwrap_or(start_kbps).min(max_bitrate_kbps);
     let codecs: Vec<Codec> = match cfg.codec {
         Some(c) => vec![c],
         None => vec![Codec::Hevc, Codec::H264],
@@ -293,7 +291,15 @@ fn run_mode(
         cpu = Some(CpuPath::new(cap)?);
     }
 
-    sink.started(&StreamInfo { codec: enc.codec, width: w, height: h, fps, bitrate_kbps, desktop_rect: Some(cap.rect) });
+    sink.started(&StreamInfo {
+        codec: enc.codec,
+        width: w,
+        height: h,
+        fps,
+        bitrate_kbps,
+        max_bitrate_kbps,
+        desktop_rect: Some(cap.rect),
+    });
 
     let event_thread = enc.is_async.then(|| {
         let (enc, sink) = (enc.clone(), sink.clone());
@@ -311,7 +317,7 @@ fn run_mode(
             .expect("spawn encoder event thread")
     });
 
-    let outcome = frame_loop(cap, ctl, sink, &enc, &target, gpu.as_mut(), cpu.as_mut(), fps, (w, h));
+    let outcome = frame_loop(cap, ctl, sink, &enc, &target, gpu.as_mut(), cpu.as_mut(), fps, (w, h), bitrate_kbps, bitrate_override);
 
     // Wind the encoder down; never let a misbehaving driver hang the session teardown.
     enc.begin_shutdown();
@@ -351,8 +357,11 @@ fn frame_loop(
     mut cpu: Option<&mut CpuPath>,
     fps: u32,
     (w, h): (u32, u32),
+    mut bitrate_kbps: u32,
+    bitrate_override: &mut Option<u32>,
 ) -> Result<Outcome, String> {
     let (cap_w, cap_h) = (cap.width, cap.height);
+    let started = Instant::now();
     let interval = Duration::from_secs_f64(1.0 / fps as f64);
     // Frames are due on a fixed cadence (so the average rate is exactly `fps`,
     // which is what the rate control was configured for), with a little slack
@@ -419,6 +428,22 @@ fn frame_loop(
         }
         if ctl.keyframe.swap(false, Ordering::Relaxed) {
             force_key = true;
+        }
+        // The client's view of the network changed.
+        let wanted = ctl.bitrate_kbps.swap(0, Ordering::Relaxed);
+        if wanted != 0 && wanted != bitrate_kbps {
+            if enc.set_bitrate(wanted) {
+                log!("bitrate {:.1} -> {:.1} Mbit/s", bitrate_kbps as f64 / 1000.0, wanted as f64 / 1000.0);
+                bitrate_kbps = wanted;
+                *bitrate_override = Some(wanted);
+            } else if started.elapsed() > Duration::from_secs(3) {
+                // This encoder cannot change rate on the fly: restart it with
+                // the new rate (not more often than every few seconds).
+                *bitrate_override = Some(wanted);
+                return Ok(Outcome::Restart);
+            } else {
+                ctl.bitrate_kbps.store(wanted, Ordering::Relaxed);
+            }
         }
         if force_key && submitted > 0 && enc.keyframe_unsupported.load(Ordering::Relaxed) {
             // This encoder cannot produce a keyframe on demand; a fresh one starts with one.

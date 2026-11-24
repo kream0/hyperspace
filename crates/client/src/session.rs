@@ -1,34 +1,67 @@
-//! Platform-independent client session: handshake, receive loop, loss repair,
-//! clock sync and the input sender.
+//! Platform-independent client session: encrypted handshake, receive loop,
+//! loss repair, clock sync, bitrate control and the input sender.
 
 use hyperspace_proto::clock::{now_us, ClockSync};
 use hyperspace_proto::cursor::CursorShape;
 use hyperspace_proto::frag::{Action, Frame, Reassembler};
 use hyperspace_proto::input::{InputEvent, InputQueue};
+use hyperspace_proto::pairing::{is_local, resolve_addr};
+use hyperspace_proto::rate::{RateControl, Sample};
+use hyperspace_proto::secure::{self, Initiator, Key, DATA_OVERHEAD};
 use hyperspace_proto::wire::{self, bye, pt, Hello, Packet, Welcome, FRAG_HEADER_LEN};
-use hyperspace_proto::log;
+use hyperspace_proto::{log, rendezvous, DEFAULT_PORT};
+use std::cell::RefCell;
 use std::io::ErrorKind;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const HOST_TIMEOUT: Duration = Duration::from_secs(5);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const PING_INTERVAL_US: u64 = 200_000;
 
 #[derive(Clone, Debug)]
 pub struct Options {
-    pub host: SocketAddr,
+    pub key: Key,
+    /// Addresses to try, all at once.
+    pub candidates: Vec<SocketAddr>,
+    /// Look the host's current address up if the known ones do not answer.
+    pub lookup: bool,
+    pub timeout: Duration,
     pub fps: u16,
     pub bitrate_kbps: u32,
     pub codecs: u8,
     pub max_datagram: u16,
 }
 
+/// An established, encrypted path to the host.
+pub struct Link {
+    sock: UdpSocket,
+    secure: secure::Session,
+}
+
+thread_local! {
+    static WIRE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+impl Link {
+    /// Encrypt and send one packet.
+    pub fn send(&self, plain: &[u8]) {
+        WIRE.with(|w| {
+            let mut w = w.borrow_mut();
+            self.secure.seal(plain, &mut w);
+            let _ = self.sock.send(&w);
+        });
+    }
+}
+
 pub struct Connection {
-    pub sock: Arc<UdpSocket>,
+    pub link: Arc<Link>,
     pub welcome: Welcome,
+    /// The address that answered.
+    pub peer: SocketAddr,
+    /// Addresses learned from the lookup service during this connect (to be saved).
+    pub learned: Vec<String>,
 }
 
 fn make_socket(host: SocketAddr) -> std::io::Result<UdpSocket> {
@@ -43,72 +76,145 @@ fn make_socket(host: SocketAddr) -> std::io::Result<UdpSocket> {
     let local: SocketAddr = if host.is_ipv4() { ([0, 0, 0, 0], 0).into() } else { ([0u16; 8], 0).into() };
     s.bind(&local.into())?;
     s.connect(&host.into())?;
+    s.set_nonblocking(true)?;
     Ok(s.into())
 }
 
-/// Perform the HELLO/WELCOME handshake.
+/// Connect: authenticate with the pairing key over whichever address answers
+/// first, then wait for the host to start its stream.
 pub fn connect(opts: &Options) -> Result<Connection, String> {
-    let sock = make_socket(opts.host).map_err(|e| format!("socket: {e}"))?;
-    sock.set_read_timeout(Some(Duration::from_millis(250))).map_err(|e| e.to_string())?;
-    let nonce = {
-        // Unique enough to tell our HELLO retries from another client's.
-        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-        (t as u32) ^ ((t >> 32) as u32) ^ std::process::id().rotate_left(16)
-    };
     let hello = wire::hello(&Hello {
-        nonce,
+        nonce: 0,
         codecs: opts.codecs,
         fps: opts.fps,
         bitrate_kbps: opts.bitrate_kbps,
         max_datagram: opts.max_datagram,
     });
-    let start = Instant::now();
-    let mut buf = [0u8; 2048];
-    log!("connecting to {} ...", opts.host);
-    while start.elapsed() < CONNECT_TIMEOUT {
-        // A refused send (ICMP unreachable) shows up as an error on a connected
-        // UDP socket; the host may simply not be running yet, so keep trying.
-        let _ = sock.send(&hello);
-        let n = match sock.recv(&mut buf) {
-            Ok(n) => n,
-            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => continue,
-            Err(e) if matches!(e.kind(), ErrorKind::ConnectionRefused | ErrorKind::ConnectionReset) => {
-                std::thread::sleep(Duration::from_millis(250));
-                continue;
+    let mut init = Initiator::new(&opts.key, &hello);
+    let mut socks: Vec<(UdpSocket, SocketAddr)> = Vec::new();
+    let add = |socks: &mut Vec<(UdpSocket, SocketAddr)>, addr: SocketAddr| {
+        if socks.iter().all(|(_, a)| *a != addr) {
+            // A family this machine has no route for simply fails here.
+            if let Ok(s) = make_socket(addr) {
+                socks.push((s, addr));
             }
-            Err(e) => return Err(format!("network error: {e}")),
+        }
+    };
+    for &c in &opts.candidates {
+        add(&mut socks, c);
+    }
+    let list = |socks: &[(UdpSocket, SocketAddr)]| socks.iter().map(|(_, a)| a.to_string()).collect::<Vec<_>>().join(", ");
+    if socks.is_empty() && !opts.lookup {
+        return Err("no usable address for the host".into());
+    }
+    log!("connecting to {} ...", if socks.is_empty() { "the host (looking up its address)".to_string() } else { list(&socks) });
+
+    let (tx, rx) = mpsc::channel::<Option<Vec<String>>>();
+    let mut lookup_started = false;
+    let mut lookup_done = !opts.lookup;
+    let mut learned: Vec<String> = Vec::new();
+    let start = Instant::now();
+    let mut last_send: Option<Instant> = None;
+    let mut buf = [0u8; 2048];
+    let (session, winner) = 'handshake: loop {
+        if start.elapsed() > opts.timeout || (socks.is_empty() && lookup_done) {
+            let mut msg = if socks.is_empty() {
+                "the host's address is unknown and the lookup found nothing - is hyperspace-host running?".to_string()
+            } else {
+                format!(
+                    "no answer from {}.\n  - is hyperspace-host running, and is this the pairing string it printed?\n  \
+                     - from outside its network the host's router must forward the UDP port (the host log says whether that worked)",
+                    list(&socks)
+                )
+            };
+            if cfg!(target_os = "macos") {
+                msg += "\n  - on macOS: System Settings > Privacy & Security > Local Network must allow the terminal you launched this from";
+            }
+            return Err(msg);
+        }
+        if last_send.is_none_or(|t| t.elapsed() >= Duration::from_millis(250)) {
+            last_send = Some(Instant::now());
+            for (s, _) in &socks {
+                let _ = s.send(init.packet());
+            }
+        }
+        // On the host's own network the answer arrives within milliseconds;
+        // only bother the lookup service when nothing came back.
+        if opts.lookup && !lookup_started && (socks.is_empty() || start.elapsed() > Duration::from_millis(700)) {
+            lookup_started = true;
+            let (tx, key) = (tx.clone(), opts.key.clone());
+            std::thread::spawn(move || {
+                let found = rendezvous::connect().ok().and_then(|dht| rendezvous::resolve(&dht, &key));
+                let _ = tx.send(found);
+            });
+        }
+        if let Ok(found) = rx.try_recv() {
+            lookup_done = true;
+            if let Some(addrs) = found {
+                let before = socks.len();
+                for a in &addrs {
+                    for sa in resolve_addr(a, DEFAULT_PORT) {
+                        add(&mut socks, sa);
+                    }
+                }
+                if socks.len() > before {
+                    log!("found the host's current addresses: {}", addrs.join(", "));
+                    last_send = None;
+                }
+                learned = addrs;
+            }
+        }
+        for (i, (s, _)) in socks.iter().enumerate() {
+            // Errors (ICMP unreachable, no route) just mean "not this address".
+            if let Ok(n) = s.recv(&mut buf) {
+                if let Some((session, payload)) = init.finish(&buf[..n]) {
+                    match payload.first() {
+                        Some(&wire::ACCEPT_OK) => break 'handshake (session, i),
+                        Some(&wire::ACCEPT_VERSION_MISMATCH) => return Err(bye::describe(bye::VERSION_MISMATCH).into()),
+                        _ => return Err("the host sent an invalid answer".into()),
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    };
+
+    let (sock, peer) = socks.swap_remove(winner);
+    sock.set_nonblocking(false).map_err(|e| e.to_string())?;
+    sock.set_read_timeout(Some(Duration::from_millis(100))).map_err(|e| e.to_string())?;
+    let link = Link { sock, secure: session };
+    log!("authenticated with {peer}{}", if is_local(peer.ip()) { "" } else { " (over the internet)" });
+
+    // Our first encrypted packet proves to the host that we hold the session
+    // keys; it then starts capturing and tells us about the stream.
+    let mut plain = Vec::new();
+    let start = Instant::now();
+    while start.elapsed() < opts.timeout {
+        link.send(&wire::req_welcome());
+        let n = match link.sock.recv(&mut buf) {
+            Ok(n) => n,
+            Err(_) => continue,
         };
-        match wire::parse(&buf[..n]) {
-            Some(Packet::Welcome(w)) if w.nonce == nonce => {
+        match link.secure.open(&buf[..n], &mut plain).and_then(wire::parse) {
+            Some(Packet::Welcome(w)) => {
                 if (w.chunk as usize) < 64 || w.width == 0 || w.height == 0 {
                     return Err("host sent an invalid WELCOME".into());
                 }
-                return Ok(Connection { sock: Arc::new(sock), welcome: w });
+                return Ok(Connection { link: Arc::new(link), welcome: w, peer, learned });
             }
-            Some(Packet::Bye(reason)) if reason != bye::UNKNOWN_SESSION => {
+            Some(Packet::Bye(reason)) => {
                 return Err(format!("host refused the connection: {}", bye::describe(reason)));
-            }
-            None if wire::is_version_mismatch(&buf[..n]) => {
-                return Err(bye::describe(bye::VERSION_MISMATCH).into());
             }
             _ => {}
         }
     }
-    let mut msg = format!(
-        "no answer from {} - is hyperspace-host running there and is UDP port {} allowed through its firewall?",
-        opts.host,
-        opts.host.port()
-    );
-    if cfg!(target_os = "macos") {
-        msg += "\n(on macOS also check System Settings > Privacy & Security > Local Network: the terminal you launched this from must be allowed)";
-    }
-    Err(msg)
+    Err("the host accepted the connection but never started the stream (see the host log)".into())
 }
 
 /// Sends input with redundancy until acked. Shared between the UI thread
 /// (events) and the network thread (acks, resends).
 pub struct InputTx {
-    sock: Arc<UdpSocket>,
+    link: Arc<Link>,
     state: Mutex<InputState>,
 }
 
@@ -119,9 +225,9 @@ struct InputState {
 }
 
 impl InputTx {
-    pub fn new(sock: Arc<UdpSocket>) -> InputTx {
+    pub fn new(link: Arc<Link>) -> InputTx {
         InputTx {
-            sock,
+            link,
             state: Mutex::new(InputState { q: InputQueue::default(), buf: Vec::with_capacity(1500), last_send_us: 0 }),
         }
     }
@@ -131,7 +237,7 @@ impl InputTx {
     pub fn send(&self, ev: InputEvent) {
         let mut s = self.state.lock().unwrap();
         s.q.push(ev);
-        Self::flush(&self.sock, &mut s);
+        Self::flush(&self.link, &mut s);
     }
 
     /// Queue several events and send them in one datagram.
@@ -143,13 +249,13 @@ impl InputTx {
         for ev in evs {
             s.q.push(*ev);
         }
-        Self::flush(&self.sock, &mut s);
+        Self::flush(&self.link, &mut s);
     }
 
-    fn flush(sock: &UdpSocket, s: &mut InputState) {
+    fn flush(link: &Link, s: &mut InputState) {
         let InputState { q, buf, last_send_us, .. } = s;
         if q.encode(buf) {
-            let _ = sock.send(buf);
+            link.send(buf);
             *last_send_us = now_us();
         }
     }
@@ -162,7 +268,7 @@ impl InputTx {
     pub fn resend_if_stale(&self, now: u64, after_us: u64) {
         let mut s = self.state.lock().unwrap();
         if s.q.has_unacked() && now.saturating_sub(s.last_send_us) >= after_us {
-            Self::flush(&self.sock, &mut s);
+            Self::flush(&self.link, &mut s);
         }
     }
 
@@ -245,15 +351,20 @@ pub fn receive_loop(
     handler: &mut dyn Handler,
     keyframe_every_us: Option<u64>,
 ) -> Exit {
-    let sock = &*conn.sock;
+    let link = &*conn.link;
+    let sock = &link.sock;
     let chunk = conn.welcome.chunk as usize;
+    let mut rate = RateControl::new(conn.welcome.bitrate_kbps, conn.welcome.max_bitrate_kbps);
+    let mut plain_buf = Vec::new();
+    let (mut prev_dropped, mut prev_nacks) = (0u64, 0u64);
+    let (mut st_delay_sum, mut st_delay_min, mut st_delay_n) = (0u64, u64::MAX, 0u64);
     let start = now_us();
     let mut video = Reassembler::new(pt::VIDEO, chunk, start);
     let mut cursor = Reassembler::new(pt::CURSOR, chunk, start);
     let mut cursor_serial = 0u32;
     let mut cursor_visible = true;
     let mut clock = ClockSync::default();
-    let mut buf = vec![0u8; wire::MAX_DATAGRAM + FRAG_HEADER_LEN + 64];
+    let mut buf = vec![0u8; wire::MAX_DATAGRAM + FRAG_HEADER_LEN + DATA_OVERHEAD + 64];
     let mut out = Vec::with_capacity(1500);
     let mut ping_id = 0u32;
     let mut last_ping = 0u64;
@@ -281,8 +392,12 @@ pub fn receive_loop(
         }
         match sock.recv(&mut buf) {
             Ok(n) => {
-                last_rx = Instant::now();
-                match wire::parse(&buf[..n]) {
+                // Anything that does not authenticate is ignored outright.
+                let plain: &[u8] = link.secure.open(&buf[..n], &mut plain_buf).unwrap_or(&[]);
+                if !plain.is_empty() {
+                    last_rx = Instant::now();
+                }
+                match wire::parse(plain) {
                     Some(Packet::Frag(h, payload)) if h.kind == pt::VIDEO => {
                         video.push(&h, payload, now_us());
                         while let Some(frame) = video.pop() {
@@ -296,11 +411,15 @@ pub fn receive_loop(
                                 let lat = t1.saturating_sub(cap_local);
                                 st_lat_sum += lat;
                                 st_lat_n += 1;
+                                let delay = frame.first_rx_us.saturating_sub(cap_local);
+                                st_delay_sum += delay;
+                                st_delay_min = st_delay_min.min(delay);
+                                st_delay_n += 1;
                             }
                             video.recycle(frame.data);
                             if !ok {
                                 video.force_keyframe(t1);
-                                let _ = sock.send(&wire::req_keyframe());
+                                link.send(&wire::req_keyframe());
                             }
                             if stop.load(Ordering::Relaxed) {
                                 break;
@@ -351,16 +470,16 @@ pub fn receive_loop(
         video.poll(now, |a| match a {
             Action::Nack { frame_id, frags } => {
                 wire::nack(&mut out, pt::VIDEO, frame_id, frags);
-                let _ = sock.send(&out);
+                link.send(&out);
             }
             Action::RequestKeyframe => {
-                let _ = sock.send(&wire::req_keyframe());
+                link.send(&wire::req_keyframe());
             }
         });
         cursor.poll(now, |a| {
             if let Action::Nack { frame_id, frags } = a {
                 wire::nack(&mut out, pt::CURSOR, frame_id, frags);
-                let _ = sock.send(&out);
+                link.send(&out);
             }
         });
 
@@ -372,7 +491,7 @@ pub fn receive_loop(
         if now.saturating_sub(last_ping) >= ping_every {
             last_ping = now;
             ping_id = ping_id.wrapping_add(1);
-            let _ = sock.send(&wire::ping(ping_id, now, cursor_serial));
+            link.send(&wire::ping(ping_id, now, cursor_serial));
         }
 
         // Test hook: a static desktop produces no frames; periodic keyframe
@@ -380,7 +499,7 @@ pub fn receive_loop(
         if let Some(every) = keyframe_every_us {
             if now - last_forced_kf >= every {
                 last_forced_kf = now;
-                let _ = sock.send(&wire::req_keyframe());
+                link.send(&wire::req_keyframe());
             }
         }
 
@@ -401,6 +520,22 @@ pub fn receive_loop(
                 nacks: video.stats.nacks_sent,
                 keyframe_requests: video.stats.keyframe_requests,
             });
+            // Ask the host for less (or more) if the path changed.
+            let sample = Sample {
+                frames: st_frames,
+                delay_avg_us: (st_delay_n > 0).then(|| st_delay_sum / st_delay_n),
+                delay_min_us: (st_delay_n > 0).then_some(st_delay_min),
+                dropped: video.stats.frames_dropped - prev_dropped,
+                nacks: video.stats.nacks_sent - prev_nacks,
+                rtt_us: clock.rtt_us().unwrap_or(5_000),
+            };
+            prev_dropped = video.stats.frames_dropped;
+            prev_nacks = video.stats.nacks_sent;
+            (st_delay_sum, st_delay_min, st_delay_n) = (0, u64::MAX, 0);
+            if let Some(kbps) = rate.update(&sample) {
+                log!("network conditions changed: asking the host for {:.1} Mbit/s", kbps as f64 / 1000.0);
+                link.send(&wire::set_bitrate(kbps));
+            }
             st_start = now;
             st_frames = 0;
             st_bytes = 0;
@@ -412,7 +547,7 @@ pub fn receive_loop(
 
     if exit == Exit::Local {
         for _ in 0..3 {
-            let _ = sock.send(&wire::bye(bye::QUIT));
+            link.send(&wire::bye(bye::QUIT));
         }
     }
     exit

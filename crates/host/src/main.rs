@@ -4,6 +4,7 @@
 mod file_source;
 mod inject;
 mod pipeline;
+mod reach;
 mod server;
 #[cfg(windows)]
 mod win;
@@ -12,7 +13,10 @@ mod yuv;
 
 use hyperspace_proto::{log, wire, Codec, DEFAULT_PORT};
 use pipeline::{Config, EncoderPref, SourceKind};
+use hyperspace_proto::pairing::{config_dir, Pairing};
+use hyperspace_proto::secure::Key;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 const HELP: &str = "\
 hyperspace-host - low-latency remote desktop host
@@ -22,13 +26,19 @@ USAGE:
 
 OPTIONS:
     --port <N>            UDP port to listen on [default: 45800]
-    --bind <ADDR:PORT>    Listen address [default: 0.0.0.0:45800]
+    --bind <ADDR:PORT>    Listen on one address only [default: all, IPv4 and IPv6]
+    --public-host <NAME>  DNS name that points at this PC (e.g. a dynamic-DNS name);
+                          added to the pairing string
+    --no-upnp             Do not ask the router to forward the port
+    --no-dht              Do not publish this host's address for roaming clients
+    --new-key             Replace the pairing key (every client must pair again)
+    --config-dir <DIR>    Where the key and pairing string are kept
     --display <N>         Display to capture, see --list [default: primary]
     --codec <h264|hevc>   Force a codec [default: hevc if both sides support it]
     --encoder <auto|hw|sw>  Encoder selection [default: auto = hardware, else software]
     --bitrate <MBIT>      Video bitrate; overrides the client's request
     --max-fps <N>         Cap the frame rate regardless of the client's request
-    --packet-size <N>     Max UDP payload [default: 1400; use 1200 over VPNs]
+    --packet-size <N>     Max UDP payload on the LAN [default: 1400; 1232 is used across the internet]
     --view-only           Ignore remote keyboard/mouse
     --once                Exit when the first session ends
     --dump <FILE>         Also write the encoded stream to FILE (Annex B)
@@ -46,9 +56,20 @@ enum Mode {
     SelfTest(u32),
 }
 
-fn parse_args() -> Result<(Config, Mode), String> {
+struct Extra {
+    upnp: bool,
+    dht: bool,
+    public_host: Option<String>,
+    new_key: bool,
+    config_dir: PathBuf,
+}
+
+fn parse_args() -> Result<(Config, Mode, Extra), String> {
+    let mut extra = Extra { upnp: true, dht: true, public_host: None, new_key: false, config_dir: config_dir() };
     let mut cfg = Config {
-        bind: SocketAddr::from(([0, 0, 0, 0], DEFAULT_PORT)),
+        bind: None,
+        port: DEFAULT_PORT,
+        key: Key::from_bytes([0; 32]),
         source: SourceKind::Desktop,
         display: usize::MAX,
         codec: None,
@@ -75,10 +96,21 @@ fn parse_args() -> Result<(Config, Mode), String> {
                 std::process::exit(0);
             }
             "--port" => {
-                let p: u16 = val("--port")?.parse().map_err(|_| "invalid --port")?;
-                cfg.bind.set_port(p);
+                cfg.port = val("--port")?.parse().map_err(|_| "invalid --port")?;
+                if let Some(b) = cfg.bind.as_mut() {
+                    b.set_port(cfg.port);
+                }
             }
-            "--bind" => cfg.bind = val("--bind")?.parse().map_err(|_| "invalid --bind (expected ADDR:PORT)")?,
+            "--bind" => {
+                let addr: SocketAddr = val("--bind")?.parse().map_err(|_| "invalid --bind (expected ADDR:PORT)")?;
+                cfg.port = addr.port();
+                cfg.bind = Some(addr);
+            }
+            "--public-host" => extra.public_host = Some(val("--public-host")?),
+            "--no-upnp" => extra.upnp = false,
+            "--no-dht" => extra.dht = false,
+            "--new-key" => extra.new_key = true,
+            "--config-dir" => extra.config_dir = val("--config-dir")?.into(),
             "--display" => cfg.display = val("--display")?.parse().map_err(|_| "invalid --display")?,
             "--codec" => {
                 cfg.codec = Some(match val("--codec")?.as_str() {
@@ -133,11 +165,11 @@ fn parse_args() -> Result<(Config, Mode), String> {
             other => return Err(format!("unknown option '{other}' (try --help)")),
         }
     }
-    Ok((cfg, mode))
+    Ok((cfg, mode, extra))
 }
 
 fn main() {
-    let (cfg, mode) = match parse_args() {
+    let (cfg, mode, extra) = match parse_args() {
         Ok(v) => v,
         Err(e) => {
             eprintln!("error: {e}");
@@ -145,7 +177,7 @@ fn main() {
         }
     };
     let result = match mode {
-        Mode::Serve => serve(cfg),
+        Mode::Serve => serve(cfg, extra),
         Mode::List => list(),
         Mode::SelfTest(n) => self_test(cfg, n),
     };
@@ -155,13 +187,48 @@ fn main() {
     }
 }
 
-fn serve(cfg: Config) -> Result<(), String> {
+/// Load the pairing key, creating it on first run.
+fn load_key(extra: &Extra) -> Result<Key, String> {
+    let path = extra.config_dir.join("host.key");
+    if !extra.new_key {
+        if let Some(p) = Pairing::load(&path) {
+            return Ok(p.key);
+        }
+    }
+    let key = Key::generate();
+    Pairing { key: key.clone(), addrs: Vec::new() }
+        .save(&path)
+        .map_err(|e| format!("cannot store the pairing key in {}: {e}", path.display()))?;
+    log!("generated a new pairing key ({})", path.display());
+    Ok(key)
+}
+
+fn serve(mut cfg: Config, extra: Extra) -> Result<(), String> {
     #[cfg(windows)]
     win::process_setup();
+    cfg.key = load_key(&extra)?;
     let mut server = server::Server::new(cfg.clone())?;
-    log!("hyperspace-host {} listening on udp {}", env!("CARGO_PKG_VERSION"), server.local_addr().unwrap_or(cfg.bind));
-    log!("no authentication: only expose this port on a network you trust");
-    server.run()
+    log!(
+        "hyperspace-host {} listening on udp {}",
+        env!("CARGO_PKG_VERSION"),
+        server.local_addr().map(|a| a.to_string()).unwrap_or_else(|| cfg.port.to_string())
+    );
+    let reach = {
+        let opts = reach::Options {
+            key: cfg.key.clone(),
+            port: cfg.port,
+            upnp: extra.upnp,
+            dht: extra.dht,
+            public_host: extra.public_host,
+            config_dir: extra.config_dir,
+        };
+        std::thread::Builder::new().name("reach".into()).spawn(move || reach::run(opts)).map_err(|e| e.to_string())?
+    };
+    let result = server.run();
+    // Let the reach thread withdraw the router's port mapping.
+    server::SHUTDOWN.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = reach.join();
+    result
 }
 
 fn list() -> Result<(), String> {
@@ -235,7 +302,7 @@ fn self_test(cfg: Config, frames: u32) -> Result<(), String> {
         *sink.dump.lock().unwrap() = Some(std::fs::File::create(p).map_err(|e| format!("{}: {e}", p.display()))?);
     }
     let ctl = Arc::new(Control::default());
-    let req = StreamRequest { codecs: wire::CODEC_MASK_ALL, fps: 60, bitrate_kbps: 0 };
+    let req = StreamRequest { codecs: wire::CODEC_MASK_ALL, fps: 60, bitrate_kbps: 0, wan: false };
     let result = std::thread::scope(|scope| {
         let worker = scope.spawn(|| pipeline::run(&cfg, req, ctl.clone(), sink.clone()));
         let start = std::time::Instant::now();

@@ -1,0 +1,317 @@
+//! Making the host reachable from outside its LAN, without a VPN or relay.
+//!
+//! * asks the router (UPnP IGD) to forward the UDP port, and to open an IPv6
+//!   firewall pinhole where the router supports that;
+//! * works out which addresses a client could use (LAN, public IPv4, global
+//!   IPv6, an optional DNS name) and prints them as the pairing string;
+//! * keeps those addresses published (encrypted) in the BitTorrent DHT so a
+//!   paired client still finds the host after its home IP address changes.
+
+use crate::server::SHUTDOWN;
+use hyperspace_proto::pairing::{format_addr, is_behind_nat, Pairing};
+use hyperspace_proto::secure::Key;
+use hyperspace_proto::{log, rendezvous};
+use igd_next::{PortMappingProtocol, SearchOptions};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV6, UdpSocket};
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+
+pub struct Options {
+    pub key: Key,
+    pub port: u16,
+    pub upnp: bool,
+    pub dht: bool,
+    /// DNS name (optionally `name:port`) that always points at this host.
+    pub public_host: Option<String>,
+    pub config_dir: PathBuf,
+}
+
+const LEASE_SECS: u32 = 3600;
+const RENEW_EVERY: Duration = Duration::from_secs(20 * 60);
+const PUBLISH_EVERY: Duration = Duration::from_secs(30 * 60);
+
+/// Addresses of this machine: (private IPv4s, global IPv6s).
+fn local_addresses() -> (Vec<Ipv4Addr>, Vec<std::net::Ipv6Addr>) {
+    let (mut v4, mut v6) = (Vec::new(), Vec::new());
+    for iface in if_addrs::get_if_addrs().unwrap_or_default() {
+        match iface.ip() {
+            IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_link_local() => v4.push(ip),
+            // Global unicast only (2000::/3): link-local and unique-local are useless off-site.
+            IpAddr::V6(ip) if (ip.segments()[0] & 0xe000) == 0x2000 => v6.push(ip),
+            _ => {}
+        }
+    }
+    v4.sort();
+    v4.dedup();
+    v6.sort();
+    v6.dedup();
+    v6.truncate(4);
+    (v4, v6)
+}
+
+struct PortMapping {
+    gateway: igd_next::Gateway,
+    local: SocketAddr,
+    external_port: u16,
+    external_ip: Option<IpAddr>,
+    pinholes: Vec<u16>,
+}
+
+impl PortMapping {
+    /// Find the router and ask it to forward `port` (UDP) to us.
+    fn establish(port: u16, v6: &[std::net::Ipv6Addr]) -> Result<PortMapping, String> {
+        let mut opts = SearchOptions::default();
+        opts.timeout = Some(Duration::from_secs(3));
+        // Tests point discovery at a stand-in router instead of the multicast group.
+        if let Some(addr) = std::env::var("HYPERSPACE_UPNP_SEARCH").ok().and_then(|v| v.parse::<SocketAddr>().ok()) {
+            opts.broadcast_address = addr;
+            opts.allowed_gateway_ips = vec![addr.ip()];
+        }
+        let gateway = igd_next::search_gateway(opts).map_err(|e| format!("no UPnP router found ({e})"))?;
+        // Our address on the interface that faces the router.
+        let local_ip = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .and_then(|s| s.connect(gateway.addr).and_then(|_| s.local_addr()))
+            .map(|a| a.ip())
+            .map_err(|e| format!("cannot determine the LAN address: {e}"))?;
+        let local = SocketAddr::new(local_ip, port);
+        let external_port = match gateway.add_port(PortMappingProtocol::UDP, port, local, LEASE_SECS, "hyperspace") {
+            Ok(()) => port,
+            // The same port may be taken by another machine: take any free one.
+            Err(first) => gateway
+                .add_any_port(PortMappingProtocol::UDP, local, LEASE_SECS, "hyperspace")
+                .map_err(|e| format!("the router refused to forward a port ({first}; {e})"))?,
+        };
+        let external_ip = gateway.get_external_ip().ok();
+        let mut m = PortMapping { gateway, local, external_port, external_ip, pinholes: Vec::new() };
+        m.open_pinholes(v6);
+        Ok(m)
+    }
+
+    /// IPv6 is not translated, only filtered: ask for an opening per address.
+    fn open_pinholes(&mut self, v6: &[std::net::Ipv6Addr]) {
+        for id in self.pinholes.drain(..) {
+            let _ = self.gateway.remove_pinhole(id);
+        }
+        for ip in v6 {
+            let target = SocketAddrV6::new(*ip, self.local.port(), 0, 0);
+            if let Ok(id) = self.gateway.add_pinhole(PortMappingProtocol::UDP, target, LEASE_SECS) {
+                self.pinholes.push(id);
+            }
+        }
+    }
+
+    fn renew(&mut self, v6: &[std::net::Ipv6Addr]) {
+        if let Err(e) =
+            self.gateway.add_port(PortMappingProtocol::UDP, self.external_port, self.local, LEASE_SECS, "hyperspace")
+        {
+            log!("could not renew the router's port mapping: {e}");
+        }
+        if let Ok(ip) = self.gateway.get_external_ip() {
+            self.external_ip = Some(ip);
+        }
+        self.open_pinholes(v6);
+    }
+
+    fn remove(&mut self) {
+        let _ = self.gateway.remove_port(PortMappingProtocol::UDP, self.external_port);
+        for id in self.pinholes.drain(..) {
+            let _ = self.gateway.remove_pinhole(id);
+        }
+    }
+
+    /// Public IPv4 endpoint, if the router really is on the internet.
+    fn public_endpoint(&self) -> Option<SocketAddr> {
+        self.external_ip.filter(|ip| !is_behind_nat(*ip)).map(|ip| SocketAddr::new(ip, self.external_port))
+    }
+}
+
+/// Everything the background thread knows about how to reach this host.
+struct Reach {
+    opts: Options,
+    mapping: Option<PortMapping>,
+    dht: Option<rendezvous::Dht>,
+    last_addrs: Vec<String>,
+}
+
+impl Reach {
+    fn addresses(&self) -> Vec<String> {
+        let port = self.opts.port;
+        let (v4, v6) = local_addresses();
+        let mut out: Vec<String> = Vec::new();
+        let mut push = |s: String| {
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        };
+        for ip in &v4 {
+            push(format_addr(&SocketAddr::new((*ip).into(), port)));
+        }
+        if let Some(name) = &self.opts.public_host {
+            if let Some((h, p)) = hyperspace_proto::pairing::split_host_port(name, port) {
+                push(format!("{h}/{p}"));
+            }
+        }
+        match self.mapping.as_ref().and_then(|m| m.public_endpoint()) {
+            Some(ep) => push(format_addr(&ep)),
+            None => {
+                // No mapping: the port may still be forwarded by hand, so offer
+                // the public address the DHT sees us at.
+                if let Some(ip) = self.dht.as_ref().and_then(rendezvous::public_ipv4) {
+                    if !is_behind_nat(ip.into()) {
+                        push(format_addr(&SocketAddr::new(ip.into(), port)));
+                    }
+                }
+            }
+        }
+        for ip in &v6 {
+            push(format_addr(&SocketAddr::new((*ip).into(), port)));
+        }
+        out
+    }
+
+    fn pairing(&self, addrs: &[String]) -> Pairing {
+        Pairing { key: self.opts.key.clone(), addrs: addrs.to_vec() }
+    }
+
+    fn announce(&mut self, first: bool) {
+        let addrs = self.addresses();
+        if !first && addrs == self.last_addrs {
+            return;
+        }
+        let pairing = self.pairing(&addrs);
+        let path = self.opts.config_dir.join("pairing.txt");
+        if let Err(e) = pairing.save(&path) {
+            log!("cannot write {}: {e}", path.display());
+        }
+        if first {
+            self.explain();
+            log!("pair a client once with:");
+            eprintln!("\n    hyperspace-client pair {}\n", pairing.encode());
+            log!("(also saved to {})", path.display());
+        } else {
+            log!("addresses changed: {}", addrs.join(", "));
+        }
+        self.last_addrs = addrs;
+    }
+
+    /// Tell the user, in plain words, whether outside access will work.
+    fn explain(&self) {
+        let (_, v6) = local_addresses();
+        match &self.mapping {
+            Some(m) => match m.public_endpoint() {
+                Some(ep) => log!("reachable from the internet at {ep} (port forwarded automatically by the router)"),
+                None => log!(
+                    "the router forwarded a port, but its own address ({}) is not public: your provider uses \
+                     carrier-grade NAT (or there is a second router), so IPv4 connections from outside cannot get in",
+                    m.external_ip.map(|i| i.to_string()).unwrap_or_else(|| "unknown".into())
+                ),
+            },
+            None if self.opts.upnp => log!(
+                "automatic port forwarding is unavailable: to connect from outside, forward UDP port {} to this PC \
+                 in your router (or enable UPnP there)",
+                self.opts.port
+            ),
+            None => {}
+        }
+        if !v6.is_empty() {
+            let opened = self.mapping.as_ref().is_some_and(|m| !m.pinholes.is_empty());
+            log!(
+                "IPv6 address available{}",
+                if opened {
+                    " and opened in the router's firewall"
+                } else {
+                    " (reachable from IPv6 networks if the router's firewall allows inbound UDP to this PC)"
+                }
+            );
+        }
+    }
+
+    fn publish(&mut self) -> bool {
+        let Some(dht) = &self.dht else { return false };
+        if self.last_addrs.is_empty() {
+            return false;
+        }
+        match rendezvous::publish(dht, &self.opts.key, &self.last_addrs, rendezvous::unix_time()) {
+            Ok(()) => true,
+            Err(e) => {
+                log!("could not publish this host's address for roaming clients: {e}");
+                false
+            }
+        }
+    }
+}
+
+/// Run until shutdown. Never fails: every step is best-effort.
+pub fn run(opts: Options) {
+    let (_, v6) = local_addresses();
+    let mapping = if opts.upnp {
+        match PortMapping::establish(opts.port, &v6) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                log!("{e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let dht = if opts.dht {
+        match rendezvous::connect() {
+            Ok(d) => {
+                // Joining the network also teaches the node its public address.
+                if !rendezvous::wait_ready(&d) {
+                    log!("could not join the address lookup network (no internet access?)");
+                }
+                Some(d)
+            }
+            Err(e) => {
+                log!("address lookup service unavailable: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut reach = Reach { opts, mapping, dht, last_addrs: Vec::new() };
+    reach.announce(true);
+    let mut published = reach.publish();
+    if published {
+        log!("address published: paired clients will find this host even after its IP address changes");
+    }
+    let mut last_renew = Instant::now();
+    let mut last_publish = Instant::now();
+    let mut last_check = Instant::now();
+    while !SHUTDOWN.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(200));
+        if last_renew.elapsed() >= RENEW_EVERY {
+            last_renew = Instant::now();
+            let (_, v6) = local_addresses();
+            if let Some(m) = reach.mapping.as_mut() {
+                m.renew(&v6);
+            }
+        }
+        // Notice address changes (new DHCP lease, new ISP prefix) within a minute.
+        if last_check.elapsed() >= Duration::from_secs(60) {
+            last_check = Instant::now();
+            if let Some(m) = reach.mapping.as_mut() {
+                if let Ok(ip) = m.gateway.get_external_ip() {
+                    m.external_ip = Some(ip);
+                }
+            }
+            let before = reach.last_addrs.clone();
+            reach.announce(false);
+            if reach.last_addrs != before {
+                published = false;
+            }
+        }
+        let retry = if published { PUBLISH_EVERY } else { Duration::from_secs(120) };
+        if last_publish.elapsed() >= retry {
+            last_publish = Instant::now();
+            published = reach.publish();
+        }
+    }
+    if let Some(m) = reach.mapping.as_mut() {
+        m.remove();
+    }
+}

@@ -11,6 +11,8 @@ path = "src/main.rs"
 [dependencies]
 hyperspace-proto = { path = "../proto" }
 socket2 = "0.6"
+igd-next = { version = "0.18", features = ["ipv6"] }
+if-addrs = "0.15"
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"

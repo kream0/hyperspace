@@ -1,9 +1,13 @@
-//! UDP session server: handshake, retransmits, input, liveness.
+//! UDP session server: encrypted handshake, retransmits, input, liveness.
 //!
-//! One client at a time; a new HELLO replaces the current session. The
-//! capture/encode pipeline only runs while a client is connected and pushes
-//! packets straight onto the socket from its own thread - the server thread
-//! handles everything that flows the other way.
+//! One client at a time; a newly authenticated client replaces the current
+//! session. The capture/encode pipeline only runs while a client is connected
+//! and pushes packets straight onto the socket from its own thread - the
+//! server thread handles everything that flows the other way.
+//!
+//! Nothing is ever sent in response to a packet that does not authenticate
+//! with the pairing key, so to anyone else the port is indistinguishable
+//! from a closed one.
 
 use crate::inject::{new_injector, Injector};
 use crate::pipeline::{self, Config, Control, Sink, StreamInfo, StreamRequest};
@@ -11,13 +15,16 @@ use hyperspace_proto::clock::now_us;
 use hyperspace_proto::cursor::CursorShape;
 use hyperspace_proto::frag::Fragmenter;
 use hyperspace_proto::input::InputReceiver;
-use hyperspace_proto::wire::{self, bye, pt, Packet, FLAG_KEYFRAME, FRAG_HEADER_LEN};
+use hyperspace_proto::pairing::is_local;
+use hyperspace_proto::secure::{self, Responder, DATA_OVERHEAD, PT_DATA, PT_INIT};
+use hyperspace_proto::wire::{self, bye, pt, Hello, Packet, FLAG_KEYFRAME, FRAG_HEADER_LEN};
 use hyperspace_proto::{annexb, log, Codec};
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -30,6 +37,13 @@ const STORE_FRAMES: usize = 48;
 const SESSION_TIMEOUT: Duration = Duration::from_secs(5);
 const STATUS_INTERVAL: Duration = Duration::from_millis(200);
 const STATS_INTERVAL: Duration = Duration::from_secs(5);
+/// Handshakes answered but not yet confirmed by an encrypted packet.
+const MAX_PENDING: usize = 8;
+const PENDING_TTL: Duration = Duration::from_secs(10);
+
+thread_local! {
+    static WIRE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
 
 struct Stored {
     id: u32,
@@ -41,6 +55,7 @@ struct Stored {
 #[derive(Default)]
 struct VideoTx {
     frag: Fragmenter,
+    wire: Vec<u8>,
     next_id: u32,
     store: VecDeque<Stored>,
     dump: Option<std::fs::File>,
@@ -49,6 +64,7 @@ struct VideoTx {
 #[derive(Default)]
 struct CursorTx {
     frag: Fragmenter,
+    wire: Vec<u8>,
     serial: u32,
     visible: bool,
     msg: Vec<u8>,
@@ -69,8 +85,9 @@ struct Stats {
 /// Per-session state shared with the pipeline thread.
 pub struct Shared {
     sock: Arc<UdpSocket>,
-    addr: SocketAddr,
-    nonce: u32,
+    /// The client's current address; follows it if it roams.
+    addr: RwLock<SocketAddr>,
+    secure: secure::Session,
     session: u32,
     chunk: usize,
     welcome: Mutex<Option<Vec<u8>>>,
@@ -81,31 +98,44 @@ pub struct Shared {
 }
 
 impl Shared {
-    fn send(&self, d: &[u8]) {
-        let _ = self.sock.send_to(d, self.addr);
+    fn addr(&self) -> SocketAddr {
+        *self.addr.read().unwrap()
+    }
+
+    /// Encrypt and send one control packet.
+    fn send(&self, plain: &[u8]) {
+        WIRE.with(|w| {
+            let mut w = w.borrow_mut();
+            self.secure.seal(plain, &mut w);
+            let _ = self.sock.send_to(&w, self.addr());
+        });
     }
 
     fn send_cursor_shape(&self, c: &mut CursorTx) {
         if c.msg.is_empty() {
             return;
         }
-        let CursorTx { frag, serial, msg, .. } = c;
+        let addr = self.addr();
+        let CursorTx { frag, wire, serial, msg, .. } = c;
         frag.send_all(pt::CURSOR, FLAG_KEYFRAME, *serial, 0, msg, self.chunk, |d| {
-            let _ = self.sock.send_to(d, self.addr);
+            self.secure.seal(d, wire);
+            let _ = self.sock.send_to(wire, addr);
         });
         c.last_sent_us = now_us();
     }
 
     /// Resend fragments; false if the frame is no longer available.
     fn retransmit(&self, n: &wire::Nack<'_>) -> bool {
-        let mut send = |d: &[u8]| {
-            let _ = self.sock.send_to(d, self.addr);
-            self.stats.retransmits.fetch_add(1, Ordering::Relaxed);
-        };
+        let addr = self.addr();
         match n.kind {
             pt::VIDEO => {
                 let mut v = self.video.lock().unwrap();
-                let VideoTx { frag, store, .. } = &mut *v;
+                let VideoTx { frag, wire, store, .. } = &mut *v;
+                let mut send = |d: &[u8]| {
+                    self.secure.seal(d, wire);
+                    let _ = self.sock.send_to(wire, addr);
+                    self.stats.retransmits.fetch_add(1, Ordering::Relaxed);
+                };
                 let Some(first) = store.front().map(|s| s.id) else { return false };
                 let Some(s) = store.get(n.frame_id.wrapping_sub(first) as usize) else { return false };
                 if n.whole_frame() {
@@ -120,7 +150,11 @@ impl Shared {
             pt::CURSOR => {
                 let mut c = self.cursor.lock().unwrap();
                 if n.frame_id == c.serial && !c.msg.is_empty() {
-                    let CursorTx { frag, serial, msg, .. } = &mut *c;
+                    let CursorTx { frag, wire, serial, msg, .. } = &mut *c;
+                    let mut send = |d: &[u8]| {
+                        self.secure.seal(d, wire);
+                        let _ = self.sock.send_to(wire, addr);
+                    };
                     if n.whole_frame() {
                         frag.send_all(pt::CURSOR, FLAG_KEYFRAME, *serial, 0, msg, self.chunk, send);
                     } else {
@@ -139,13 +173,14 @@ impl Shared {
 impl Sink for Shared {
     fn started(&self, info: &StreamInfo) {
         let w = wire::welcome(&wire::Welcome {
-            nonce: self.nonce,
+            nonce: 0,
             session: self.session,
             codec: info.codec,
             width: info.width as u16,
             height: info.height as u16,
             fps: info.fps as u16,
             bitrate_kbps: info.bitrate_kbps,
+            max_bitrate_kbps: info.max_bitrate_kbps,
             chunk: self.chunk as u16,
         });
         self.send(&w);
@@ -165,13 +200,15 @@ impl Sink for Shared {
         if data.is_empty() {
             return;
         }
+        let addr = self.addr();
         let mut v = self.video.lock().unwrap();
         let id = v.next_id;
         v.next_id = id.wrapping_add(1);
         let flags = if keyframe { FLAG_KEYFRAME } else { 0 };
-        let VideoTx { frag, store, dump, .. } = &mut *v;
+        let VideoTx { frag, wire, store, dump, .. } = &mut *v;
         frag.send_all(pt::VIDEO, flags, id, ts_us, data, self.chunk, |d| {
-            let _ = self.sock.send_to(d, self.addr);
+            self.secure.seal(d, wire);
+            let _ = self.sock.send_to(wire, addr);
         });
         let lat = now_us().saturating_sub(ts_us);
         self.stats.latency_sum_us.fetch_add(lat, Ordering::Relaxed);
@@ -214,10 +251,23 @@ pub fn write_dump(f: &mut std::fs::File, codec: Codec, au: &[u8]) {
     let _ = f.write_all(au);
 }
 
+/// A handshake we answered; becomes the session once the client proves it
+/// holds the session keys (which a replayed first message cannot).
+struct Pending {
+    init: Vec<u8>,
+    resp: Vec<u8>,
+    secure: secure::Session,
+    hello: Hello,
+    created: Instant,
+}
+
 struct Session {
     shared: Arc<Shared>,
     ctl: Arc<Control>,
     thread: Option<JoinHandle<Result<(), String>>>,
+    /// The handshake that created this session, to answer retransmissions.
+    init: Vec<u8>,
+    resp: Vec<u8>,
     started_at: Instant,
     last_rx: Instant,
     last_status: Instant,
@@ -234,42 +284,48 @@ pub struct Server {
     cfg: Config,
     sock: Arc<UdpSocket>,
     session: Option<Session>,
+    pending: Vec<Pending>,
     next_session_id: u32,
-    last_unknown_reply: Instant,
+    plain: Vec<u8>,
 }
 
-pub fn bind_socket(addr: SocketAddr) -> std::io::Result<UdpSocket> {
+/// Bind the listening socket. With no explicit address this is one
+/// dual-stack socket serving IPv4 and IPv6.
+pub fn bind_socket(bind: Option<SocketAddr>, port: u16) -> std::io::Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
-    let s = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
-    // Big buffers: a keyframe is a burst of a few hundred datagrams.
-    for size in [8 << 20, 2 << 20, 512 << 10] {
-        if s.set_send_buffer_size(size).is_ok() {
-            break;
+    let make = |addr: SocketAddr, dual: bool| -> std::io::Result<UdpSocket> {
+        let s = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+        if dual {
+            s.set_only_v6(false)?;
         }
+        // Big buffers: a keyframe is a burst of a few hundred datagrams.
+        for size in [8 << 20, 2 << 20, 512 << 10] {
+            if s.set_send_buffer_size(size).is_ok() {
+                break;
+            }
+        }
+        let _ = s.set_recv_buffer_size(1 << 20);
+        s.bind(&addr.into())?;
+        Ok(s.into())
+    };
+    match bind {
+        Some(addr) => make(addr, false),
+        None => make(SocketAddr::from(([0u16; 8], port)), true).or_else(|_| make(SocketAddr::from(([0u8; 4], port)), false)),
     }
-    let _ = s.set_recv_buffer_size(1 << 20);
-    s.bind(&addr.into())?;
-    Ok(s.into())
 }
 
 impl Server {
     pub fn new(cfg: Config) -> Result<Server, String> {
-        let sock = bind_socket(cfg.bind).map_err(|e| format!("cannot bind UDP {}: {e}", cfg.bind))?;
+        let sock = bind_socket(cfg.bind, cfg.port).map_err(|e| format!("cannot bind UDP port {}: {e}", cfg.port))?;
         sock.set_read_timeout(Some(Duration::from_millis(20))).map_err(|e| e.to_string())?;
-        Ok(Server {
-            cfg,
-            sock: Arc::new(sock),
-            session: None,
-            next_session_id: 1,
-            last_unknown_reply: Instant::now(),
-        })
+        Ok(Server { cfg, sock: Arc::new(sock), session: None, pending: Vec::new(), next_session_id: 1, plain: Vec::new() })
     }
 
     pub fn local_addr(&self) -> Option<SocketAddr> {
         self.sock.local_addr().ok()
     }
 
-    /// Serve until the process is killed (or, with `--once`, until the first session ends).
+    /// Serve until shut down (or, with `--once`, until the first session ends).
     pub fn run(&mut self) -> Result<(), String> {
         let mut buf = vec![0u8; 65536];
         let mut had_session = false;
@@ -295,25 +351,71 @@ impl Server {
     }
 
     fn handle(&mut self, buf: &[u8], from: SocketAddr) {
-        let Some(pkt) = wire::parse(buf) else {
-            if wire::is_version_mismatch(buf) {
-                log!("{from}: protocol version mismatch");
-                let _ = self.sock.send_to(&wire::bye(bye::VERSION_MISMATCH), from);
-            }
-            return;
-        };
-        if let Packet::Hello(h) = pkt {
-            self.on_hello(h, from);
+        match buf.first() {
+            Some(&PT_INIT) => self.on_init(buf, from),
+            Some(&PT_DATA) => self.on_data(buf, from),
+            _ => {}
+        }
+    }
+
+    /// First handshake message. Answered only if it was made with our key.
+    fn on_init(&mut self, buf: &[u8], from: SocketAddr) {
+        // Retransmissions get the same answer again.
+        if let Some(s) = self.session.as_ref().filter(|s| s.init == buf) {
+            let _ = self.sock.send_to(&s.resp, from);
             return;
         }
-        let Some(s) = self.session.as_mut().filter(|s| s.shared.addr == from) else {
-            // Tell stale clients to go away (rate limited; the reply is smaller than any request).
-            if self.last_unknown_reply.elapsed() > Duration::from_millis(200) && !matches!(pkt, Packet::Bye(_)) {
-                self.last_unknown_reply = Instant::now();
-                let _ = self.sock.send_to(&wire::bye(bye::UNKNOWN_SESSION), from);
-            }
+        if let Some(p) = self.pending.iter().find(|p| p.init == buf) {
+            let _ = self.sock.send_to(&p.resp, from);
             return;
+        }
+        let Some((responder, payload)) = Responder::accept(&self.cfg.key, buf) else { return };
+        let hello = match wire::parse(&payload) {
+            Some(Packet::Hello(h)) => h,
+            _ => {
+                if wire::is_version_mismatch(&payload) {
+                    log!("{from}: client speaks a different protocol version; update both sides");
+                    let (_, resp) = responder.finish(&wire::accept(wire::ACCEPT_VERSION_MISMATCH));
+                    let _ = self.sock.send_to(&resp, from);
+                }
+                return;
+            }
         };
+        let (secure, resp) = responder.finish(&wire::accept(wire::ACCEPT_OK));
+        let _ = self.sock.send_to(&resp, from);
+        if self.pending.len() >= MAX_PENDING {
+            self.pending.remove(0);
+        }
+        self.pending.push(Pending { init: buf.to_vec(), resp, secure, hello, created: Instant::now() });
+    }
+
+    fn on_data(&mut self, buf: &[u8], from: SocketAddr) {
+        let mut plain = std::mem::take(&mut self.plain);
+        if let Some(s) = &self.session {
+            if s.shared.secure.open(buf, &mut plain).is_some() {
+                if s.shared.addr() != from {
+                    // Authenticated packets from a new address: the client moved networks.
+                    log!("client moved to {}", pretty(from));
+                    *s.shared.addr.write().unwrap() = from;
+                }
+                self.on_packet(&plain);
+                self.plain = plain;
+                return;
+            }
+        }
+        if let Some(i) = self.pending.iter().position(|p| p.secure.open(buf, &mut plain).is_some()) {
+            let p = self.pending.remove(i);
+            self.pending.clear();
+            self.commit(p, from);
+            self.on_packet(&plain);
+        }
+        self.plain = plain;
+    }
+
+    /// A decrypted packet from the session's client.
+    fn on_packet(&mut self, plain: &[u8]) {
+        let Some(s) = self.session.as_mut() else { return };
+        let Some(pkt) = wire::parse(plain) else { return };
         s.last_rx = Instant::now();
         match pkt {
             Packet::Input(evs) => {
@@ -338,32 +440,43 @@ impl Server {
                 }
             }
             Packet::RequestKeyframe => s.ctl.keyframe.store(true, Ordering::Relaxed),
+            Packet::RequestWelcome => {
+                if let Some(w) = s.shared.welcome.lock().unwrap().as_ref() {
+                    s.shared.send(w);
+                }
+            }
+            Packet::SetBitrate(kbps) => {
+                if let Some(info) = *s.shared.info.lock().unwrap() {
+                    if info.max_bitrate_kbps != 0 {
+                        let kbps = kbps.clamp(500.min(info.max_bitrate_kbps), info.max_bitrate_kbps);
+                        s.ctl.bitrate_kbps.store(kbps, Ordering::Relaxed);
+                    }
+                }
+            }
             Packet::Ping { id, t_us, cursor_serial } => {
                 s.client_cursor_serial = cursor_serial;
                 s.shared.send(&wire::pong(id, t_us, now_us()));
             }
             Packet::Bye(reason) => {
-                log!("client {from} disconnected: {}", bye::describe(reason));
+                log!("client {} disconnected: {}", pretty(s.shared.addr()), bye::describe(reason));
                 self.end_session(None);
             }
             _ => {}
         }
     }
 
-    fn on_hello(&mut self, h: wire::Hello, from: SocketAddr) {
+    /// The client proved it holds the session keys: make it the session.
+    fn commit(&mut self, p: Pending, from: SocketAddr) {
         if let Some(s) = &self.session {
-            if s.shared.addr == from && s.shared.nonce == h.nonce {
-                // Retransmitted HELLO: repeat the WELCOME if the pipeline is up.
-                if let Some(w) = s.shared.welcome.lock().unwrap().as_ref() {
-                    s.shared.send(w);
-                }
-                return;
-            }
-            log!("new client {from} replaces {}", s.shared.addr);
+            log!("new client {} replaces {}", pretty(from), pretty(s.shared.addr()));
             self.end_session(Some(bye::REPLACED));
         }
-
+        let h = p.hello;
+        let wan = !is_local(from.ip());
         let mut datagram = self.cfg.packet_size;
+        if wan {
+            datagram = datagram.min(wire::WAN_DATAGRAM);
+        }
         if h.max_datagram != 0 {
             datagram = datagram.min(h.max_datagram as usize);
         }
@@ -377,10 +490,10 @@ impl Server {
         });
         let shared = Arc::new(Shared {
             sock: self.sock.clone(),
-            addr: from,
-            nonce: h.nonce,
+            addr: RwLock::new(from),
+            secure: p.secure,
             session: self.next_session_id,
-            chunk: datagram - FRAG_HEADER_LEN,
+            chunk: datagram - DATA_OVERHEAD - FRAG_HEADER_LEN,
             welcome: Mutex::new(None),
             info: Mutex::new(None),
             video: Mutex::new(VideoTx { dump, ..Default::default() }),
@@ -389,9 +502,11 @@ impl Server {
         });
         self.next_session_id += 1;
         let ctl = Arc::new(Control::default());
-        let req = StreamRequest { codecs: h.codecs, fps: h.fps as u32, bitrate_kbps: h.bitrate_kbps };
+        let req = StreamRequest { codecs: h.codecs, fps: h.fps as u32, bitrate_kbps: h.bitrate_kbps, wan };
         log!(
-            "client {from} connecting (fps {}, bitrate {}, codecs {:#b})",
+            "client {} connected{} (fps {}, bitrate {}, codecs {:#b})",
+            pretty(from),
+            if wan { " over the internet" } else { "" },
             if h.fps == 0 { "auto".to_string() } else { h.fps.to_string() },
             if h.bitrate_kbps == 0 { "auto".to_string() } else { format!("{} kbit/s", h.bitrate_kbps) },
             h.codecs
@@ -408,6 +523,8 @@ impl Server {
             shared,
             ctl,
             thread: Some(thread),
+            init: p.init,
+            resp: p.resp,
             started_at: now,
             last_rx: now,
             last_status: now,
@@ -422,6 +539,7 @@ impl Server {
     }
 
     fn housekeeping(&mut self) {
+        self.pending.retain(|p| p.created.elapsed() < PENDING_TTL);
         let Some(s) = self.session.as_mut() else { return };
         let now = Instant::now();
 
@@ -436,7 +554,7 @@ impl Server {
             return;
         }
         if now.duration_since(s.last_rx) > SESSION_TIMEOUT {
-            log!("client {} timed out", s.shared.addr);
+            log!("client {} timed out", pretty(s.shared.addr()));
             self.end_session(Some(bye::TIMEOUT));
             return;
         }
@@ -504,4 +622,9 @@ impl Server {
             s.injector.injected()
         );
     }
+}
+
+/// Address for log lines (IPv4 peers on the dual-stack socket shown as IPv4).
+fn pretty(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
 }
