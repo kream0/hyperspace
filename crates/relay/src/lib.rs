@@ -7,7 +7,11 @@
 //! opaque datagrams between the room's host and its clients.
 //!
 //! Plain HTTP only. In production TLS ends at a reverse proxy in front of the
-//! relay, which listens on loopback.
+//! relay, which listens on loopback. The proxy must append the client's
+//! address to X-Forwarded-For (nginx: `proxy_set_header X-Forwarded-For
+//! $proxy_add_x_forwarded_for`) or set the header to that address: for a
+//! connection from loopback the relay logs the header's last entry, the only
+//! one the proxy vouches for.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -598,31 +602,29 @@ async fn dispatch(
 }
 
 /// Whether a request came straight from this machine rather than through
-/// the reverse proxy (which adds X-Forwarded-For and X-Real-IP).
+/// the reverse proxy (which adds X-Forwarded-For, and may add X-Real-IP).
 fn is_local(peer: SocketAddr, headers: &HeaderMap) -> bool {
     peer.ip().is_loopback() && !headers.contains_key("x-forwarded-for") && !headers.contains_key("x-real-ip")
 }
 
 /// The address to log for a connection. From loopback (the reverse proxy):
-/// X-Real-IP, else the last X-Forwarded-For entry, the one the proxy itself
-/// appended (earlier ones come from the client and prove nothing). Else, or
-/// if neither holds an address, the socket's peer.
+/// the last X-Forwarded-For entry, the one the proxy appended (earlier ones,
+/// like any header a proxy passes through untouched, come from the client
+/// and prove nothing). X-Real-IP only when there is no X-Forwarded-For at
+/// all. Else, or if the header does not hold an address, the socket's peer.
 fn remote_addr(peer: SocketAddr, headers: &HeaderMap) -> String {
-    if peer.ip().is_loopback() {
-        let header_ip = |name: &str| {
-            headers
-                .get_all(name)
-                .iter()
-                .last()
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.rsplit(',').next())
-                .and_then(|v| v.trim().parse::<IpAddr>().ok())
-        };
-        if let Some(ip) = header_ip("x-real-ip").or_else(|| header_ip("x-forwarded-for")) {
-            return ip.to_string();
-        }
+    if !peer.ip().is_loopback() {
+        return peer.ip().to_string();
     }
-    peer.ip().to_string()
+    let name = if headers.contains_key("x-forwarded-for") { "x-forwarded-for" } else { "x-real-ip" };
+    let ip = headers
+        .get_all(name)
+        .iter()
+        .last()
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.rsplit(',').next())
+        .and_then(|v| v.trim().parse::<IpAddr>().ok());
+    ip.unwrap_or(peer.ip()).to_string()
 }
 
 /// A connection's seat in its room. Dropping it, at the end of the
@@ -968,14 +970,26 @@ mod tests {
         let remote: SocketAddr = "198.51.100.1:5000".parse().unwrap();
         assert_eq!(remote_addr(local, &headers), "192.0.2.7");
         assert_eq!(remote_addr(remote, &headers), "198.51.100.1");
-        // X-Real-IP, which the proxy sets outright, wins.
-        headers.insert("x-real-ip", "192.0.2.9".parse().unwrap());
-        assert_eq!(remote_addr(local, &headers), "192.0.2.9");
-        assert_eq!(remote_addr(remote, &headers), "198.51.100.1");
-        headers.insert("x-real-ip", "nonsense".parse().unwrap());
+        // An X-Real-IP the client sent itself (a proxy that does not set it
+        // passes it through) loses to the entry the proxy appended.
+        headers.insert("x-real-ip", "203.0.113.66".parse().unwrap());
         assert_eq!(remote_addr(local, &headers), "192.0.2.7");
+        // Many entries, and a second header line: the last entry of the last line.
+        headers.append("x-forwarded-for", "10.0.0.1 , 10.0.0.2,192.0.2.8".parse().unwrap());
+        assert_eq!(remote_addr(local, &headers), "192.0.2.8");
+        // Not from loopback: no proxy of ours, so every header is ignored.
+        assert_eq!(remote_addr(remote, &headers), "198.51.100.1");
+        // X-Real-IP only when there is no X-Forwarded-For at all.
+        let mut real = HeaderMap::new();
+        real.insert("x-real-ip", "192.0.2.9".parse().unwrap());
+        assert_eq!(remote_addr(local, &real), "192.0.2.9");
+        assert_eq!(remote_addr(remote, &real), "198.51.100.1");
+        // A header that holds no address: the socket's peer, not a fallback
+        // to the other header.
         headers.insert("x-forwarded-for", "<script>".parse().unwrap());
         assert_eq!(remote_addr(local, &headers), "127.0.0.1");
+        real.insert("x-real-ip", "nonsense".parse().unwrap());
+        assert_eq!(remote_addr(local, &real), "127.0.0.1");
         assert_eq!(remote_addr(local, &HeaderMap::new()), "127.0.0.1");
     }
 

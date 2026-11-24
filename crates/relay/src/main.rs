@@ -8,7 +8,11 @@ hyperspace-relay - relay for hyperspace hosts and clients that cannot reach each
 
 Hosts and clients connect to it with a WebSocket and it forwards their
 encrypted datagrams; it never holds a pairing key. It speaks plain HTTP:
-put a TLS reverse proxy in front of it.
+put a TLS reverse proxy in front of it, on the same machine. The proxy must
+append the client's address to X-Forwarded-For (nginx:
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for) or set it to
+that address: the relay logs the header's last entry for connections from
+loopback.
 
 USAGE:
     hyperspace-relay --allow <FILE> [OPTIONS]
@@ -27,7 +31,8 @@ OPTIONS:
 
 ENDPOINTS:
     GET /health           200 \"hyperspace relay ok\"
-    GET /                 Version, hosts online and clients
+    GET /                 Version; hosts online and clients too when asked
+                          directly on this machine (not through the proxy)
     GET /v1               WebSocket for hosts and clients
 ";
 
