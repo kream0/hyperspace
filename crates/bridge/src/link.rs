@@ -89,6 +89,12 @@ pub fn secs(d: Duration) -> String {
     }
 }
 
+/// The log line for a link that ended after `lived`: why, as a clause, then
+/// what happens next ("reconnecting in 1 s").
+pub fn closed_line(lived: Duration, why: &str, next: &str) -> String {
+    format!("relay link closed after {}: {}; {next}", secs(lived), errors::clause(why))
+}
+
 /// Exponential backoff with jitter, so that hosts and clients cut off at the
 /// same moment do not all come back at the same moment.
 pub struct Backoff {
@@ -206,7 +212,7 @@ pub async fn open(url: &RelayUrl) -> Result<Ws, Failure> {
 pub fn read_error(e: &tungstenite::Error) -> String {
     match e {
         tungstenite::Error::Protocol(ProtocolError::ResetWithoutClosingHandshake) => {
-            "the connection was cut without a close frame".into()
+            "the connection ended without warning".into()
         }
         tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => {
             "the relay closed the connection".into()

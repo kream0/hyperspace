@@ -8,11 +8,11 @@
 //!   paired client still finds the host after its home IP address changes.
 
 use crate::server::{PROBE_SEEN, PROBE_TOKEN, PT_PROBE, SHUTDOWN};
-use hyperspace_bridge::plain_error;
+use hyperspace_bridge::{clause, plain_error};
 use hyperspace_proto::pairing::{format_addr, is_behind_nat, is_relay_entry, Pairing};
 use hyperspace_proto::secure::Key;
 use hyperspace_proto::{log, rendezvous};
-use igd_next::{PortMappingProtocol, SearchOptions};
+use igd_next::{AddAnyPortError, AddPortError, PortMappingProtocol, RequestError, SearchOptions};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV6, UdpSocket};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -84,9 +84,7 @@ impl PortMapping {
             // The same port may be taken by another machine: take any free one.
             Err(first) => gateway
                 .add_any_port(PortMappingProtocol::UDP, local, LEASE_SECS, "hyperspace")
-                .map_err(|e| {
-                    format!("the router refused to forward a port ({}; {})", plain_error(&first), plain_error(&e))
-                })?,
+                .map_err(|e| refused_line(&first, &e))?,
         };
         let external_ip = gateway.get_external_ip().ok();
         let mut m = PortMapping { gateway, local, external_port, external_ip, pinholes: Vec::new() };
@@ -111,7 +109,7 @@ impl PortMapping {
         if let Err(e) =
             self.gateway.add_port(PortMappingProtocol::UDP, self.external_port, self.local, LEASE_SECS, "hyperspace")
         {
-            log!("could not renew the router's port mapping: {}", plain_error(&e));
+            log!("could not renew the router's port mapping: {}", add_port_error(&e));
         }
         if let Ok(ip) = self.gateway.get_external_ip() {
             self.external_ip = Some(ip);
@@ -131,6 +129,45 @@ impl PortMapping {
         self.external_ip.filter(|ip| !is_behind_nat(*ip)).map(|ip| SocketAddr::new(ip, self.external_port))
     }
 }
+
+/// Both refusals, when neither the same port nor any other could be
+/// forwarded.
+fn refused_line(first: &AddPortError, second: &AddAnyPortError) -> String {
+    format!("the router refused to forward a port ({}; {})", add_port_error(first), add_any_port_error(second))
+}
+
+/// The UPnP library prints an I/O error in its debug form ("IO error: Os {
+/// code: 111, kind: ConnectionRefused, ... }"): the I/O error's own message
+/// instead.
+fn request_error(e: &RequestError) -> String {
+    match e {
+        RequestError::IoError(io) => plain_error(io),
+        e => plain_error(e),
+    }
+}
+
+/// What the router said, without the library's "Request error." in front,
+/// its closing periods or its parameter names.
+fn add_port_error(e: &AddPortError) -> String {
+    let text = match e {
+        AddPortError::RequestError(r) => request_error(r),
+        AddPortError::OnlyPermanentLeasesSupported => PERMANENT_ONLY.to_string(),
+        e => plain_error(e),
+    };
+    clause(&text).to_string()
+}
+
+/// As [`add_port_error`], for a request for any free port.
+fn add_any_port_error(e: &AddAnyPortError) -> String {
+    let text = match e {
+        AddAnyPortError::RequestError(r) => request_error(r),
+        AddAnyPortError::OnlyPermanentLeasesSupported => PERMANENT_ONLY.to_string(),
+        e => plain_error(e),
+    };
+    clause(&text).to_string()
+}
+
+const PERMANENT_ONLY: &str = "the router only accepts port mappings that never expire";
 
 /// Send a packet to our own public address and see whether it comes back in.
 /// Most routers loop such traffic back ("NAT hairpinning"); when it arrives it
@@ -425,5 +462,57 @@ mod tests {
         assert_eq!(pairing_for(&key, &addrs, None).addrs, addrs);
         // a relay alone still makes a usable pairing string
         assert_eq!(pairing_for(&key, &[], Some("wss://relay.example/v1")).addrs, ["relay=wss://relay.example/v1"]);
+    }
+
+    /// No debug form, OS error number or closing period from the UPnP
+    /// library reaches the log.
+    fn assert_plain(line: &str) {
+        for raw in ["Os {", "Custom {", "Kind(", "kind:", "code:", "os error", "Request error", ".;", ".)", "`"] {
+            assert!(!line.contains(raw), "{line:?} contains {raw:?}");
+        }
+        assert!(!line.ends_with('.'), "{line:?}");
+    }
+
+    fn io_add(e: std::io::Error) -> AddPortError {
+        AddPortError::RequestError(RequestError::IoError(e))
+    }
+
+    fn io_any(e: std::io::Error) -> AddAnyPortError {
+        AddAnyPortError::RequestError(RequestError::IoError(e))
+    }
+
+    #[test]
+    fn router_errors_read_plainly() {
+        use std::io::{Error, ErrorKind};
+        // An I/O error under the request error: its own message, not its
+        // debug form, and without its period.
+        assert_eq!(add_port_error(&io_add(Error::new(ErrorKind::ConnectionRefused, "the router hung up."))), "the router hung up");
+        assert_eq!(add_any_port_error(&io_any(Error::new(ErrorKind::TimedOut, "no answer."))), "no answer");
+        // The same failure on every OS: no number, whatever the message.
+        for e in [io_add(Error::from_raw_os_error(1)), io_add(Error::from(ErrorKind::TimedOut))] {
+            let line = add_port_error(&e);
+            assert!(!line.is_empty());
+            assert_plain(&line);
+        }
+        assert_plain(&add_any_port_error(&io_any(Error::from_raw_os_error(1))));
+        // The router's own answers, without the library's periods.
+        assert_eq!(add_port_error(&AddPortError::ActionNotAuthorized), "The client is not authorized to map this port");
+        assert_eq!(
+            add_any_port_error(&AddAnyPortError::RequestError(RequestError::ErrorCode(718, "ConflictInMappingEntry".into()))),
+            "Gateway response error 718: ConflictInMappingEntry"
+        );
+        assert_eq!(add_port_error(&AddPortError::OnlyPermanentLeasesSupported), PERMANENT_ONLY);
+        assert_eq!(add_any_port_error(&AddAnyPortError::OnlyPermanentLeasesSupported), PERMANENT_ONLY);
+
+        let line = refused_line(&AddPortError::PortInUse, &io_any(Error::new(ErrorKind::Other, "IO failed.")));
+        assert_eq!(
+            line,
+            "the router refused to forward a port (The requested mapping conflicts with a mapping assigned to another \
+             client; IO failed)"
+        );
+        assert_plain(&line);
+        let line = refused_line(&io_add(Error::from_raw_os_error(1)), &AddAnyPortError::DescriptionTooLong);
+        assert!(line.ends_with("; The description was too long for the gateway to handle)"), "{line:?}");
+        assert_plain(&line);
     }
 }

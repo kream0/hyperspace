@@ -150,7 +150,7 @@ async fn run(url: RelayUrl, room: RoomKey, target: SocketAddr, peers: RelayedPee
                         (backoff.next(), false)
                     }
                 };
-                log!("relay link closed after {}: {}; reconnecting in {}", secs(lived), end.why(), secs(wait));
+                log!("{}", link::closed_line(lived, end.why(), &format!("reconnecting in {}", secs(wait))));
                 if shared_key {
                     log!("relay: another host with the same key is using this relay: stop one of them");
                 }
@@ -190,7 +190,7 @@ async fn run(url: RelayUrl, room: RoomKey, target: SocketAddr, peers: RelayedPee
             Err(Failure::Unreachable(e)) => {
                 let wait = backoff.next();
                 if quiet.changed(&e) {
-                    log!("relay: {e}; retrying");
+                    log!("relay: {}; retrying", errors::clause(&e));
                 }
                 wait
             }

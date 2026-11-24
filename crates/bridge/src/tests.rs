@@ -996,6 +996,47 @@ fn durations_read_well() {
     assert_eq!(secs(Duration::ZERO), "0 s");
 }
 
+#[test]
+fn reasons_lose_their_period_inside_a_line() {
+    assert_eq!(errors::clause("An existing connection was forcibly closed by the remote host."), "An existing connection was forcibly closed by the remote host");
+    assert_eq!(errors::clause("timed out"), "timed out");
+    assert_eq!(errors::clause("done... "), "done");
+    assert_eq!(errors::clause(""), "");
+    assert_eq!(crate::clause("Le message reçu était inattendu."), "Le message reçu était inattendu");
+
+    // Windows ends every message with a period: the line still reads well.
+    let windows = errors::plain(std::io::Error::from_raw_os_error(10054));
+    let why = format!("network error: {windows}");
+    for line in [
+        link::closed_line(Duration::from_secs(12), &why, "reconnecting in 1 s"),
+        link::closed_line(Duration::from_millis(600), "network error: Connection reset by peer.", "not reconnecting until asked"),
+    ] {
+        assert!(line.starts_with("relay link closed after "), "{line:?}");
+        assert!(!line.contains(".;") && !line.contains("os error"), "{line:?}");
+    }
+    assert_eq!(
+        link::closed_line(Duration::from_millis(600), "network error: Connection reset by peer.", "not reconnecting until asked"),
+        "relay link closed after 0.6 s: network error: Connection reset by peer; not reconnecting until asked"
+    );
+    assert_eq!(
+        link::closed_line(Duration::from_secs(35), "no traffic for 35 s", "reconnecting in 1 s"),
+        "relay link closed after 35 s: no traffic for 35 s; reconnecting in 1 s"
+    );
+}
+
+#[test]
+fn read_errors_read_plainly() {
+    use tokio_tungstenite::tungstenite::error::ProtocolError;
+    use tokio_tungstenite::tungstenite::Error;
+    assert_eq!(
+        link::read_error(&Error::Protocol(ProtocolError::ResetWithoutClosingHandshake)),
+        "the connection ended without warning"
+    );
+    assert_eq!(link::read_error(&Error::ConnectionClosed), "the relay closed the connection");
+    let reset = link::read_error(&Error::Io(std::io::Error::from_raw_os_error(104)));
+    assert!(reset.starts_with("network error: ") && !reset.contains("os error"), "{reset:?}");
+}
+
 /// What native-tls's OpenSSL backend (Linux) prints for a verify failure:
 /// the error stack, then the verify result in parentheses.
 fn openssl(verify: &str, code: u32) -> (String, String) {

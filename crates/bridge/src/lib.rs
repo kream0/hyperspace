@@ -92,6 +92,13 @@ pub fn plain_error(e: &dyn std::fmt::Display) -> String {
     errors::plain(e)
 }
 
+/// A reason as a clause inside a longer log line ("...: {reason}; retrying"):
+/// without its closing period, which many OS messages have (all of
+/// Windows' do), so the line never reads ".;".
+pub fn clause(reason: &str) -> &str {
+    errors::clause(reason)
+}
+
 /// Checks that a relay answers at `url`: DNS, TCP, TLS (for `wss://`), the
 /// WebSocket upgrade and the relay's challenge. It closes without
 /// authenticating, so it needs no key. Returns one line saying what worked,

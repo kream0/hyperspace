@@ -390,13 +390,13 @@ async fn run(url: RelayUrl, room: RoomKey, sock: UdpSocket, shared: Arc<Shared>,
                 match end {
                     End::Lost(why) => {
                         let wait = backoff.next();
-                        log!("relay link closed after {}: {why}; reconnecting in {}", secs(lived), secs(wait));
+                        log!("{}", link::closed_line(lived, &why, &format!("reconnecting in {}", secs(wait))));
                         shared.link_down(&why);
                         shared.set_quietly(Status::CannotReach(format!("connection to the relay lost: {why}")));
                         wait
                     }
                     End::ByHost(why) => {
-                        log!("relay link closed after {}: {why}; not reconnecting until asked", secs(lived));
+                        log!("{}", link::closed_line(lived, &why, "not reconnecting until asked"));
                         shared.link_down(&why);
                         // Read before the status changes: only calls made
                         // after the client saw ClosedByHost count.

@@ -2,7 +2,7 @@
 //! the saved setting, or the pairing string's), and the link to it, which
 //! joins the race of the host's direct addresses.
 
-use hyperspace_bridge::{plain_error, ClientBridge, LinkStats, RelayUrl, Status};
+use hyperspace_bridge::{clause, plain_error, ClientBridge, LinkStats, RelayUrl, Status};
 use hyperspace_proto::log;
 use hyperspace_proto::pairing::{check_relay_url, Pairing, RELAY_PREFIX};
 use hyperspace_proto::relay::refused;
@@ -127,7 +127,7 @@ pub fn status_line(status: Status, host: &str) -> String {
         Status::Connecting => "no answer from the relay yet (still connecting).".to_string(),
         Status::CannotReach(why) => format!(
             "the relay is not reachable: {}. On a company network, ask IT to allow {host}.",
-            why.trim_end_matches('.')
+            clause(&why)
         ),
         Status::RelayBusy => "the relay is busy; retrying.".to_string(),
         Status::Refused(refused::NOT_ALLOWED) => "this relay does not serve this PC yet: its operator must add the \
@@ -139,7 +139,7 @@ pub fn status_line(status: Status, host: &str) -> String {
             .to_string(),
         Status::HostOnline => "the PC is connected to the relay but did not answer.".to_string(),
         Status::ClosedByHost => "the host closed this connection through the relay.".to_string(),
-        Status::Closed(why) => format!("the relay link stopped: {}.", why.trim_end_matches('.')),
+        Status::Closed(why) => format!("the relay link stopped: {}.", clause(&why)),
     }
 }
 
@@ -189,7 +189,7 @@ impl Relay {
             None => {}
             // The link stopped for good: a new one (and a new socket), below.
             Some(Status::Closed(why)) => {
-                log!("relay: starting a new relay link (the last one stopped: {why})");
+                log!("relay: starting a new relay link (the last one stopped: {})", clause(&why));
                 self.report();
                 self.bridge = None;
                 self.sock = None;
@@ -302,7 +302,7 @@ impl Relay {
     pub fn diagnose(&self) -> String {
         let Some(status) = self.status() else {
             return match &self.start_error {
-                Some(e) => format!("{}.", e.trim_end_matches('.')),
+                Some(e) => format!("{}.", clause(e)),
                 None => "not tried.".to_string(),
             };
         };

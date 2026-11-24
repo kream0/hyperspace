@@ -154,6 +154,13 @@ pub fn plain(e: impl std::fmt::Display) -> String {
     clean(&e.to_string())
 }
 
+/// A reason as a clause inside a longer line ("...: {reason}; retrying"),
+/// without the period that ends many OS messages (all of Windows' do), so
+/// the line never reads ".;".
+pub fn clause(reason: &str) -> &str {
+    reason.trim_end().trim_end_matches('.').trim_end()
+}
+
 /// OpenSSL error entries ("error:0A000126:SSL routines::unexpected eof while
 /// reading:../ssl/record/rec_layer_s3.c:303:") cut down to their reason
 /// ("unexpected eof while reading"), and std's " (os error 104)" taken out:
