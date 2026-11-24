@@ -465,3 +465,51 @@ fn self_test(cfg: Config, frames: u32) -> Result<(), String> {
     println!("SELF-TEST OK");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn extra(dir: &std::path::Path, relay: RelayArg) -> Extra {
+        Extra { upnp: false, dht: false, public_host: None, new_key: false, config_dir: dir.to_path_buf(), relay }
+    }
+
+    #[test]
+    fn the_relay_setting_is_kept_until_turned_off() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!("hyperspace-host-test-{}-{nanos}", std::process::id()));
+        let file = dir.join("relay.txt");
+        let url = RelayUrl::parse("wss://relay.example").unwrap();
+        let setting = |relay: RelayArg| relay_setting(&extra(&dir, relay)).map(|u| u.to_string());
+
+        // No flag and nothing saved: no relay (there is no default one).
+        assert_eq!(setting(RelayArg::Unset), None);
+        // --relay saves it (creating the directory) and later runs use it.
+        assert_eq!(setting(RelayArg::Set(url.clone())).as_deref(), Some("wss://relay.example/v1"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "wss://relay.example/v1\n");
+        assert_eq!(setting(RelayArg::Unset).as_deref(), Some("wss://relay.example/v1"));
+        // --relay off removes it, and saying it again is fine.
+        assert_eq!(setting(RelayArg::Off), None);
+        assert!(!file.exists());
+        assert_eq!(setting(RelayArg::Off), None);
+        assert_eq!(setting(RelayArg::Unset), None);
+        // A file edited by hand: read leniently, ignored if invalid.
+        std::fs::write(&file, "  WSS://Relay.Example:8443/hs \r\n").unwrap();
+        assert_eq!(setting(RelayArg::Unset).as_deref(), Some("wss://relay.example:8443/hs"));
+        std::fs::write(&file, "https://relay.example\n").unwrap();
+        assert_eq!(setting(RelayArg::Unset), None);
+        std::fs::write(&file, "\n").unwrap();
+        assert_eq!(setting(RelayArg::Unset), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_relay_bridge_sends_to_the_server() {
+        let any_v4: SocketAddr = "0.0.0.0:45800".parse().unwrap();
+        assert_eq!(relay_target(any_v4), "127.0.0.1:45800".parse().unwrap());
+        let any_v6 = relay_target("[::]:45800".parse().unwrap());
+        assert!(any_v6.ip().is_loopback() && any_v6.port() == 45800, "{any_v6}");
+        let one: SocketAddr = "192.0.2.10:45801".parse().unwrap();
+        assert_eq!(relay_target(one), one);
+    }
+}

@@ -10,8 +10,10 @@ use std::time::{Duration, Instant};
 use hyperspace_proto::relay::{refused, RoomKey};
 use hyperspace_proto::secure::Key;
 use hyperspace_relay::{Allow, Config};
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 
-use crate::link::{Backoff, Timing};
+use crate::link::{self, Backoff, Timing};
 use crate::queue;
 use crate::{check, ClientBridge, HostBridge, RelayUrl, RelayedPeers, Status};
 
@@ -265,6 +267,63 @@ fn both_ends_reconnect_after_a_relay_restart() {
     // The new link's peer replaced the old one.
     wait_for("one peer", || s.peers.len() == 1);
     drop(relay);
+}
+
+#[test]
+fn a_client_whose_host_is_away_sees_it_offline() {
+    let relay = Relay::start(Allow::Open);
+    let (client, local) = ClientBridge::start_with(relay.url(), &Key::generate(), fast()).unwrap();
+    wait_for("the host to be reported offline", || client.status() == Status::HostOffline);
+    assert!(client.status().to_string().contains("offline"), "{}", client.status());
+    // What the client sends meanwhile goes nowhere and breaks nothing.
+    let app = app();
+    app.send_to(b"anyone there?", local).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(client.status(), Status::HostOffline);
+    assert_eq!(client.hosts_seen(), 0);
+}
+
+#[test]
+fn a_new_host_with_the_same_key_takes_over() {
+    let relay = Relay::start(Allow::Open);
+    let key = Key::generate();
+    let (first_echo, second_echo) = (Echo::start(), Echo::start());
+    // The replaced host waits before it tries again; long enough here that
+    // it stays out of the way.
+    let stays_away = Timing { refused_wait: WAIT * 3, ..fast() };
+    let first = HostBridge::start_with(relay.url(), &key, first_echo.addr, RelayedPeers::new(), stays_away).unwrap();
+    let (client, local) = ClientBridge::start_with(relay.url(), &key, fast()).unwrap();
+    wait_for("the first host", || client.status() == Status::HostOnline);
+    let app = app();
+    echo_through(&app, local, b"to the first host");
+    let seen = client.hosts_seen();
+
+    let second_peers = RelayedPeers::new();
+    let second = HostBridge::start_with(relay.url(), &key, second_echo.addr, second_peers.clone(), fast()).unwrap();
+    // The status stays "host online": the count is how the client tells.
+    wait_for("the client to see a new host", || client.hosts_seen() > seen);
+    assert_eq!(client.status(), Status::HostOnline);
+    echo_through(&app, local, b"to the second host");
+    assert!(!second_echo.senders().is_empty());
+    assert_eq!(second_peers.len(), 1);
+
+    drop(second);
+    wait_for("the host to be reported offline", || client.status() == Status::HostOffline);
+    // Stopping a bridge does not wait out its pause.
+    let began = Instant::now();
+    drop(first);
+    assert!(began.elapsed() < WAIT, "{:?}", began.elapsed());
+}
+
+#[test]
+fn close_frames_are_told_apart() {
+    let frame = |code: u16, reason: &'static str| Some(CloseFrame { code: CloseCode::from(code), reason: reason.into() });
+    assert!(link::is_replaced(&frame(hyperspace_proto::relay::close::REPLACED, "replaced")));
+    assert!(!link::is_replaced(&frame(1000, "")));
+    assert!(!link::is_replaced(&None));
+    assert_eq!(link::close_text(&frame(1008, "")), " (code 1008)");
+    assert_eq!(link::close_text(&frame(1008, "bad\nline")), " (code 1008: bad?line)");
+    assert_eq!(link::close_text(&None), "");
 }
 
 #[test]
