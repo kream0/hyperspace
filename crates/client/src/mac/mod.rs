@@ -578,7 +578,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(t) = r.net.take() {
                     let _ = t.join();
                 }
-                log!("{} ({decoded} frames decoded, {presented} presented)", exit.describe());
+                log!("{} ({decoded} frames decoded, {presented} presented)", hyperspace_bridge::clause(&exit.describe()));
                 let wanted = self.args.frames;
                 self.exit_code = match (&exit, wanted) {
                     (Exit::Local, Some(n)) if decoded < n => 1,

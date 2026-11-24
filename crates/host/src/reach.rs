@@ -132,7 +132,12 @@ impl PortMapping {
 
 /// No router answered the search, or its answer was of no use.
 fn no_router_line(e: &SearchError) -> String {
-    format!("no UPnP router found ({})", clause(&http_error(&e.to_string())))
+    let text = match e {
+        // The parser's complaint can quote the router's answer.
+        SearchError::XmlError(x) => with_router_text("XML error", &x.to_string()),
+        e => http_error(&e.to_string()),
+    };
+    format!("no UPnP router found ({})", clause(&text))
 }
 
 /// Both refusals, when neither the same port nor any other could be
@@ -150,9 +155,35 @@ fn request_error(e: &RequestError) -> String {
         RequestError::IoError(io) => plain_error(io),
         RequestError::InvalidResponse(_) => UNREADABLE.to_string(),
         RequestError::AttoHttpError(_) => http_error(&e.to_string()),
+        // The fault's description is the router's own text.
+        RequestError::ErrorCode(code, text) => with_router_text(&format!("Gateway response error {code}"), text),
         e => plain_error(e),
     }
 }
+
+/// `what`, then the router's `text` after a colon when it is fit for a log
+/// line (see [`router_text`]); `what` alone otherwise.
+fn with_router_text(what: &str, text: &str) -> String {
+    match router_text(text) {
+        Some(words) => format!("{what}: {words}"),
+        None => what.to_string(),
+    }
+}
+
+/// Text that comes from the router, such as a fault's description
+/// ("ConflictInMappingEntry"), when it is one short printable line: once
+/// trimmed, at most [`ROUTER_TEXT_MAX`] characters, all of them ASCII
+/// letters, digits, punctuation or spaces. None for anything else (long,
+/// several lines, control characters, other scripts), which stays out of
+/// the log: nothing bounds what a router may send there.
+fn router_text(text: &str) -> Option<&str> {
+    let text = text.trim_matches(|c: char| c.is_ascii_whitespace());
+    let printable = text.bytes().all(|b| b == b' ' || b.is_ascii_graphic());
+    (!text.is_empty() && text.len() <= ROUTER_TEXT_MAX && printable).then_some(text)
+}
+
+/// The longest router text a log line carries.
+const ROUTER_TEXT_MAX: usize = 64;
 
 /// The UPnP library writes a failure of its HTTP client, the usual one when
 /// the router does not take a request, as "HTTP error Io Error: Connection
@@ -597,6 +628,64 @@ mod tests {
         for part in ["private", "Envelope", "<", "Invalid response"] {
             assert!(!line.contains(part), "{line:?} contains {part:?}");
         }
+    }
+
+    #[test]
+    fn router_text_is_kept_only_when_short_and_printable() {
+        // What real routers send.
+        for name in ["ConflictInMappingEntry", "Invalid Args", "OnlyPermanentLeasesSupported", "Action Failed"] {
+            assert_eq!(router_text(name), Some(name));
+        }
+        // Whitespace around one line, as an indented XML element has.
+        assert_eq!(router_text("\n      ConflictInMappingEntry\n    "), Some("ConflictInMappingEntry"));
+        let longest = "A".repeat(ROUTER_TEXT_MAX);
+        assert_eq!(router_text(&longest), Some(longest.as_str()));
+        let sentence = "The port mapping entry conflicts with a mapping assigned before.";
+        assert_eq!((sentence.len(), router_text(sentence)), (ROUTER_TEXT_MAX, Some(sentence)));
+        for text in [
+            "A".repeat(ROUTER_TEXT_MAX + 1),
+            "The port mapping entry conflicts with a mapping assigned earlier.".to_string(),
+            "Action Failed\nsee the router's log".to_string(),
+            "Action Failed\r\nsee the router's log".to_string(),
+            "Action\u{7}Failed".to_string(),
+            "\u{1b}[31mFailed".to_string(),
+            "Action\tFailed".to_string(),
+            "Action\u{0}Failed".to_string(),
+            "\u{c9}chec de l'action".to_string(),
+            String::new(),
+            "   ".to_string(),
+        ] {
+            assert_eq!(router_text(&text), None, "{text:?}");
+        }
+        assert_eq!("The port mapping entry conflicts with a mapping assigned earlier.".len(), ROUTER_TEXT_MAX + 1);
+    }
+
+    #[test]
+    fn router_fault_text_is_bounded() {
+        let fault = |code, text: &str| AddPortError::RequestError(RequestError::ErrorCode(code, text.to_string()));
+        // A short name is kept.
+        let kept = add_port_error(&fault(718, "ConflictInMappingEntry"));
+        assert_eq!(kept, "Gateway response error 718: ConflictInMappingEntry");
+        // Anything else leaves the code alone.
+        let long = "A".repeat(ROUTER_TEXT_MAX + 1);
+        assert_eq!(add_port_error(&fault(501, &long)), "Gateway response error 501");
+        assert_eq!(add_port_error(&fault(501, "Action Failed\nreason: see log")), "Gateway response error 501");
+        assert_eq!(add_port_error(&fault(501, "Action\u{1b}[2JFailed")), "Gateway response error 501");
+        assert_eq!(add_port_error(&fault(501, "")), "Gateway response error 501");
+        let any = AddAnyPortError::RequestError(RequestError::ErrorCode(501, format!("{long}\n{long}")));
+        assert_eq!(add_any_port_error(&any), "Gateway response error 501");
+        let line = refused_line(&fault(501, &long), &any);
+        assert_eq!(
+            line,
+            "the router refused to forward a port (Gateway response error 501; Gateway response error 501)"
+        );
+        assert!(!line.contains('A') && !line.contains('\n'), "{line:?}");
+        assert_plain(&line);
+        // The search's XML error, which can quote the router's answer.
+        let short = with_router_text("XML error", "1:1 Unexpected end of stream");
+        assert_eq!(short, "XML error: 1:1 Unexpected end of stream");
+        assert_eq!(with_router_text("XML error", &format!("1:1 Unexpected token {long}")), "XML error");
+        assert_eq!(with_router_text("XML error", "2:3 Unexpected token\n<html>"), "XML error");
     }
 
     #[test]

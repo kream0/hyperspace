@@ -131,7 +131,7 @@ pub fn run(args: &Args) -> i32 {
     let exit = session::run_sessions(&opts, conn, &input, &stop, &mut h, keyframes, relay.as_mut(), &mut on_connect);
     log!(
         "{}: {} frames ({} invalid), {} dropped, {} nacks, {} keyframe requests, {} cursor shapes, input acked: {}",
-        exit.describe(),
+        hyperspace_bridge::clause(&exit.describe()),
         h.frames,
         h.bad,
         h.last.frames_dropped,

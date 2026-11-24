@@ -12,10 +12,17 @@ CLIENTCFG="$LOGS/client-config"
 trap 'kill $(jobs -p) 2>/dev/null || true' EXIT
 HOST_PID=
 
-start_host() { # name stream port
+start_host() { # name stream port: until it listens and has saved its pairing string, or fail
+  # The pairing string goes: an earlier host's must not pass for this one's.
+  rm -f "$HOSTCFG/pairing.txt"
   "$BIN/hyperspace-host" --file "$2" --once --port "$3" --no-upnp --no-dht --config-dir "$HOSTCFG" >"$LOGS/$1.host.log" 2>&1 &
   HOST_PID=$!
-  for _ in $(seq 50); do [ -s "$HOSTCFG/pairing.txt" ] && grep -q "listening" "$LOGS/$1.host.log" && break; sleep 0.1; done
+  for _ in $(seq 100); do
+    [ -s "$HOSTCFG/pairing.txt" ] && grep -q "listening" "$LOGS/$1.host.log" && return 0
+    kill -0 $HOST_PID 2>/dev/null || { echo "FAILED: host $1 exited before listening"; cat "$LOGS/$1.host.log"; exit 1; }
+    sleep 0.1
+  done
+  echo "FAILED: host $1 not listening after 10 s"; cat "$LOGS/$1.host.log"; exit 1
 }
 
 start_forwarder() { # log listen_port host_port loss_percent: until it is bound (sets FWD_PID)
@@ -68,13 +75,21 @@ echo "ignored, as it should be"
 "$BIN/hyperspace-client" 127.0.0.1:45905 --headless --frames 30 --config-dir "$CLIENTCFG" 2>&1 | tail -1
 wait $HOST_PID 2>/dev/null || true
 
-if grep -q '\.[0-9A-Za-z_-]*\..*[0-9]/45906' <(start_host saved testdata/testsrc_720p.h264 45906; cat "$HOSTCFG/pairing.txt"; kill $HOST_PID 2>/dev/null); then
-  echo "=== saved-host (connect with no address, racing the addresses in the pairing string)"
-  start_host saved testdata/testsrc_720p.h264 45906
+echo "=== saved-host (connect with no address, racing the addresses in the pairing string)"
+# One host, started here: it serves the case when its pairing string has an
+# address besides loopback, and is stopped (and waited for) when it has not.
+start_host saved testdata/testsrc_720p.h264 45906
+if grep -q '\.[0-9A-Za-z_-]*\..*[0-9]/45906' "$HOSTCFG/pairing.txt"; then
   "$BIN/hyperspace-client" pair "$(cat "$HOSTCFG/pairing.txt")" --config-dir "$LOGS/saved" >/dev/null
-  "$BIN/hyperspace-client" --headless --frames 60 --no-lookup --config-dir "$LOGS/saved" 2>&1 | tee "$LOGS/saved.client.log" | tail -2
+  if ! "$BIN/hyperspace-client" --headless --frames 60 --no-lookup --config-dir "$LOGS/saved" 2>&1 | tee "$LOGS/saved.client.log" | tail -2; then
+    echo "--- host log"; cat "$LOGS/saved.host.log"; exit 1
+  fi
   grep -q "CLIENT OK" "$LOGS/saved.client.log" || { echo "FAILED: saved-host"; cat "$LOGS/saved.host.log"; exit 1; }
   wait $HOST_PID 2>/dev/null || true
+else
+  kill $HOST_PID 2>/dev/null || true
+  wait $HOST_PID 2>/dev/null || true
+  echo "skipped: no address besides loopback in the pairing string"
 fi
 
 if command -v python3 >/dev/null; then
