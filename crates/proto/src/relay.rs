@@ -67,7 +67,8 @@
 //!
 //! # Closing
 //!
-//! The relay sends a WebSocket close frame in exactly three cases ([`close`]):
+//! The relay starts a WebSocket close (sends the first close frame) in
+//! exactly three cases ([`close`]):
 //!
 //! | code | reason                 | sent to  | when                                                  |
 //! |------|------------------------|----------|-------------------------------------------------------|
@@ -77,7 +78,10 @@
 //!
 //! Before 4001 or 1000 the relay writes what was already queued for the
 //! link. A link that does not take that and the close frame within 5
-//! seconds is dropped without a close frame.
+//! seconds is dropped without a close frame. A room has at most 4 such
+//! links closing at once, and the relay 16 in all: when another one starts
+//! closing (a host replaced over and over, say), the oldest of the room, or
+//! of the relay, is dropped at once, with or without its close frame.
 //!
 //! Every other end is a dropped TCP connection, with no close frame (in
 //! particular no 1009 for a message too big):
@@ -106,11 +110,13 @@
 //!   default) and drops a link it hears nothing from for 60 seconds.
 //! - Drop a datagram over [`MAX_PAYLOAD`] locally: sending it drops the
 //!   whole link.
-//! - After 1008 `"refused"`, act on the REFUSED reason: retrying soon does
+//! - After 1008 `"refused"`, act on the REFUSED reason. Retrying soon does
 //!   not help for [`refused::NOT_ALLOWED`], [`refused::BAD_SIGNATURE`] or
-//!   [`refused::VERSION_MISMATCH`] (say so), while [`refused::ROOM_FULL`],
-//!   [`refused::RELAY_FULL`] and [`refused::TIMEOUT`] may pass after a
-//!   back-off.
+//!   [`refused::VERSION_MISMATCH`]: say so. [`refused::PROTOCOL`] is a bug
+//!   on the bridge's side (its HELLO did not decode): say so and retry
+//!   slowly (retrying soon does not help, as for NOT_ALLOWED).
+//!   [`refused::ROOM_FULL`], [`refused::RELAY_FULL`] and
+//!   [`refused::TIMEOUT`] may pass after a back-off.
 //! - After 1000 `"closed by the host"` (a client): the host let this client
 //!   go. Do not reconnect at once.
 //! - After 4001 `"replaced"` (a host): back off, or stop and say so.
@@ -151,8 +157,9 @@ pub mod mt {
     pub const CLIENT_DATA: u8 = 9;
 }
 
-/// The only WebSocket close frames the relay sends (see the module docs,
-/// "Closing"). Every other end of a link is a dropped TCP connection.
+/// The only WebSocket closes the relay starts (see the module docs,
+/// "Closing"). It also answers a peer that closes first; every other end
+/// of a link is a dropped TCP connection.
 pub mod close {
     /// Right after REFUSED (policy violation); reason text `"refused"`.
     pub const REFUSED: u16 = 1008;

@@ -24,8 +24,12 @@ OPTIONS:
                           per line, '#' starts a comment. Read again on every connection,
                           so edits apply without a restart
     --open                Allow every room (for tests only; instead of --allow)
-    --max-rooms <N>       Rooms open at once [default: 16]
-    --max-clients <N>     Clients per room [default: 4]
+    --max-rooms <N>       Rooms open at once [default: 16]. Worst case: each room
+                          more takes about 1 MiB of memory per seat (5 MiB with
+                          4 clients per room)
+    --max-clients <N>     Clients per room [default: 4]. Worst case: each client
+                          more takes about 1 MiB of memory per room (16 MiB with
+                          16 rooms). The relay prints its worst case as it starts
     --rate-mbit <N>       Limit per room and direction, in Mbit/s; 0 = none [default: 60]
     -h, --help            Show this help
     -V, --version         Show version
@@ -114,8 +118,11 @@ fn main() {
     };
     let rate = config.rate.map_or("no rate limit".to_string(), |r| format!("{r} per room and direction"));
     let limits = format!(
-        "at most {} rooms, {} clients per room, {} connections, {rate}",
-        config.max_rooms, config.max_clients, config.max_links
+        "at most {} rooms, {} clients per room, {} connections, about {} MiB of memory, {rate}",
+        config.max_rooms,
+        config.max_clients,
+        config.links(),
+        config.worst_case_mib()
     );
 
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
@@ -126,7 +133,7 @@ fn main() {
         }
     };
     let result = runtime.block_on(async {
-        let listener = tokio::net::TcpListener::bind(listen).await?;
+        let listener = hyperspace_relay::bind(listen)?;
         let addr = listener.local_addr()?;
         hyperspace_relay::log(format_args!(
             "hyperspace relay {} listening on {addr} ({rooms}; {limits})",
