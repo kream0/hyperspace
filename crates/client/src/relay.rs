@@ -106,10 +106,15 @@ pub fn stats_line(s: &LinkStats) -> String {
         Some(t) => format!("up {} s", t.elapsed().as_secs()),
         None => "down".to_string(),
     };
+    // Without the OS error number or a closing period: the reason sits
+    // inside the line.
+    let close = match s.last_close.as_deref() {
+        Some(why) => clause(&plain_error(&why)).to_string(),
+        None => "none".to_string(),
+    };
     let mut line = format!(
-        "relay link: {up}, {} reconnects, last close: {}, in {:.1} MB / out {:.1} MB, dropped {}",
+        "relay link: {up}, {} reconnects, last close: {close}, in {:.1} MB / out {:.1} MB, dropped {}",
         s.reconnects,
-        s.last_close.as_deref().unwrap_or("none"),
         mb(s.bytes_in),
         mb(s.bytes_out),
         s.dropped
@@ -452,6 +457,14 @@ mod tests {
             "relay link: up 0 s, 2 reconnects, last close: no traffic for 35 s, in 12.3 MB / out 0.3 MB, dropped 3 \
              (and 7 while the link was down)"
         );
+        s.discarded_while_down = 0;
+        s.last_close = Some("could not write to the relay: Connection reset by peer (os error 104)".into());
+        let line = stats_line(&s);
+        assert!(line.contains("last close: could not write to the relay: Connection reset by peer, in"), "{line}");
+        s.last_close = Some("An existing connection was forcibly closed by the remote host.".into());
+        let line = stats_line(&s);
+        assert!(line.contains("last close: An existing connection was forcibly closed by the remote host, in "), "{line}");
+        assert!(!line.contains(".,"), "{line}");
     }
 
     #[test]

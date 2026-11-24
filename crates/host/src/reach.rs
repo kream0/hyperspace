@@ -12,7 +12,7 @@ use hyperspace_bridge::{clause, plain_error};
 use hyperspace_proto::pairing::{format_addr, is_behind_nat, is_relay_entry, Pairing};
 use hyperspace_proto::secure::Key;
 use hyperspace_proto::{log, rendezvous};
-use igd_next::{AddAnyPortError, AddPortError, PortMappingProtocol, RequestError, SearchOptions};
+use igd_next::{AddAnyPortError, AddPortError, PortMappingProtocol, RequestError, SearchError, SearchOptions};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV6, UdpSocket};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -72,7 +72,7 @@ impl PortMapping {
             opts.broadcast_address = addr;
             opts.allowed_gateway_ips = vec![addr.ip()];
         }
-        let gateway = igd_next::search_gateway(opts).map_err(|e| format!("no UPnP router found ({})", plain_error(&e)))?;
+        let gateway = igd_next::search_gateway(opts).map_err(|e| no_router_line(&e))?;
         // Our address on the interface that faces the router.
         let local_ip = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
             .and_then(|s| s.connect(gateway.addr).and_then(|_| s.local_addr()))
@@ -130,6 +130,11 @@ impl PortMapping {
     }
 }
 
+/// No router answered the search, or its answer was of no use.
+fn no_router_line(e: &SearchError) -> String {
+    format!("no UPnP router found ({})", clause(&http_error(&e.to_string())))
+}
+
 /// Both refusals, when neither the same port nor any other could be
 /// forwarded.
 fn refused_line(first: &AddPortError, second: &AddAnyPortError) -> String {
@@ -138,13 +143,29 @@ fn refused_line(first: &AddPortError, second: &AddAnyPortError) -> String {
 
 /// The UPnP library prints an I/O error in its debug form ("IO error: Os {
 /// code: 111, kind: ConnectionRefused, ... }"): the I/O error's own message
-/// instead.
+/// instead. A response it cannot parse carries the router's whole answer,
+/// which is never logged: a fixed phrase stands for it.
 fn request_error(e: &RequestError) -> String {
     match e {
         RequestError::IoError(io) => plain_error(io),
+        RequestError::InvalidResponse(_) => UNREADABLE.to_string(),
+        RequestError::AttoHttpError(_) => http_error(&e.to_string()),
         e => plain_error(e),
     }
 }
+
+/// The UPnP library writes a failure of its HTTP client, the usual one when
+/// the router does not take a request, as "HTTP error Io Error: Connection
+/// refused (os error 111)": the words after its prefixes (or after "HTTP
+/// error " alone), without the OS error number. Text without the prefixes
+/// is only cleared of that number.
+fn http_error(text: &str) -> String {
+    let words = text.strip_prefix("HTTP error Io Error: ").or_else(|| text.strip_prefix("HTTP error ")).unwrap_or(text);
+    plain_error(&words)
+}
+
+/// Stands for a router's answer the library could not parse.
+const UNREADABLE: &str = "the router's answer could not be read";
 
 /// What the router said, without the library's "Request error." in front,
 /// its closing periods or its parameter names.
@@ -514,5 +535,93 @@ mod tests {
         let line = refused_line(&io_add(Error::from_raw_os_error(1)), &AddAnyPortError::DescriptionTooLong);
         assert!(line.ends_with("; The description was too long for the gateway to handle)"), "{line:?}");
         assert_plain(&line);
+    }
+
+    /// A failure of the library's HTTP client, which is how a router that
+    /// does not take a request most often shows.
+    fn http(e: std::io::Error) -> RequestError {
+        RequestError::AttoHttpError(e.into())
+    }
+
+    #[test]
+    fn http_errors_read_plainly() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(http_error("HTTP error Io Error: Connection refused (os error 111)"), "Connection refused");
+        assert_eq!(http_error("HTTP error Status code 500 indicates failure"), "Status code 500 indicates failure");
+        // Text without the library's prefixes comes back unchanged.
+        for text in [
+            "Connection refused",
+            "Gateway response error 718: ConflictInMappingEntry",
+            "IO error: Io Error: no answer",
+            "the HTTP error Io Error: no answer",
+            "",
+        ] {
+            assert_eq!(http_error(text), text);
+        }
+
+        // What the library writes, so a change of wording shows here.
+        let windows = "No connection could be made because the target machine actively refused it.";
+        let shown = http(Error::new(ErrorKind::ConnectionRefused, windows)).to_string();
+        assert_eq!(shown, format!("HTTP error Io Error: {windows}"));
+        // In the host's lines, the OS's closing period goes too.
+        let line = refused_line(
+            &AddPortError::RequestError(http(Error::new(ErrorKind::ConnectionRefused, windows))),
+            &AddAnyPortError::RequestError(http(Error::new(ErrorKind::TimedOut, "The operation timed out."))),
+        );
+        assert_eq!(
+            line,
+            "the router refused to forward a port (No connection could be made because the target machine actively \
+             refused it; The operation timed out)"
+        );
+        assert_plain(&line);
+        // A real OS error, whatever its message on this OS.
+        let line = add_port_error(&AddPortError::RequestError(http(Error::from_raw_os_error(111))));
+        assert!(!line.is_empty() && !line.contains("HTTP error") && !line.contains("Io Error"), "{line:?}");
+        assert_plain(&line);
+        assert_plain(&add_any_port_error(&AddAnyPortError::RequestError(http(Error::from_raw_os_error(111)))));
+    }
+
+    #[test]
+    fn an_unreadable_router_answer_never_reaches_the_log() {
+        let body = "<s:Envelope><s:Body><u:GetExternalIPAddressResponse>private text</u:GetExternalIPAddressResponse>\
+                    </s:Body></s:Envelope>";
+        let bad = || RequestError::InvalidResponse(body.to_string());
+        assert_eq!(add_port_error(&AddPortError::RequestError(bad())), UNREADABLE);
+        assert_eq!(add_any_port_error(&AddAnyPortError::RequestError(bad())), UNREADABLE);
+        let line = refused_line(&AddPortError::RequestError(bad()), &AddAnyPortError::RequestError(bad()));
+        assert_eq!(
+            line,
+            "the router refused to forward a port (the router's answer could not be read; the router's answer could \
+             not be read)"
+        );
+        for part in ["private", "Envelope", "<", "Invalid response"] {
+            assert!(!line.contains(part), "{line:?} contains {part:?}");
+        }
+    }
+
+    #[test]
+    fn no_router_line_reads_plainly() {
+        use std::io::{Error, ErrorKind};
+        // Windows ends its messages with a period: the line never reads ".)".
+        let unreachable = "A socket operation was attempted to an unreachable network.";
+        assert_eq!(
+            no_router_line(&SearchError::IoError(Error::new(ErrorKind::Other, unreachable))),
+            "no UPnP router found (IO error: A socket operation was attempted to an unreachable network)"
+        );
+        assert_eq!(
+            no_router_line(&SearchError::IoError(Error::new(ErrorKind::Other, "Connection refused (os error 111)"))),
+            "no UPnP router found (IO error: Connection refused)"
+        );
+        assert_eq!(
+            no_router_line(&SearchError::HttpError(Error::new(ErrorKind::ConnectionRefused, unreachable).into())),
+            "no UPnP router found (A socket operation was attempted to an unreachable network)"
+        );
+        let timeout = no_router_line(&SearchError::NoResponseWithinTimeout);
+        assert_eq!(timeout, "no UPnP router found (No response within timeout)");
+        let by_io = SearchError::IoError(Error::from_raw_os_error(1));
+        let by_http = SearchError::HttpError(Error::from_raw_os_error(1).into());
+        for e in [by_io, by_http] {
+            assert_plain(&no_router_line(&e));
+        }
     }
 }

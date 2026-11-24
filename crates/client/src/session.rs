@@ -3,7 +3,7 @@
 //! reconnects when a relay is configured.
 
 use crate::relay::Relay;
-use hyperspace_bridge::Status;
+use hyperspace_bridge::{clause, plain_error, Status};
 use hyperspace_proto::clock::{now_us, ClockSync};
 use hyperspace_proto::cursor::CursorShape;
 use hyperspace_proto::frag::{Action, Frame, Reassembler};
@@ -552,6 +552,13 @@ impl Exit {
     }
 }
 
+/// A failure of the session's socket, without the OS error number (it
+/// differs from one OS to the next) or a closing period, as the reason of a
+/// longer line.
+fn network_error(e: &std::io::Error) -> String {
+    format!("network error: {}", clause(&plain_error(e)))
+}
+
 /// Run until `stop` is set, the host goes away, or the socket fails. Sends BYE
 /// on the way out when the exit is ours. `keyframe_every_us` periodically asks
 /// the host for a keyframe, and `cut_after` ends the session without a
@@ -680,7 +687,7 @@ fn receive_loop(
                     break Exit::HostTimeout;
                 }
             }
-            Err(e) => break Exit::Error(format!("network error: {e}")),
+            Err(e) => break Exit::Error(network_error(&e)),
         }
 
         handler.idle();
@@ -846,7 +853,7 @@ pub fn run_sessions(
         if began.elapsed() >= STABLE_SESSION {
             wait = RETRY_FIRST;
         }
-        log!("{}; connecting again", exit.describe());
+        log!("{}; connecting again", clause(&exit.describe()));
         let mut attempts = 0;
         conn = loop {
             if !wait_unless_stopped(jittered(wait), stop) {
@@ -886,6 +893,27 @@ mod tests {
         // The host said goodbye, another client took over, or we stopped.
         for exit in [Exit::Local, Exit::Host(bye::QUIT), Exit::Host(bye::REPLACED), Exit::Host(bye::STREAM_ENDED)] {
             assert!(!retryable(&exit), "{exit:?}");
+        }
+    }
+
+    #[test]
+    fn network_errors_read_plainly() {
+        use std::io::Error;
+        assert_eq!(
+            network_error(&Error::new(ErrorKind::Other, "Connection refused (os error 111)")),
+            "network error: Connection refused"
+        );
+        // Windows ends its messages with a period: "...; connecting again"
+        // never reads ".;".
+        let windows = "An existing connection was forcibly closed by the remote host.";
+        assert_eq!(
+            network_error(&Error::new(ErrorKind::ConnectionReset, windows)),
+            "network error: An existing connection was forcibly closed by the remote host"
+        );
+        for code in [1, 10054, 111] {
+            let exit = Exit::Error(network_error(&Error::from_raw_os_error(code)));
+            let line = format!("{}; connecting again", clause(&exit.describe()));
+            assert!(!line.contains("os error") && !line.contains(".;"), "{line:?}");
         }
     }
 

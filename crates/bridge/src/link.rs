@@ -294,7 +294,11 @@ pub async fn writer(sink: &mut SplitSink<Ws, Message>, rx: Rx, ping: Duration) -
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + ping, ping);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
-        // Only the waits race; whatever was taken off the queue is written.
+        // Only the waits race here, so a message this select takes off the
+        // queue is never lost to the tick. The writer itself is one branch
+        // of the link's loop: when that loop returns (the bridge is dropped,
+        // the relay closes, the link goes idle), this future and its queue
+        // are dropped, and what they still hold is not sent.
         let first = tokio::select! {
             msg = rx.recv() => Some(msg),
             _ = tick.tick() => None,
