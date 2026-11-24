@@ -499,12 +499,64 @@ async fn a_removed_link_that_stops_reading_gives_its_slot_back_in_time() {
             Ok(ws) => break ws,
             Err(status) => assert_eq!(status, 503),
         }
-        assert!(started.elapsed() < Duration::from_secs(10), "the removed link still holds its slot");
+        assert!(started.elapsed() < Duration::from_secs(7), "the removed link still holds its slot");
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     challenge(&mut d).await;
     send(&mut fast, Msg::ClientData(b"still here")).await;
     expect(&mut host, Msg::HostData { peer: 2, payload: b"still here" }).await;
+}
+
+#[tokio::test]
+async fn a_host_replaced_over_and_over_does_not_fill_the_relay() {
+    let mut c = config(Allow::Open);
+    // Far longer than the test: only the cap on closing links ends them.
+    c.write_timeout = Duration::from_secs(300);
+    c.idle_timeout = Duration::from_secs(300);
+    c.max_links = 7;
+    let addr = start(c).await;
+    let key = room();
+
+    // Hosts that never read, so never answer the close: each replaced one
+    // would hold its slot until its close deadline (5 s). Without the cap
+    // on closing links, these 7 take every slot: 6 closing, 1 seated.
+    let mut hosts = vec![join(addr, &key, Role::Host).await];
+    let started = tokio::time::Instant::now();
+    for _ in 0..6 {
+        hosts.push(join(addr, &key, Role::Host).await);
+    }
+
+    // With it, the room keeps 4 closing and the 2 oldest were dropped at
+    // once, giving their slots back long before the deadline.
+    let mut a = loop {
+        match try_connect(addr).await {
+            Ok(ws) => break ws,
+            Err(status) => assert_eq!(status, 503),
+        }
+        assert!(started.elapsed() < Duration::from_secs(3), "replaced hosts still hold every slot");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    // And the last host holds the room.
+    let nonce = challenge(&mut a).await;
+    send(&mut a, Msg::Hello(key.hello(Role::Client, &nonce))).await;
+    expect(&mut a, Msg::Ok).await;
+    expect(&mut a, Msg::Status { host_online: true }).await;
+    expect(hosts.last_mut().unwrap(), Msg::PeerOpen(1)).await;
+}
+
+/// Linux doubles the size set, and must not grow it: a proxy that stops
+/// reading would otherwise make it grow up to megabytes.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn connections_have_small_kernel_buffers() {
+    let listener = hyperspace_relay::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _peer = TcpStream::connect(addr).await.unwrap();
+    let (tcp, _) = timeout(WAIT, listener.accept()).await.expect("accept timed out").unwrap();
+    let socket = tokio::net::TcpSocket::from_std_stream(tcp.into_std().unwrap());
+    let size = 2 * hyperspace_relay::SOCKET_BUFFER;
+    assert_eq!(socket.send_buffer_size().unwrap(), size);
+    assert_eq!(socket.recv_buffer_size().unwrap(), size);
 }
 
 #[tokio::test]

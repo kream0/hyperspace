@@ -13,7 +13,7 @@
 //! connection from loopback the relay logs the header's last entry, the only
 //! one the proxy vouches for.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::io::{self, Write as _};
@@ -34,7 +34,7 @@ use axum::Router;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use hyperspace_proto::relay::{self as proto, mt, refused, Hello, Msg, Role, RoomId};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpSocket};
 use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 
 /// Where the relay listens unless told otherwise (loopback: a reverse proxy
@@ -66,6 +66,22 @@ const CLOSE_GRACE: Duration = Duration::from_secs(2);
 /// Time a link the room let go of has, from that moment, to take what is
 /// still queued for it and the close handshake. Past it, it is dropped.
 const CLOSE_DEADLINE: Duration = Duration::from_secs(5);
+/// Links a room let go of that may still be closing at once. When another
+/// one starts closing, the oldest is dropped at once: a host replaced over
+/// and over must not fill the relay with links that hold their slot for
+/// [`CLOSE_DEADLINE`].
+const MAX_CLOSING: usize = 4;
+/// Kernel send and receive buffer of every connection (SO_SNDBUF and
+/// SO_RCVBUF; Linux doubles the value, so 64 KiB each way). Left alone, the
+/// kernel grows a connection's send buffer up to 4 MiB (tcp_wmem) when the
+/// proxy stops reading, all of it charged to the service's memory.
+///
+/// It still carries a room's 60 Mbit/s with ease: the other end is the
+/// proxy on loopback, a fraction of a millisecond away, and 60 Mbit/s is
+/// only 7.5 KB per millisecond. 64 KiB in flight keeps up even when the
+/// proxy answers 8 ms late, and the link's queue ([`DATA_BYTES`]) takes
+/// the bursts.
+pub const SOCKET_BUFFER: u32 = 32 * 1024;
 
 /// Write one timestamped line to stderr. Never panics (eprintln! does when
 /// stderr is gone).
@@ -168,8 +184,15 @@ pub struct Config {
     pub max_pending: usize,
     /// WebSocket connections in all, authenticated or not, including links
     /// still closing; more are answered HTTP 503. This is what bounds the
-    /// relay's memory: each link can hold up to about 0.8 MiB (its queue and
-    /// WebSocket buffers).
+    /// relay's memory: a link can hold up to about 1 MiB, 0.77 MiB in the
+    /// relay (its queue, with the allocator's rounding, and its WebSocket
+    /// buffers) and 0.25 MiB in the kernel (its socket buffers, see
+    /// [`SOCKET_BUFFER`], plus one loopback packet over each). With the
+    /// defaults any link may be a full one: 16 rooms seat up to 80 links
+    /// and may have 64 more closing. A connection still authenticating
+    /// takes less (about 0.32 MiB).
+    /// Connections that never ask for the WebSocket are bounded by the
+    /// reverse proxy, which passes on only complete requests.
     pub max_links: usize,
     /// Time a new connection has to answer the challenge.
     pub auth_timeout: Duration,
@@ -190,8 +213,9 @@ impl Config {
             max_clients: 4,
             rate: Rate::from_mbit(60),
             max_pending: 64,
-            // 128 x 0.8 MiB stays under the service's 128 MiB memory cap.
-            max_links: 128,
+            // 96 x 1.02 MiB, plus about 10 MiB for the rest of the process,
+            // is 108 MiB: under the service's 128 MiB memory cap.
+            max_links: 96,
             auth_timeout: Duration::from_secs(5),
             ping_interval: Duration::from_secs(20),
             idle_timeout: Duration::from_secs(60),
@@ -245,6 +269,8 @@ struct LinkState {
     queued: AtomicUsize,
     /// Ends the connection at once (it could not take a control message).
     kill: Notify,
+    /// Ends the connection at once (newer links of its room are closing).
+    cut: Notify,
     /// Set just before the room drops the link...
     removed: OnceLock<Removed>,
     /// ...and then notified, which starts the writer's close deadline.
@@ -393,6 +419,11 @@ struct Shared {
     pending: Arc<Semaphore>,
     /// Permits for all connections ([`Config::max_links`]).
     links: Arc<Semaphore>,
+    /// Per room, the links it let go of that are still closing, oldest
+    /// first ([`MAX_CLOSING`]). Kept apart from the rooms: a room that
+    /// empties is deleted, but its closing links still count. Taken after
+    /// the rooms lock when both are held.
+    closing: Mutex<HashMap<RoomId, VecDeque<(u64, Arc<LinkState>)>>>,
 }
 
 impl Shared {
@@ -403,11 +434,45 @@ impl Shared {
             config,
             rooms: Mutex::new(HashMap::new()),
             next_link: AtomicU64::new(1),
+            closing: Mutex::new(HashMap::new()),
         }
     }
 
     fn rooms(&self) -> MutexGuard<'_, HashMap<RoomId, Room>> {
         self.rooms.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn closing(&self) -> MutexGuard<'_, HashMap<RoomId, VecDeque<(u64, Arc<LinkState>)>>> {
+        self.closing.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The room lets go of `link`, which then closes (see [`Link::remove`]).
+    /// Past [`MAX_CLOSING`] links closing in the room, the oldest is
+    /// dropped at once. Called under the rooms lock: the link is listed
+    /// before its connection, which takes that lock to leave, can look for
+    /// it in [`Shared::closed`].
+    fn let_go(&self, room: RoomId, link: Link, why: Removed) {
+        let mut closing = self.closing();
+        let list = closing.entry(room).or_default();
+        list.push_back((link.id, link.state.clone()));
+        if list.len() > MAX_CLOSING {
+            if let Some((_, oldest)) = list.pop_front() {
+                oldest.cut.notify_one();
+            }
+        }
+        drop(closing);
+        link.remove(why);
+    }
+
+    /// A link the room let go of has ended: it no longer counts as closing.
+    fn closed(&self, room: RoomId, id: u64) {
+        let mut closing = self.closing();
+        if let Some(list) = closing.get_mut(&room) {
+            list.retain(|(link, _)| *link != id);
+            if list.is_empty() {
+                closing.remove(&room);
+            }
+        }
     }
 
     fn counts(&self) -> (usize, usize) {
@@ -449,7 +514,7 @@ impl Shared {
         }
         let replaced = match r.host.replace(link) {
             Some(old) => {
-                old.remove(Removed::Replaced);
+                self.let_go(room, old, Removed::Replaced);
                 true
             }
             None => false,
@@ -547,7 +612,7 @@ impl Shared {
                     match rooms.get_mut(&room) {
                         Some(r) if r.host_is(id) => match r.clients.remove(&peer) {
                             Some(client) => {
-                                client.remove(Removed::ByHost);
+                                self.let_go(room, client, Removed::ByHost);
                                 true
                             }
                             None => false,
@@ -565,7 +630,23 @@ impl Shared {
     }
 }
 
-/// Serve the relay on `listener` until it fails.
+/// A listener for [`serve`] on `addr`. Unlike [`TcpListener::bind`], it caps
+/// the kernel buffers of every connection at [`SOCKET_BUFFER`] (accepted
+/// sockets take them from the listener). Call it inside the runtime.
+pub fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
+    let socket = if addr.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
+    // As TcpListener::bind does: a restarted relay gets its port back at once.
+    #[cfg(not(windows))]
+    socket.set_reuseaddr(true)?;
+    // Set before listening, so the kernel also sizes each connection's TCP
+    // window from it.
+    socket.set_send_buffer_size(SOCKET_BUFFER)?;
+    socket.set_recv_buffer_size(SOCKET_BUFFER)?;
+    socket.bind(addr)?;
+    socket.listen(1024)
+}
+
+/// Serve the relay on `listener` (from [`bind`]) until it fails.
 pub async fn serve(listener: TcpListener, config: Config) -> io::Result<()> {
     let shared = Arc::new(Shared::new(config));
     let app = Router::new().fallback(dispatch).with_state(shared);
@@ -661,11 +742,20 @@ struct Seated {
 impl Drop for Seated {
     fn drop(&mut self) {
         drop(self.slot.take());
+        let why = self.why.as_deref().unwrap_or("internal error");
+        let room = self.room.masked();
         if self.shared.leave(self.room, self.seat, self.id) {
-            let why = self.why.as_deref().unwrap_or("internal error");
             match self.seat {
-                Seat::Host => log!("host left room {}: {why}", self.room.masked()),
-                Seat::Client(peer) => log!("client {peer} left room {}: {why}", self.room.masked()),
+                Seat::Host => log!("host left room {room}: {why}"),
+                Seat::Client(peer) => log!("client {peer} left room {room}: {why}"),
+            }
+        } else {
+            // The room let go of it earlier (that was logged then); this is
+            // how its close went.
+            self.shared.closed(self.room, self.id);
+            match self.seat {
+                Seat::Host => log!("replaced host of room {room} gone: {why}"),
+                Seat::Client(peer) => log!("closed client {peer} of room {room} gone: {why}"),
             }
         }
     }
@@ -729,6 +819,7 @@ async fn connection(
         why = write(sink, outbox, first, &shared.config) => why,
         why = read(stream, &shared, room, seat, id) => why,
         _ = state.kill.notified() => "too slow (its queue was full)".to_string(),
+        _ = state.cut.notified() => format!("dropped at once ({MAX_CLOSING} newer links of its room are closing)"),
     };
     seated.why = Some(why);
 }
@@ -945,6 +1036,41 @@ mod tests {
         assert_eq!(room.alloc_peer(), u32::MAX);
         assert_eq!(room.alloc_peer(), 1);
         assert_eq!(room.alloc_peer(), 3, "2 is taken");
+    }
+
+    #[test]
+    fn a_room_keeps_at_most_four_closing_links() {
+        let shared = Shared::new(Config::new(Allow::Open));
+        let room = RoomId::from_bytes([0xab; 32]);
+        let other = RoomId::from_bytes([0xcd; 32]);
+        let mut states = Vec::new();
+        let mut outboxes = Vec::new();
+        for id in 1..=6 {
+            let (link, outbox) = Link::new(id);
+            states.push(link.state.clone());
+            outboxes.push(outbox);
+            shared.let_go(room, link, Removed::Replaced);
+        }
+        let (link, _outbox) = Link::new(7);
+        let elsewhere = link.state.clone();
+        shared.let_go(other, link, Removed::ByHost);
+
+        // The two oldest are dropped at once, the four newest close as
+        // usual, and another room's links count for that room only.
+        let cut: Vec<bool> = states.iter().map(|s| s.cut.notified().now_or_never().is_some()).collect();
+        assert_eq!(cut, [true, true, false, false, false, false]);
+        assert!(elsewhere.cut.notified().now_or_never().is_none());
+        assert!(states.iter().all(|s| s.removed.get() == Some(&Removed::Replaced)));
+        assert_eq!(shared.closing().get(&room).map(VecDeque::len), Some(MAX_CLOSING));
+
+        // Links that end stop counting (the dropped ones were no longer
+        // listed), and a room with none left is forgotten.
+        for id in 1..=6 {
+            shared.closed(room, id);
+        }
+        assert_eq!(shared.closing().len(), 1);
+        shared.closed(other, 7);
+        assert!(shared.closing().is_empty());
     }
 
     #[test]

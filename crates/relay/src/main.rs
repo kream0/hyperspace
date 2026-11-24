@@ -126,7 +126,7 @@ fn main() {
         }
     };
     let result = runtime.block_on(async {
-        let listener = tokio::net::TcpListener::bind(listen).await?;
+        let listener = hyperspace_relay::bind(listen)?;
         let addr = listener.local_addr()?;
         hyperspace_relay::log(format_args!(
             "hyperspace relay {} listening on {addr} ({rooms}; {limits})",
