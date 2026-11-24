@@ -110,13 +110,13 @@
 //!   default) and drops a link it hears nothing from for 60 seconds.
 //! - Drop a datagram over [`MAX_PAYLOAD`] locally: sending it drops the
 //!   whole link.
-//! - After 1008 `"refused"`, act on the REFUSED reason: retrying soon does
+//! - After 1008 `"refused"`, act on the REFUSED reason. Retrying soon does
 //!   not help for [`refused::NOT_ALLOWED`], [`refused::BAD_SIGNATURE`] or
-//!   [`refused::VERSION_MISMATCH`] (say so), nor for [`refused::PROTOCOL`],
-//!   which is a bug on the bridge's side (its HELLO did not decode): say
-//!   so and retry slowly, as for NOT_ALLOWED. [`refused::ROOM_FULL`],
-//!   [`refused::RELAY_FULL`] and [`refused::TIMEOUT`] may pass after a
-//!   back-off.
+//!   [`refused::VERSION_MISMATCH`]: say so. [`refused::PROTOCOL`] is a bug
+//!   on the bridge's side (its HELLO did not decode): say so and retry
+//!   slowly (retrying soon does not help, as for NOT_ALLOWED).
+//!   [`refused::ROOM_FULL`], [`refused::RELAY_FULL`] and
+//!   [`refused::TIMEOUT`] may pass after a back-off.
 //! - After 1000 `"closed by the host"` (a client): the host let this client
 //!   go. Do not reconnect at once.
 //! - After 4001 `"replaced"` (a host): back off, or stop and say so.

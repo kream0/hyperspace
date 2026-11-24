@@ -88,6 +88,16 @@ pub const MAX_CLOSING_ALL: usize = 16;
 /// bursts.
 pub const SOCKET_BUFFER: u32 = 32 * 1024;
 
+/// Most memory a link that authenticated can hold, in KiB (about 1.02 MiB):
+/// 0.77 MiB in the relay (its queue, with the allocator's rounding, and its
+/// WebSocket buffers) and 0.25 MiB in the kernel (its socket buffers, see
+/// [`SOCKET_BUFFER`], plus one loopback packet over each).
+pub const LINK_KIB: u64 = 1045;
+/// The same for a connection still authenticating (about 0.32 MiB).
+pub const PENDING_KIB: u64 = 328;
+/// The rest of the process (about 10 MiB).
+pub const PROCESS_KIB: u64 = 10 * 1024;
+
 /// Write one timestamped line to stderr. Never panics (eprintln! does when
 /// stderr is gone).
 pub fn log(args: fmt::Arguments) {
@@ -214,23 +224,38 @@ impl Config {
     /// end). Connections that never authenticate still can, by taking every
     /// pending slot, each for up to the auth timeout.
     ///
-    /// This bounds the relay's memory. A link that authenticated can hold
-    /// up to about 1.02 MiB: 0.77 MiB in the relay (its queue, with the
-    /// allocator's rounding, and its WebSocket buffers) and 0.25 MiB in the
-    /// kernel (its socket buffers, see [`SOCKET_BUFFER`], plus one loopback
-    /// packet over each). A connection still authenticating takes less,
-    /// about 0.32 MiB. With the defaults, 96 seated or closing links, 16
-    /// authenticating and about 10 MiB for the rest of the process come to
-    /// 98 + 5 + 10 = 113 MiB: under the service's 128 MiB memory cap.
-    /// Connections that never ask for the WebSocket are bounded by the
-    /// reverse proxy, which passes on only complete requests.
+    /// This bounds the relay's memory ([`Config::worst_case_mib`]). A link
+    /// that authenticated can hold up to about 1.02 MiB ([`LINK_KIB`]), a
+    /// connection still authenticating about 0.32 MiB ([`PENDING_KIB`]), and
+    /// the rest of the process takes about 10 MiB ([`PROCESS_KIB`]). With
+    /// the defaults, 96 seated or closing links, 16 authenticating and the
+    /// rest come to 98 + 5 + 10 = 113 MiB: under the service's 128 MiB
+    /// memory cap. Each room more adds a link per seat, about 5 MiB with 4
+    /// clients per room; each client per room more adds about 1 MiB per
+    /// room. Connections that never ask for the WebSocket are bounded by
+    /// the reverse proxy, which passes on only complete requests.
     pub fn links(&self) -> usize {
-        let all = self
-            .max_rooms
-            .saturating_mul(self.max_clients.saturating_add(1))
-            .saturating_add(self.max_pending)
-            .saturating_add(MAX_CLOSING_ALL);
-        all.min(self.max_links)
+        self.full_links().saturating_add(self.max_pending).min(self.max_links)
+    }
+
+    /// The most memory these limits let the relay use, in MiB, rounded:
+    /// every seat and every closing link full, the pending slots taken, all
+    /// within [`Config::links`]. See there for the figures.
+    pub fn worst_case_mib(&self) -> u64 {
+        let links = self.links() as u64;
+        let full = (self.full_links() as u64).min(links);
+        let pending = (self.max_pending as u64).min(links.saturating_sub(full));
+        let kib = full
+            .saturating_mul(LINK_KIB)
+            .saturating_add(pending.saturating_mul(PENDING_KIB))
+            .saturating_add(PROCESS_KIB);
+        kib.saturating_add(512) / 1024
+    }
+
+    /// Links that can hold their full share of memory: one per seat in every
+    /// room, plus the links still closing.
+    fn full_links(&self) -> usize {
+        self.max_rooms.saturating_mul(self.max_clients.saturating_add(1)).saturating_add(MAX_CLOSING_ALL)
     }
 
     pub fn new(allow: Allow) -> Config {
@@ -776,6 +801,10 @@ struct Seated {
 
 impl Drop for Seated {
     fn drop(&mut self) {
+        // The slot goes first. The other way round, a link no longer listed
+        // as closing would hold a slot for a moment, which Config::links does
+        // not leave room for. This way a link already gone may, for a moment,
+        // still count as closing (and get a closing link cut a step early).
         drop(self.slot.take());
         let why = self.why.as_deref().unwrap_or("internal error");
         let room = self.room.masked();
@@ -1150,6 +1179,31 @@ mod tests {
         assert_eq!(config.links(), 3);
         config.max_links = 1000;
         assert_eq!(config.links(), 16 + 2 * 2 + MAX_CLOSING_ALL, "only a lower number counts");
+    }
+
+    #[test]
+    fn the_worst_case_memory_follows_the_limits() {
+        let defaults = Config::new(Allow::Open);
+        // 96 full links, 16 authenticating and the rest of the process.
+        assert_eq!(defaults.worst_case_mib(), 113);
+        // A room more: 5 links more.
+        let mut config = defaults.clone();
+        config.max_rooms = 17;
+        assert_eq!(config.worst_case_mib(), 118);
+        // A client per room more: 16 links more.
+        let mut config = defaults.clone();
+        config.max_clients = 5;
+        assert_eq!(config.worst_case_mib(), 129);
+        // A lower connection limit leaves less room, full links first.
+        let mut config = defaults.clone();
+        config.max_links = 100;
+        assert_eq!(config.worst_case_mib(), 109);
+        config.max_links = 3;
+        assert_eq!(config.worst_case_mib(), 13);
+        // Absurd limits saturate rather than overflow.
+        let mut config = defaults;
+        config.max_rooms = usize::MAX;
+        assert!(config.worst_case_mib() > 1 << 30);
     }
 
     #[test]

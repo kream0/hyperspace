@@ -10,7 +10,7 @@ use hyperspace_proto::relay::{self, refused, Msg, Role, RoomKey};
 use hyperspace_proto::secure::Key;
 use hyperspace_relay::{Allow, Config, Rate};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -26,8 +26,9 @@ fn config(allow: Allow) -> Config {
     c
 }
 
+/// A relay on a free loopback port, with the production socket options.
 async fn start(config: Config) -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = hyperspace_relay::bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         hyperspace_relay::serve(listener, config).await.unwrap();
