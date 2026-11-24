@@ -5,7 +5,6 @@ members = ["crates/proto", "crates/host", "crates/client"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-repository = "https://github.com/kream0/hyperspace"
 
 [profile.release]
 opt-level = 3

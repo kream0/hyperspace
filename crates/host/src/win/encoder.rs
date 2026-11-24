@@ -510,7 +510,10 @@ impl Encoder {
                 None => q.pop_front().unwrap_or_else(hyperspace_proto::clock::now_us),
             }
         };
-        let _ = self.in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1)));
+        // Only this thread decrements, so load-then-sub cannot underflow.
+        if self.in_flight.load(Ordering::Relaxed) > 0 {
+            self.in_flight.fetch_sub(1, Ordering::Relaxed);
+        }
         self.frames_out.fetch_add(1, Ordering::Relaxed);
         if info.keyframe && !info.has_param_sets {
             // The decoder needs SPS/PPS in-band with every keyframe.

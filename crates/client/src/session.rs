@@ -94,11 +94,15 @@ pub fn connect(opts: &Options) -> Result<Connection, String> {
             _ => {}
         }
     }
-    Err(format!(
+    let mut msg = format!(
         "no answer from {} - is hyperspace-host running there and is UDP port {} allowed through its firewall?",
         opts.host,
         opts.host.port()
-    ))
+    );
+    if cfg!(target_os = "macos") {
+        msg += "\n(on macOS also check System Settings > Privacy & Security > Local Network: the terminal you launched this from must be allowed)";
+    }
+    Err(msg)
 }
 
 /// Sends input with redundancy until acked. Shared between the UI thread

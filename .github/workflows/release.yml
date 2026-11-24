@@ -29,7 +29,7 @@ jobs:
         run: |
           New-Item -ItemType Directory dist | Out-Null
           Copy-Item target\release\hyperspace-host.exe, README.md dist\
-          Compress-Archive -Path dist\* -DestinationPath "hyperspace-host-$env:TAG-windows-x64.zip"
+          Compress-Archive -Path dist\* -DestinationPath "hyperspace-host-windows-x64.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: windows
@@ -54,7 +54,7 @@ jobs:
             target/x86_64-apple-darwin/release/hyperspace-client
           codesign --force --sign - dist/hyperspace-client
           cp README.md dist/
-          tar -czf "hyperspace-client-$TAG-macos-universal.tar.gz" -C dist .
+          tar -czf "hyperspace-client-macos-universal.tar.gz" -C dist .
       - uses: actions/upload-artifact@v4
         with:
           name: macos
@@ -78,12 +78,12 @@ jobs:
           cat > notes.md <<NOTES
           ## Install
 
-          **Windows host** (the machine you want to control): unzip \`hyperspace-host-$TAG-windows-x64.zip\` and run \`hyperspace-host.exe\`. Allow it through the firewall on private networks when Windows asks.
+          **Windows host** (the machine you want to control): unzip \`hyperspace-host-windows-x64.zip\` and run \`hyperspace-host.exe\`. Allow it through the firewall on private networks when Windows asks.
 
           **macOS client** (the machine you sit at):
 
           \`\`\`bash
-          curl -L https://github.com/${{ github.repository }}/releases/download/$TAG/hyperspace-client-$TAG-macos-universal.tar.gz | tar -xz
+          curl -L https://github.com/${{ github.repository }}/releases/download/$TAG/hyperspace-client-macos-universal.tar.gz | tar -xz
           ./hyperspace-client <windows-ip>
           \`\`\`
 

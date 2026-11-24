@@ -16,10 +16,14 @@ use hyperspace_proto::{annexb, log, Codec};
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Write};
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+/// Set (by the console control handler) to make the server say goodbye to its
+/// client, release held keys and return.
+pub static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 /// Frames kept for NACK retransmission.
 const STORE_FRAMES: usize = 48;
@@ -276,6 +280,11 @@ impl Server {
                 // Windows reports ICMP port-unreachable for earlier sends as a recv error.
                 Err(e) if e.kind() == ErrorKind::ConnectionReset => {}
                 Err(e) => return Err(format!("socket error: {e}")),
+            }
+            if SHUTDOWN.load(Ordering::Relaxed) {
+                log!("shutting down");
+                self.end_session(Some(bye::QUIT));
+                return Ok(());
             }
             self.housekeeping();
             had_session |= self.session.is_some();

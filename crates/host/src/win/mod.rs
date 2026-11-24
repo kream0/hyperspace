@@ -20,6 +20,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Media::MediaFoundation::{MFShutdown, MFStartup, MFSTARTUP_FULL, MF_VERSION};
 use windows::Win32::Media::timeBeginPeriod;
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+use windows::Win32::System::Console::SetConsoleCtrlHandler;
 use windows::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED};
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, SetPriorityClass, SetThreadPriority, HIGH_PRIORITY_CLASS, THREAD_PRIORITY_HIGHEST,
@@ -49,7 +50,17 @@ pub fn process_setup() {
         let _ = SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
         // 1 ms scheduler granularity for accurate short waits.
         timeBeginPeriod(1);
+        // Ctrl+C / closing the console: disconnect the client cleanly first.
+        let _ = SetConsoleCtrlHandler(Some(console_handler), true);
     }
+}
+
+unsafe extern "system" fn console_handler(_ctrl_type: u32) -> windows::core::BOOL {
+    crate::server::SHUTDOWN.store(true, Ordering::Relaxed);
+    // For close/logoff/shutdown events the process dies when this returns:
+    // give the server loop a moment to send BYE and release held keys.
+    std::thread::sleep(Duration::from_millis(400));
+    true.into()
 }
 
 /// COM (multithreaded apartment) + Media Foundation for the current thread.
@@ -362,7 +373,8 @@ fn frame_loop(
         // While a captured frame waits for its slot, only wait that long;
         // a newer frame arriving meanwhile simply replaces it.
         let since = last_submit.elapsed();
-        let wait_ms = if pending_image || force_key { min_gap.saturating_sub(since).as_millis().min(4) as u32 } else { 4 };
+        let ready = have_image && (pending_image || force_key);
+        let wait_ms = if ready { min_gap.saturating_sub(since).as_millis().min(4) as u32 } else { 4 };
         match cap.acquire(wait_ms, target, &mut |shape, visible| sink_ref.cursor(shape, visible))? {
             Acquired::Frame { image: true } => {
                 pending_ts = now_us();

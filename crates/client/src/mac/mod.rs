@@ -33,6 +33,11 @@ use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{CustomCursor, Fullscreen, Window, WindowId};
 
+extern "C" {
+    fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+}
+const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+
 /// State shared between the UI thread and the render thread.
 #[derive(Default)]
 pub struct UiShared {
@@ -212,6 +217,9 @@ impl App {
             std::thread::Builder::new()
                 .name("net-decode-present".into())
                 .spawn(move || {
+                    // Highest scheduling class: keeps this thread on the
+                    // performance cores and ahead of background work.
+                    unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
                     let mut h = NetHandler {
                         decoder: Decoder::new(codec),
                         renderer,
