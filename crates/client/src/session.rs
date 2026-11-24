@@ -366,11 +366,17 @@ pub fn connect(opts: &Options, mut relay: Option<&mut Relay>, stop: &AtomicBool)
     // keys; it then starts capturing and tells us about the stream.
     let mut plain = Vec::new();
     let start = Instant::now();
+    let mut last_req: Option<Instant> = None;
     while start.elapsed() < opts.timeout {
         if stop.load(Ordering::Relaxed) {
             return Err("stopped".into());
         }
-        link.send(&wire::req_welcome());
+        // On a timer, not once per datagram: stray ones (the last session's,
+        // on the relay link) must not set off a burst.
+        if last_req.is_none_or(|t| t.elapsed() >= Duration::from_millis(100)) {
+            last_req = Some(Instant::now());
+            link.send(&wire::req_welcome());
+        }
         let n = match link.sock.recv(&mut buf) {
             Ok(n) => n,
             Err(_) => continue,
@@ -412,7 +418,10 @@ impl InputTx {
     }
 
     /// A new session replaced the last: send on its link, from a fresh queue
-    /// (the new session numbers input from the start).
+    /// (the new session numbers input from the start). Input typed while the
+    /// client was connecting again went out on the old link, and the host
+    /// dropped it: on purpose. Never carry it over, since clicks replayed
+    /// late on the new session would do worse than none.
     pub fn set_link(&self, link: Arc<Link>) {
         let mut s = self.state.lock().unwrap();
         s.link = link;
@@ -877,6 +886,39 @@ mod tests {
         for exit in [Exit::Local, Exit::Host(bye::QUIT), Exit::Host(bye::REPLACED), Exit::Host(bye::STREAM_ENDED)] {
             assert!(!retryable(&exit), "{exit:?}");
         }
+    }
+
+    #[test]
+    fn a_stray_answer_leaves_the_handshake_usable() {
+        // A late answer to an earlier handshake (the last session's, on the
+        // relay link), or a damaged answer, is ignored, and the real one still
+        // completes the handshake. This relies on the noise library putting
+        // its state back after a failed read.
+        let key = Key::generate();
+        let ok = wire::accept(wire::ACCEPT_OK);
+        let earlier = Initiator::new(&key, b"earlier");
+        let (r, _) = secure::Responder::accept(&key, earlier.packet()).unwrap();
+        let (_, stale) = r.finish(&ok);
+        let mut init = Initiator::new(&key, b"now");
+        let (r, payload) = secure::Responder::accept(&key, init.packet()).unwrap();
+        assert_eq!(payload, b"now");
+        let (host, real) = r.finish(&ok);
+        let mut damaged = real.clone();
+        *damaged.last_mut().unwrap() ^= 1;
+        assert!(matches!(answer(&mut init, &stale), Ok(None)));
+        assert!(matches!(answer(&mut init, &damaged), Ok(None)));
+        assert!(matches!(answer(&mut init, &real[..real.len() - 1]), Ok(None)));
+        assert!(matches!(answer(&mut init, &[]), Ok(None)));
+        let client = match answer(&mut init, &real) {
+            Ok(Some(s)) => s,
+            other => panic!("the real answer did not complete the handshake: {:?}", other.err()),
+        };
+        // Both ends hold the same keys.
+        let (mut sealed, mut plain) = (Vec::new(), Vec::new());
+        client.seal(b"ping", &mut sealed);
+        assert_eq!(host.open(&sealed, &mut plain), Some(&b"ping"[..]));
+        host.seal(b"pong", &mut sealed);
+        assert_eq!(client.open(&sealed, &mut plain), Some(&b"pong"[..]));
     }
 
     #[test]

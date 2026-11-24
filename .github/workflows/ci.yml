@@ -122,6 +122,7 @@ jobs:
           RELAY_PID=$!
           for i in $(seq 50); do grep -q "listening on" relay.log && break; sleep 0.2; done
           target/release/hyperspace-host.exe --once --port 45813 --no-upnp --no-dht --relay ws://127.0.0.1:47813 --config-dir relayhostcfg > relay-host.log 2>&1 &
+          HOST_PID=$!
           for i in $(seq 100); do grep -q "relay: connected to" relay-host.log && break; sleep 0.2; done
           KEY=$(cut -d. -f2 relayhostcfg/host.key)
           target/release/hyperspace-client.exe pair "hs1.$KEY.192.0.2.1/45813,relay=ws://127.0.0.1:47813/v1" --config-dir relayclientcfg
@@ -134,7 +135,7 @@ jobs:
           grep -q "CLIENT OK" relay-client.log || status=1
           grep -q "authenticated with the host through the relay" relay-client.log || status=1
           grep -q "connected through the relay" relay-host.log || status=1
-          kill $RELAY_PID 2>/dev/null || true
+          kill $HOST_PID $RELAY_PID 2>/dev/null || true
           exit $status
       - name: Find the host through the public lookup network (live internet)
         # Depends on the public BitTorrent DHT being reachable from the runner.

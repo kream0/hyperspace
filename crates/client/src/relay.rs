@@ -239,9 +239,13 @@ impl Relay {
         let handle = sock.try_clone().and_then(|s| s.set_nonblocking(true).map(|()| s));
         match handle {
             Ok(s) => {
-                let mut buf = [0u8; 2048];
+                // Larger than any relayed datagram. Only "nothing left" ends
+                // the drain: Windows also reports a datagram too large for
+                // the buffer, or an earlier send's ICMP error, as an error
+                // here, and those still leave datagrams behind them.
+                let mut buf = vec![0u8; 9000];
                 for _ in 0..100_000 {
-                    if s.recv(&mut buf).is_err() {
+                    if matches!(s.recv(&mut buf), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock) {
                         break;
                     }
                 }

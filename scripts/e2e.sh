@@ -292,11 +292,19 @@ expect "$LOGS/relay-f.client.log" "CLIENT OK" "CLIENT OK"
 expect "$LOGS/relay-f.client.log" "relay link reconnected \([0-9]+ reconnects so far\); it had closed: " "the reconnect line"
 expect "$LOGS/relay-f.client.log" "relay link: up [0-9]+ s, [1-9][0-9]* reconnects, last close: " "the reconnect count at exit"
 [ "$(grep -c "relay: connected to" "$LOGS/relay-f.host.log")" -ge 2 ] || ERRS+="  relay-f.host.log: the host's relay link did not come back"$'\n'
-# The second session goes through the same link (and so the same local socket).
-[ "$(grep -c "authenticated with the host through the relay" "$LOGS/relay-f.client.log")" -ge 2 ] \
-  || ERRS+="  relay-f.client.log: no second session through the relay"$'\n'
+# Whichever side gets back to the relay first: if the client's link sees the
+# host come online, it makes a second session over the same link (and so the
+# same local socket); if the host was back first, the session carries on and
+# the host moves it to its new socket for this client. Video goes on either way.
+if [ "$(grep -c "authenticated with the host through the relay" "$LOGS/relay-f.client.log")" -lt 2 ] \
+  && ! grep -qE "client moved to .*through the relay" "$LOGS/relay-f.host.log"; then
+  ERRS+="  relay-f: neither a second session nor the session moving to the new link"$'\n'
+fi
+in_order "$LOGS/relay-f.client.log" "video after the reconnect" \
+  "relay link reconnected" "\] [1-9][0-9]* fps  [0-9.]+ Mbit/s.*via relay" "CLIENT OK"
 reject "$LOGS/relay-f.client.log" "starting a new relay link" "a new relay link"
 grep -h -E "relay link|connecting again|authenticated" "$LOGS/relay-f.client.log" || true
+grep -h -E "client moved to|connected through" "$LOGS/relay-f.host.log" || true
 end_case relay-f "$LOGS/relay-f.client.log" "$LOGS/relay-f.host.log" "$LOGS/relay-f.relay.log"
 
 echo "=== relay-g (a pairing without a relay: --relay once, then plain runs use it; --relay off; --relay-check)"
