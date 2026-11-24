@@ -989,15 +989,22 @@ fn other_tls_failures_keep_a_short_detail() {
 #[test]
 fn an_answer_that_is_not_tls_reads_the_same_on_every_os() {
     let not_tls = "the server at relay.example port 443 did not answer with TLS (wrong port?)";
-    // Linux: OpenSSL 3.0 (seen on a real run against an HTTP port), and a
-    // later one that adds a second entry.
+    // Linux, both seen on real runs against an HTTP port: OpenSSL 3.0, and
+    // a later one, which checks the record length first.
     let wrong = "error:0A00010B:SSL routines::wrong version number:../ssl/record/ssl3_record.c:354:".to_string();
     assert_eq!(tls_line((wrong.clone(), wrong)), not_tls);
-    let stacked = "error:0A00010B:SSL routines:tls_get_more_records:wrong version number:\
-                   ../ssl/record/methods/tls_common.c:605:, error:0A000139:SSL routines::record layer failure:\
-                   ../ssl/record/rec_layer_s3.c:696:"
-        .to_string();
-    assert_eq!(tls_line((stacked.clone(), stacked)), not_tls);
+    let long = (
+        "error:0A0000C6:SSL routines:tls_get_more_records:packet length too long:../ssl/record/methods/tls_common.c:660:, \
+         error:0A000139:SSL routines::record layer failure:../ssl/record/rec_layer_s3.c:698:"
+            .to_string(),
+        "Ssl(Error { code: ErrorCode(1), cause: Some(Ssl(ErrorStack([Error { code: 167772358, library: \"SSL routines\", \
+         function: \"tls_get_more_records\", reason: \"packet length too long\", file: \
+         \"../ssl/record/methods/tls_common.c\", line: 660 }, Error { code: 167772473, library: \"SSL routines\", \
+         function: \"\", reason: \"record layer failure\", file: \"../ssl/record/rec_layer_s3.c\", line: 698 }]))) }, \
+         X509VerifyResult { code: 0, error: \"ok\" })"
+            .to_string(),
+    );
+    assert_eq!(tls_line(long), not_tls);
     // macOS and Windows, by number.
     assert_eq!(tls_line(macos(-9847, "dépassement d'enregistrement")), not_tls);
     assert_eq!(tls_line(windows(0x8009_0308, "Le jeton fourni à la fonction n'est pas valide")), not_tls);

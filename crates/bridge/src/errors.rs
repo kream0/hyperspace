@@ -42,7 +42,8 @@ const CODES: &[(i64, Problem)] = &[
     (-9813, Problem::Untrusted),  // errSSLNoRootCert
     // Secure Transport reads the first 5 bytes as a record header, so an
     // HTTP answer ("HTTP/") announces a 20,527-byte record, more than its
-    // 18,432-byte read buffer (SSLRecordInternal.c).
+    // 18,432-byte read buffer (SSLRecordInternal.c). Seen in CI against an
+    // HTTP port, as was SChannel's SEC_E_INVALID_TOKEN below.
     (-9847, Problem::NotTls), // errSSLRecordOverflow
     // Windows: certificate chain policy and SChannel.
     (hr(0x800B_010F), Problem::Name),      // CERT_E_CN_NO_MATCH
@@ -59,8 +60,11 @@ const CODES: &[(i64, Problem)] = &[
 /// OpenSSL's certificate verify results and record reasons (Linux),
 /// lowercase. OpenSSL 1.1 writes "self signed", 3.x "self-signed".
 const TEXTS: &[(&str, Problem)] = &[
-    // The first bytes are not a TLS record header.
+    // The first bytes are not a TLS record header. OpenSSL 3.0 checks the
+    // version first; 3.2 and later check the length first ("HTTP/" announces
+    // a 20,527-byte record). Both seen on real runs against an HTTP port.
     ("wrong version number", Problem::NotTls),
+    ("packet length too long", Problem::NotTls),
     ("hostname mismatch", Problem::Name),
     ("ip address mismatch", Problem::Name),
     ("certificate has expired", Problem::Expired),
