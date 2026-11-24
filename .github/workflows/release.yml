@@ -2,9 +2,15 @@ name: Release
 
 # A release is published for a version exactly once:
 #   - when a `v*` tag is pushed,
-#   - when the workflow is run manually with a version, or
+#   - when the workflow is run manually with `publish` ticked, or
 #   - when the default branch is pushed and the workspace version in
 #     Cargo.toml has no release yet (bump the version to cut a release).
+# The tag of a release must be `v` followed by the workspace version.
+#
+# Run manually without `publish` (the default), the workflow is a dry run:
+# it builds and packages everything, then uploads the files it would
+# publish as the `release-dry-run` workflow artifact, and publishes nothing.
+# Any other push only runs the plan job.
 on:
   push:
     tags: ["v*"]
@@ -12,8 +18,14 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Tag to create and release, e.g. v0.1.0"
-        required: true
+        description: "Tag, e.g. v0.1.0 (empty: v + the version in Cargo.toml)"
+        required: false
+        default: ""
+      publish:
+        description: "Publish the GitHub release (unticked: dry run, nothing is published)"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
@@ -23,11 +35,12 @@ env:
 
 jobs:
   plan:
-    name: Decide whether to release
+    name: Decide whether to build and release
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.plan.outputs.tag }}
       release: ${{ steps.plan.outputs.release }}
+      build: ${{ steps.plan.outputs.build }}
     steps:
       - uses: actions/checkout@v4
       - id: plan
@@ -38,28 +51,45 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           INPUT_VERSION: ${{ inputs.version }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
         run: |
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version *= *"\(.*\)"/\1/p' Cargo.toml)
           release=false
+          build=false
           if [ "$EVENT" = "workflow_dispatch" ]; then
-            tag="$INPUT_VERSION"; release=true
+            tag="${INPUT_VERSION:-v$version}"
+            build=true
+            if [ "$INPUT_PUBLISH" = "true" ]; then release=true; fi
           elif [ "$REF_TYPE" = "tag" ]; then
             tag="$REF_NAME"; release=true
           else
-            version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version *= *"\(.*\)"/\1/p' Cargo.toml)
             tag="v$version"
             if [ "$REF_NAME" = "$DEFAULT_BRANCH" ] && [ -n "$version" ] && ! gh release view "$tag" >/dev/null 2>&1; then
               release=true
             fi
           fi
-          case "$tag" in v[0-9]*) ;; *) echo "invalid tag '$tag'"; exit 1 ;; esac
-          echo "tag=$tag release=$release"
+          if [ "$release" = "true" ]; then build=true; fi
+          echo "tag=$tag release=$release build=$build"
+          if ! [[ "$tag" =~ ^v[0-9][0-9A-Za-z.+-]*$ ]]; then
+            echo "::error::invalid tag '$tag'"; exit 1
+          fi
+          if [ "$build" = "true" ]; then
+            if [ -z "$version" ] || [ "$tag" != "v$version" ]; then
+              if [ "$release" = "true" ]; then
+                echo "::error::the tag '$tag' is not v + the workspace version in Cargo.toml ('$version')"
+                exit 1
+              fi
+              echo "::warning::the tag '$tag' is not v + the workspace version in Cargo.toml ('$version'): publishing it would fail"
+            fi
+          fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
 
   windows:
     name: Windows x64
     needs: plan
-    if: needs.plan.outputs.release == 'true'
+    if: needs.plan.outputs.build == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -79,7 +109,7 @@ jobs:
   macos:
     name: macOS universal
     needs: plan
-    if: needs.plan.outputs.release == 'true'
+    if: needs.plan.outputs.build == 'true'
     runs-on: macos-latest
     env:
       MACOSX_DEPLOYMENT_TARGET: "12.0"
@@ -95,7 +125,9 @@ jobs:
           lipo -create -output dist/hyperspace-client \
             target/aarch64-apple-darwin/release/hyperspace-client \
             target/x86_64-apple-darwin/release/hyperspace-client
+          lipo -info dist/hyperspace-client
           codesign --force --sign - dist/hyperspace-client
+          codesign --verify --verbose dist/hyperspace-client
           cp README.md dist/
           tar -czf "hyperspace-client-macos-universal.tar.gz" -C dist .
       - uses: actions/upload-artifact@v4
@@ -106,7 +138,7 @@ jobs:
   linux:
     name: Relay (Linux x64, static)
     needs: plan
-    if: needs.plan.outputs.release == 'true'
+    if: needs.plan.outputs.build == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -130,8 +162,9 @@ jobs:
           path: hyperspace-relay-*.tar.gz
 
   publish:
-    name: Publish GitHub release
+    name: Assemble, then publish the release or keep the dry run
     needs: [plan, windows, macos, linux]
+    if: needs.plan.outputs.build == 'true'
     runs-on: ubuntu-latest
     env:
       TAG: ${{ needs.plan.outputs.tag }}
@@ -146,11 +179,8 @@ jobs:
           (cd assets && sha256sum *) > SHA256SUMS.txt
           mv SHA256SUMS.txt assets/
           cat assets/SHA256SUMS.txt
-      - name: Create release
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Release notes
         run: |
-          ls -la assets
           cat > notes.md <<NOTES
           ## Install
 
@@ -169,6 +199,24 @@ jobs:
           Host and client must be the same version. See the README for options, shortcuts and limitations. \`SHA256SUMS.txt\` lists the checksum of every file.
           NOTES
           sed -i 's/^          //' notes.md
+          ls -la assets
+          cat notes.md
+      # Dry run: what would be published is kept as a workflow artifact.
+      - name: Keep the dry run
+        if: needs.plan.outputs.release != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dry-run
+          path: |
+            assets
+            notes.md
+          if-no-files-found: error
+      # The only step that creates, uploads to or edits a GitHub release.
+      - name: Publish the release
+        if: needs.plan.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" assets/* --clobber
           else
