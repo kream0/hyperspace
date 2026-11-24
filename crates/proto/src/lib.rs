@@ -12,6 +12,7 @@ pub mod frag;
 pub mod input;
 pub mod pairing;
 pub mod rate;
+pub mod relay;
 pub mod rendezvous;
 pub mod secure;
 pub mod wire;

@@ -18,14 +18,14 @@ use mainline::{MutableItem, SigningKey};
 /// BEP 44 values are limited to 1000 bytes.
 const MAX_PLAIN: usize = 900;
 
-fn derive(key: &Key, label: &[u8]) -> [u8; 32] {
+pub(crate) fn derive(key: &Key, label: &[u8]) -> [u8; 32] {
     let mut h = Blake2s256::new();
     h.update(label);
     h.update(key.bytes());
     h.finalize().into()
 }
 
-fn signing_key(key: &Key) -> SigningKey {
+pub(crate) fn signing_key(key: &Key) -> SigningKey {
     SigningKey::from_bytes(&derive(key, b"hyperspace rendezvous signing v1"))
 }
 

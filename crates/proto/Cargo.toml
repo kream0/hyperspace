@@ -10,3 +10,5 @@ getrandom = "0.3"
 blake2 = "0.10"
 chacha20poly1305 = "0.10"
 mainline = { version = "8", default-features = false, features = ["node"] }
+# Same version mainline uses; only the core signing/verification API is needed.
+ed25519-dalek = { version = "3", default-features = false }
