@@ -96,7 +96,7 @@ What can still stop it:
 | Provider uses carrier-grade NAT (no public IPv4) | "its own address is not public" | Connect over IPv6 (both ends need it), use a [relay](#through-a-relay), or ask the provider for a public IPv4 |
 | Windows Firewall blocks public networks | (client gets no answer) | Allow hyperspace-host for public networks |
 | Network you are on blocks UDP | (client gets no answer) | Use a [relay](#through-a-relay), or another network / tethering |
-| The Mac runs a VPN or security client (Zscaler, GlobalProtect, …) | client error names the tunnel interface | Those route all traffic through a tunnel that usually drops direct UDP. Use a device without it, or ask whoever manages it |
+| The Mac runs a VPN or a company security client | client error names the tunnel interface | Those route traffic through a tunnel that usually drops direct UDP. Use a [relay](#through-a-relay); if the relay's domain is blocked too, ask whoever manages the device (the IT department) |
 
 On start the host also sends a test packet to its own public address. If it
 comes back in, the log says so and you know the router and Windows Firewall
