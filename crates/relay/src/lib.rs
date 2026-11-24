@@ -207,10 +207,12 @@ impl Config {
     /// The most WebSocket connections at once: room for every one the other
     /// limits allow at the same time, max_pending + max_rooms x (1 +
     /// max_clients) + [`MAX_CLOSING_ALL`] (with the defaults 16 + 16 x 5 +
-    /// 16 = 112), or [`Config::max_links`] if that is lower. So neither
-    /// connections still authenticating nor links still closing can keep a
-    /// host or a client out of a room with a free seat (but for the moment
-    /// a dropped closing link takes to end).
+    /// 16 = 112), or [`Config::max_links`] if that is lower. So a connection
+    /// that gets one of the max_pending slots always gets a link slot too:
+    /// links still closing can never keep a host or a client out of a room
+    /// with a free seat (but for the moment a dropped closing link takes to
+    /// end). Connections that never authenticate still can, by taking every
+    /// pending slot, each for up to the auth timeout.
     ///
     /// This bounds the relay's memory. A link that authenticated can hold
     /// up to about 1.02 MiB: 0.77 MiB in the relay (its queue, with the
