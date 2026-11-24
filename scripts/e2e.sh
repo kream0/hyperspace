@@ -122,4 +122,185 @@ if command -v python3 >/dev/null; then
     grep -E "nacks" "$LOGS/loss-${loss}pct.client.log" | tail -1 || true
   done
 fi
+
+# ---- Relay fallback: host and client each reach a relay on loopback (cases a-g).
+# Port 47800 is left alone (the CI smoke test and a live relay use it).
+# Failures are collected, each with both logs, so one run shows them all.
+RELAY_PORT=47811
+RELAY="ws://127.0.0.1:$RELAY_PORT"
+DEAD=192.0.2.1/45800 # a documentation address: never answers
+RHOST="$LOGS/relay-host"
+"$BIN/hyperspace-host" --relay-id --config-dir "$RHOST" >"$LOGS/relay.allow" 2>/dev/null
+: >"$LOGS/relay-empty.allow"
+KEY=$(cut -d. -f2 "$RHOST/host.key")
+RELAY_FAILED=
+ERRS=
+RELAY_PID=
+
+expect() { # file ERE what
+  grep -qE -- "$2" "$1" || ERRS+="  $(basename "$1"): missing $3"$'\n'
+}
+reject() { # file ERE what
+  if grep -qE -- "$2" "$1"; then ERRS+="  $(basename "$1"): unexpected $3"$'\n'; fi
+}
+end_case() { # name logs...
+  local name=$1 f; shift
+  for f in "$@"; do
+    case $f in *client*) if grep -qF -- "$KEY" "$f"; then ERRS+="  $(basename "$f"): shows the pairing key"$'\n'; fi ;; esac
+  done
+  if [ -n "$ERRS" ]; then
+    echo "FAILED: $name"; printf '%s' "$ERRS"
+    for f in "$@"; do echo "--- $(basename "$f")"; cat "$f" 2>/dev/null || true; done
+    RELAY_FAILED+=" $name"
+  else
+    echo "ok"
+  fi
+  ERRS=
+}
+stop_pid() { [ -n "${1:-}" ] || return 0; kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }
+start_relay() { # log port allow-file; retries the bind (after a kill -9, say)
+  for _ in $(seq 20); do
+    "$BIN/hyperspace-relay" --listen "127.0.0.1:$2" --allow "$3" >"$1" 2>&1 &
+    RELAY_PID=$!
+    for _ in $(seq 20); do
+      grep -q "listening on 127.0.0.1:$2" "$1" && return 0
+      kill -0 $RELAY_PID 2>/dev/null || break
+      sleep 0.1
+    done
+    stop_pid $RELAY_PID
+    sleep 0.3
+  done
+  ERRS+="  $(basename "$1"): the relay did not start"$'\n'
+  return 1
+}
+start_rhost() { # name port: a host with the relay set, until its link is up
+  "$BIN/hyperspace-host" --file testdata/testsrc_720p.h264 --port "$2" --no-upnp --no-dht --relay "$RELAY" \
+    --config-dir "$RHOST" >"$LOGS/$1.host.log" 2>&1 &
+  HOST_PID=$!
+  for _ in $(seq 100); do grep -q "relay: connected to" "$LOGS/$1.host.log" && return 0; sleep 0.1; done
+  ERRS+="  $1.host.log: the host's relay link did not come up"$'\n'
+  return 1
+}
+rpair() { # dir pairing-string
+  mkdir -p "$LOGS/$1"
+  "$BIN/hyperspace-client" pair "$2" --config-dir "$LOGS/$1" >/dev/null
+}
+rclient() { # seconds log dir args...: the exit code lands in RC
+  local secs=$1 log=$2 dir=$3; shift 3
+  RC=0
+  timeout "$secs" "$BIN/hyperspace-client" --headless --no-lookup --config-dir "$LOGS/$dir" "$@" >"$LOGS/$log" 2>&1 || RC=$?
+}
+
+start_relay "$LOGS/relay.log" $RELAY_PORT "$LOGS/relay.allow" || true
+MAIN_RELAY=$RELAY_PID
+
+echo "=== relay-a (the host's address does not answer: the session goes through the relay)"
+start_rhost relay-a 45971 || true
+rpair rc-a "hs1.$KEY.$DEAD,relay=$RELAY/v1"
+rclient 40 relay-a.client.log rc-a --frames 120 --test-input --stats
+[ $RC = 0 ] || ERRS+="  client exited with $RC"$'\n'
+expect "$LOGS/relay-a.client.log" "CLIENT OK" "CLIENT OK"
+expect "$LOGS/relay-a.client.log" "authenticated with the host through the relay" "the relay as the winner"
+expect "$LOGS/relay-a.client.log" "connected through the relay: [0-9]+x[0-9]+" "the connected line"
+expect "$LOGS/relay-a.client.log" "via relay" "the relay in the stats line"
+expect "$LOGS/relay-a.client.log" "relay link: up [0-9]+ s, 0 reconnects, last close: none, in [0-9.]+ MB / out [0-9.]+ MB, dropped" "the relay link stats at exit"
+for _ in $(seq 50); do grep -q "disconnected: peer quit" "$LOGS/relay-a.host.log" && break; sleep 0.1; done
+expect "$LOGS/relay-a.host.log" "client .* connected through the relay" "the relayed client"
+expect "$LOGS/relay-a.host.log" "disconnected: peer quit" "a clean goodbye through the relay"
+grep -h -E "authenticated|connected through|relay link: " "$LOGS/relay-a.client.log" || true
+end_case relay-a "$LOGS/relay-a.client.log" "$LOGS/relay-a.host.log" "$LOGS/relay.log"
+
+echo "=== relay-b (the host answers directly too: the direct path wins, the relay link closes)"
+rpair rc-b "hs1.$KEY.127.0.0.1/45971,relay=$RELAY/v1"
+rclient 40 relay-b.client.log rc-b --frames 60
+[ $RC = 0 ] || ERRS+="  client exited with $RC"$'\n'
+expect "$LOGS/relay-b.client.log" "CLIENT OK" "CLIENT OK"
+expect "$LOGS/relay-b.client.log" "authenticated with 127.0.0.1:45971" "the direct winner"
+expect "$LOGS/relay-b.client.log" "relay link closed: the host answered directly" "the relay link closing"
+expect "$LOGS/relay-b.client.log" "connected directly at 127.0.0.1:45971" "the connected line"
+reject "$LOGS/relay-b.client.log" "authenticated with the host through the relay" "a relayed session"
+grep -h -E "authenticated|answered directly" "$LOGS/relay-b.client.log" || true
+stop_pid $HOST_PID
+end_case relay-b "$LOGS/relay-b.client.log" "$LOGS/relay-a.host.log"
+
+echo "=== relay-c (the relay does not allow this PC: say who can fix it)"
+start_relay "$LOGS/relay-c.relay.log" 47812 "$LOGS/relay-empty.allow" || true
+C_PID=$RELAY_PID RELAY_PID=$MAIN_RELAY
+rpair rc-c "hs1.$KEY.$DEAD,relay=ws://127.0.0.1:47812/v1"
+rclient 20 relay-c.client.log rc-c --frames 1 --connect-timeout 4
+[ $RC = 1 ] || ERRS+="  client exited with $RC, expected 1"$'\n'
+expect "$LOGS/relay-c.client.log" "this relay does not serve this PC yet: its operator must add the PC's relay id .shown by hyperspace-host --relay-id.\." "the not-allowed line"
+grep -h "relay ws" "$LOGS/relay-c.client.log" || true
+stop_pid $C_PID
+end_case relay-c "$LOGS/relay-c.client.log" "$LOGS/relay-c.relay.log"
+
+echo "=== relay-d (the PC is not connected to the relay)"
+rpair rc-d "hs1.$KEY.$DEAD,relay=$RELAY/v1"
+rclient 20 relay-d.client.log rc-d --frames 1 --connect-timeout 4
+[ $RC = 1 ] || ERRS+="  client exited with $RC, expected 1"$'\n'
+expect "$LOGS/relay-d.client.log" "the PC is not connected to the relay .host not running, older than 0\.3\.0, or started without --relay.\." "the host-offline line"
+grep -h "relay ws" "$LOGS/relay-d.client.log" || true
+end_case relay-d "$LOGS/relay-d.client.log" "$LOGS/relay.log"
+
+echo "=== relay-e (a client with the wrong key gets nowhere through the relay either)"
+start_rhost relay-e 45972 || true
+STRANGER=$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n')
+rpair rc-e "hs1.$STRANGER.$DEAD,relay=$RELAY/v1"
+rclient 20 relay-e.client.log rc-e --frames 1 --connect-timeout 4
+[ $RC = 1 ] || ERRS+="  client exited with $RC, expected 1"$'\n'
+expect "$LOGS/relay-e.client.log" "this relay does not serve this PC yet" "the not-allowed line"
+expect "$LOGS/relay-e.client.log" "this is the pairing string it printed" "the pairing string hint"
+reject "$LOGS/relay-e.host.log" "client .* connected" "an accepted stranger"
+stop_pid $HOST_PID
+end_case relay-e "$LOGS/relay-e.client.log" "$LOGS/relay-e.host.log"
+
+echo "=== relay-f (the relay restarts mid-session: the links come back and the stream goes on)"
+start_rhost relay-f 45973 || true
+rpair rc-f "hs1.$KEY.$DEAD,relay=$RELAY/v1"
+timeout 90 "$BIN/hyperspace-client" --headless --no-lookup --stats --frames 900 --config-dir "$LOGS/rc-f" >"$LOGS/relay-f.client.log" 2>&1 &
+CLIENT_PID=$!
+for _ in $(seq 150); do grep -q "via relay" "$LOGS/relay-f.client.log" && break; sleep 0.1; done
+kill -9 $RELAY_PID 2>/dev/null || true
+wait $RELAY_PID 2>/dev/null || true
+sleep 0.5
+start_relay "$LOGS/relay-f.relay.log" $RELAY_PORT "$LOGS/relay.allow" || true
+RC=0
+wait $CLIENT_PID || RC=$?
+[ $RC = 0 ] || ERRS+="  client exited with $RC"$'\n'
+expect "$LOGS/relay-f.client.log" "CLIENT OK" "CLIENT OK"
+expect "$LOGS/relay-f.client.log" "relay link reconnected \([0-9]+ reconnects so far\); it had closed: " "the reconnect line"
+expect "$LOGS/relay-f.client.log" "relay link: up [0-9]+ s, [1-9][0-9]* reconnects, last close: " "the reconnect count at exit"
+[ "$(grep -c "relay: connected to" "$LOGS/relay-f.host.log")" -ge 2 ] || ERRS+="  relay-f.host.log: the host's relay link did not come back"$'\n'
+grep -h -E "relay link|connecting again|authenticated" "$LOGS/relay-f.client.log" || true
+end_case relay-f "$LOGS/relay-f.client.log" "$LOGS/relay-f.host.log" "$LOGS/relay-f.relay.log"
+
+echo "=== relay-g (a pairing without a relay: --relay once, then plain runs use it; --relay off; --relay-check)"
+rpair rc-g "hs1.$KEY.$DEAD"
+rclient 40 relay-g1.client.log rc-g --frames 60 --relay "$RELAY"
+[ $RC = 0 ] || ERRS+="  first client exited with $RC"$'\n'
+expect "$LOGS/relay-g1.client.log" "relay setting saved to" "the saved setting"
+expect "$LOGS/relay-g1.client.log" "CLIENT OK" "CLIENT OK"
+grep -qx "ws://127.0.0.1:$RELAY_PORT/v1" "$LOGS/rc-g/relay.txt" || ERRS+="  relay.txt does not hold the relay"$'\n'
+rclient 40 relay-g2.client.log rc-g --frames 60
+[ $RC = 0 ] || ERRS+="  plain client exited with $RC"$'\n'
+expect "$LOGS/relay-g2.client.log" "authenticated with the host through the relay" "the relay, remembered"
+expect "$LOGS/relay-g2.client.log" "CLIENT OK" "CLIENT OK"
+rclient 20 relay-g3.client.log rc-g --frames 1 --connect-timeout 2 --relay off
+[ $RC = 1 ] || ERRS+="  --relay off client exited with $RC, expected 1"$'\n'
+expect "$LOGS/relay-g3.client.log" "relay off .saved in .*--relay URL turns it back on" "the relay-off line"
+reject "$LOGS/relay-g3.client.log" "through the relay" "the relay, though off"
+rclient 20 relay-g4.client.log rc-g --frames 1 --connect-timeout 2
+[ $RC = 1 ] || ERRS+="  client after --relay off exited with $RC, expected 1"$'\n'
+expect "$LOGS/relay-g4.client.log" "relay off .set in " "the remembered relay-off line"
+code=0; timeout 20 "$BIN/hyperspace-client" --relay-check "$RELAY" >"$LOGS/relay-g5.client.log" 2>&1 || code=$?
+[ $code = 0 ] || ERRS+="  --relay-check on a live relay exited with $code"$'\n'
+expect "$LOGS/relay-g5.client.log" "relay reachable" "the check line"
+code=0; timeout 20 "$BIN/hyperspace-client" --relay-check ws://127.0.0.1:47819 >"$LOGS/relay-g6.client.log" 2>&1 || code=$?
+[ $code = 1 ] || ERRS+="  --relay-check on no relay exited with $code, expected 1"$'\n'
+cat "$LOGS/relay-g5.client.log" "$LOGS/relay-g6.client.log"
+stop_pid $HOST_PID
+stop_pid $RELAY_PID
+end_case relay-g "$LOGS"/relay-g[1-6].client.log "$LOGS/relay-f.host.log" "$LOGS/relay-f.relay.log"
+
+if [ -n "$RELAY_FAILED" ]; then echo "FAILED relay cases:$RELAY_FAILED"; exit 1; fi
 echo "ALL E2E TESTS PASSED"

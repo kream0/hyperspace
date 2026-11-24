@@ -110,6 +110,32 @@ jobs:
           sleep 2
           echo "--- host log"; cat host.log
           exit $status
+      - name: Desktop streaming through the relay over loopback
+        # The address in the pairing string never answers (192.0.2.1 is a
+        # documentation address): the session must go through the relay
+        # built in this job.
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          target/release/hyperspace-host.exe --relay-id --config-dir relayhostcfg > relay.allow
+          target/release/hyperspace-relay.exe --listen 127.0.0.1:47813 --allow relay.allow > relay.log 2>&1 &
+          RELAY_PID=$!
+          for i in $(seq 50); do grep -q "listening on" relay.log && break; sleep 0.2; done
+          target/release/hyperspace-host.exe --once --port 45813 --no-upnp --no-dht --relay ws://127.0.0.1:47813 --config-dir relayhostcfg > relay-host.log 2>&1 &
+          for i in $(seq 100); do grep -q "relay: connected to" relay-host.log && break; sleep 0.2; done
+          KEY=$(cut -d. -f2 relayhostcfg/host.key)
+          target/release/hyperspace-client.exe pair "hs1.$KEY.192.0.2.1/45813,relay=ws://127.0.0.1:47813/v1" --config-dir relayclientcfg
+          status=0
+          target/release/hyperspace-client.exe --config-dir relayclientcfg --headless --no-lookup --frames 30 --test-input --stats > relay-client.log 2>&1 || status=$?
+          sleep 2
+          cat relay-client.log
+          echo "--- host log"; cat relay-host.log
+          echo "--- relay log"; cat relay.log
+          grep -q "CLIENT OK" relay-client.log || status=1
+          grep -q "authenticated with the host through the relay" relay-client.log || status=1
+          grep -q "connected through the relay" relay-host.log || status=1
+          kill $RELAY_PID 2>/dev/null || true
+          exit $status
       - name: Find the host through the public lookup network (live internet)
         # Depends on the public BitTorrent DHT being reachable from the runner.
         continue-on-error: true
@@ -155,6 +181,34 @@ jobs:
             wait
             if [ $status -ne 0 ]; then exit $status; fi
           done
+      - name: Window through the relay over loopback
+        # As on Windows: the pairing string's address never answers, the
+        # relay built in this job carries the session.
+        timeout-minutes: 5
+        run: |
+          target/release/hyperspace-host --relay-id --config-dir relayhostcfg > relay.allow
+          target/release/hyperspace-relay --listen 127.0.0.1:47814 --allow relay.allow > relay.log 2>&1 &
+          RELAY_PID=$!
+          for i in $(seq 50); do grep -q "listening on" relay.log && break; sleep 0.2; done
+          target/release/hyperspace-host --file testdata/testsrc_720p.h264 --once --port 45814 --no-upnp --no-dht --relay ws://127.0.0.1:47814 --config-dir relayhostcfg > relay-host.log 2>&1 &
+          HOST_PID=$!
+          for i in $(seq 100); do grep -q "relay: connected to" relay-host.log && break; sleep 0.2; done
+          KEY=$(cut -d. -f2 relayhostcfg/host.key)
+          target/release/hyperspace-client pair "hs1.$KEY.192.0.2.1/45814,relay=ws://127.0.0.1:47814/v1" --config-dir relayclientcfg
+          (sleep 3; screencapture -x shot-relay.png || true) &
+          SHOT_PID=$!
+          status=0
+          target/release/hyperspace-client --config-dir relayclientcfg --no-lookup --frames 360 --stats > client-relay.log 2>&1 || status=$?
+          for i in $(seq 25); do kill -0 $HOST_PID 2>/dev/null || break; sleep 0.2; done
+          cat client-relay.log
+          echo "--- host log"; cat relay-host.log
+          echo "--- relay log"; cat relay.log
+          grep -q "CLIENT OK" client-relay.log || status=1
+          grep -q "authenticated with the host through the relay" client-relay.log || status=1
+          grep -q "connected through the relay" relay-host.log || status=1
+          kill $HOST_PID $RELAY_PID 2>/dev/null || true
+          wait $SHOT_PID || true
+          exit $status
       - uses: actions/upload-artifact@v4
         if: always()
         with:
