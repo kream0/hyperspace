@@ -69,10 +69,22 @@ async fn expect(ws: &mut Ws, want: Msg<'_>) {
     assert_eq!(Msg::decode(&got), Some(want));
 }
 
-async fn expect_closed(ws: &mut Ws) {
-    if let Some(b) = next(ws).await {
-        panic!("expected the relay to close, got {:?}", Msg::decode(&b));
+/// The relay dropped the connection without a close frame. Pings may come
+/// first; the end shows as an error or as the end of the stream.
+async fn expect_dropped(ws: &mut Ws) {
+    loop {
+        match timeout(WAIT, ws.next()).await.expect("timed out waiting for the relay to drop the link") {
+            Some(Ok(Message::Close(frame))) => panic!("expected no close frame, got {frame:?}"),
+            Some(Ok(Message::Binary(b))) => panic!("expected the link to be dropped, got {:?}", Msg::decode(&b)),
+            Some(Ok(_)) => {}
+            Some(Err(_)) | None => return,
+        }
     }
+}
+
+/// The close frame the relay sends after REFUSED.
+async fn expect_refused_close(ws: &mut Ws) {
+    assert_eq!(close_frame(ws).await, (1008, "refused".to_string()));
 }
 
 /// Code and reason of the close frame the relay sends next.
@@ -155,7 +167,7 @@ async fn join(addr: SocketAddr, key: &RoomKey, role: Role) -> Ws {
 async fn join_refused(addr: SocketAddr, key: &RoomKey, role: Role, reason: u8) {
     let (mut ws, answer) = try_join(addr, key, role).await;
     assert_eq!(Msg::decode(&answer), Some(Msg::Refused(reason)), "{}", refused::describe(reason));
-    expect_closed(&mut ws).await;
+    expect_refused_close(&mut ws).await;
 }
 
 /// A client: joins and reads its first STATUS.
@@ -317,7 +329,8 @@ async fn the_host_can_close_a_client() {
     expect(&mut host, Msg::PeerOpen(2)).await;
 
     send(&mut host, Msg::PeerClose(1)).await;
-    expect_closed(&mut a).await;
+    // A close frame of its own: 4001 goes only to a replaced host.
+    assert_eq!(close_frame(&mut a).await, (1000, "closed by the host".to_string()));
     // No PEER_CLOSE echoed back for a close the host asked for; the other
     // client is untouched.
     send(&mut b, Msg::ClientData(b"still here")).await;
@@ -403,6 +416,9 @@ async fn a_client_that_cannot_take_a_control_message_is_closed_at_once() {
     let mut c = config(Allow::Open);
     // Far longer than the test: only a full queue can close the client here.
     c.write_timeout = Duration::from_secs(300);
+    c.idle_timeout = Duration::from_secs(300);
+    // Room for the 80 hosts below, even if replaced ones linger a moment.
+    c.max_links = 1024;
     let addr = start(c).await;
     let key = room();
     let mut host = join(addr, &key, Role::Host).await;
@@ -432,7 +448,7 @@ async fn a_client_that_cannot_take_a_control_message_is_closed_at_once() {
         host = join(addr, &key, Role::Host).await;
     }
     wait_for_counts(addr, &counts(1, 1)).await;
-    assert!(started.elapsed() < Duration::from_secs(60), "closed by a timeout, not at once");
+    assert!(started.elapsed() < Duration::from_secs(20), "closed by a timeout, not at once");
 
     // The other client kept up: it has every STATUS, and still gets data.
     send(&mut host, Msg::HostData { peer: 2, payload: b"still here" }).await;
@@ -446,6 +462,49 @@ async fn a_client_that_cannot_take_a_control_message_is_closed_at_once() {
         }
     }
     assert_eq!(statuses, 80);
+}
+
+#[tokio::test]
+async fn a_removed_link_that_stops_reading_gives_its_slot_back_in_time() {
+    let mut c = config(Allow::Open);
+    // Far longer than the test: only the close deadline can end the link.
+    c.write_timeout = Duration::from_secs(300);
+    c.idle_timeout = Duration::from_secs(300);
+    c.max_links = 3;
+    let addr = start(c).await;
+    let key = room();
+    let mut host = join(addr, &key, Role::Host).await;
+    let _slow = slow_client(addr, &key).await;
+    expect(&mut host, Msg::PeerOpen(1)).await;
+    let mut fast = client(addr, &key, true).await;
+    expect(&mut host, Msg::PeerOpen(2)).await;
+    assert_eq!(try_connect(addr).await.err(), Some(503), "every link slot is taken");
+
+    // Fill the socket buffers between the relay and the slow client, then
+    // its queue: the relay's writer for it is stuck on a write.
+    let big = vec![0x5a; relay::MAX_PAYLOAD];
+    for _ in 0..64 {
+        blast(&mut host, 1, &big, 64).await;
+    }
+    send(&mut host, Msg::HostData { peer: 2, payload: b"sync" }).await;
+    expect(&mut fast, Msg::ClientData(b"sync")).await;
+
+    // The host lets it go. Its writer can take neither the rest of the queue
+    // nor the close, yet the link ends at its deadline (5 s) and gives its
+    // slot back, long before the write timeout.
+    send(&mut host, Msg::PeerClose(1)).await;
+    let started = tokio::time::Instant::now();
+    let mut d = loop {
+        match try_connect(addr).await {
+            Ok(ws) => break ws,
+            Err(status) => assert_eq!(status, 503),
+        }
+        assert!(started.elapsed() < Duration::from_secs(10), "the removed link still holds its slot");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    challenge(&mut d).await;
+    send(&mut fast, Msg::ClientData(b"still here")).await;
+    expect(&mut host, Msg::HostData { peer: 2, payload: b"still here" }).await;
 }
 
 #[tokio::test]
@@ -542,7 +601,7 @@ async fn a_bad_signature_is_refused() {
     hello.signature[10] ^= 1;
     send(&mut ws, Msg::Hello(hello)).await;
     expect(&mut ws, Msg::Refused(refused::BAD_SIGNATURE)).await;
-    expect_closed(&mut ws).await;
+    expect_refused_close(&mut ws).await;
 
     // A HELLO recorded on another connection (other nonce).
     let mut ws = connect(addr).await;
@@ -580,7 +639,7 @@ async fn a_version_mismatch_is_refused() {
     hello[1] = relay::VERSION + 1;
     ws.send(Message::binary(hello)).await.unwrap();
     expect(&mut ws, Msg::Refused(refused::VERSION_MISMATCH)).await;
-    expect_closed(&mut ws).await;
+    expect_refused_close(&mut ws).await;
 
     // Garbage instead of HELLO.
     let mut ws = connect(addr).await;
@@ -595,7 +654,7 @@ async fn a_silent_connection_is_refused_after_the_auth_timeout() {
     let mut ws = connect(addr).await;
     challenge(&mut ws).await;
     expect(&mut ws, Msg::Refused(refused::TIMEOUT)).await;
-    expect_closed(&mut ws).await;
+    expect_refused_close(&mut ws).await;
 }
 
 #[tokio::test]
@@ -632,21 +691,21 @@ async fn oversized_or_malformed_messages_close_the_link() {
     let mut a = client(addr, &key, true).await;
     expect(&mut host, Msg::PeerOpen(1)).await;
     let _ = a.send(Message::binary(vec![relay::mt::CLIENT_DATA; 20_000])).await;
-    expect_closed(&mut a).await;
+    expect_dropped(&mut a).await;
     expect(&mut host, Msg::PeerClose(1)).await;
 
     // Under the WebSocket limit but over the datagram limit.
     let mut b = client(addr, &key, true).await;
     expect(&mut host, Msg::PeerOpen(2)).await;
     let _ = b.send(Message::binary(vec![relay::mt::CLIENT_DATA; relay::MAX_PAYLOAD + 2])).await;
-    expect_closed(&mut b).await;
+    expect_dropped(&mut b).await;
     expect(&mut host, Msg::PeerClose(2)).await;
 
     // A message for the other role.
     let mut c = client(addr, &key, true).await;
     expect(&mut host, Msg::PeerOpen(3)).await;
     send(&mut c, Msg::HostData { peer: 3, payload: b"spoof" }).await;
-    expect_closed(&mut c).await;
+    expect_dropped(&mut c).await;
     expect(&mut host, Msg::PeerClose(3)).await;
 
     // The relay is fine.
@@ -665,7 +724,7 @@ async fn quiet_links_are_pinged_and_dead_ones_closed() {
     let addr = start(c).await;
     let key = room();
     let mut host = join(addr, &key, Role::Host).await;
-    let a = client(addr, &key, true).await;
+    let mut a = client(addr, &key, true).await;
     expect(&mut host, Msg::PeerOpen(1)).await;
 
     // The host keeps reading (so it answers pings) for well over the idle
@@ -685,7 +744,8 @@ async fn quiet_links_are_pinged_and_dead_ones_closed() {
     }
     assert!(closed, "the silent client was not closed");
     assert!(pings >= 5, "only {pings} pings");
-    drop(a);
+    // Dropped, without a close frame (it gets the pings it never read).
+    expect_dropped(&mut a).await;
     // The host is still connected.
     let _b = client(addr, &key, true).await;
     expect(&mut host, Msg::PeerOpen(2)).await;

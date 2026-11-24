@@ -23,16 +23,21 @@ jobs:
       - run: cargo build --release --workspace
       - run: bash scripts/e2e.sh target/release
       - name: Relay as a static musl binary
+        # bash with pipefail: a failed command in a pipe fails the step.
+        shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
           rustup target add x86_64-unknown-linux-musl
-          cargo build --release -p hyperspace-relay --target x86_64-unknown-linux-musl
-          file target/x86_64-unknown-linux-musl/release/hyperspace-relay
-          file target/x86_64-unknown-linux-musl/release/hyperspace-relay | grep -Eq 'statically linked|static-pie linked'
+          cargo build --profile relay -p hyperspace-relay --target x86_64-unknown-linux-musl
+          file target/x86_64-unknown-linux-musl/relay/hyperspace-relay
+          file target/x86_64-unknown-linux-musl/relay/hyperspace-relay | grep -Eq 'statically linked|static-pie linked'
       - name: Relay smoke test
+        # With pipefail, a failed curl in "curl | tee" fails the step instead
+        # of leaving an empty file that the negative grep below passes on.
+        shell: bash
         run: |
-          RELAY=target/x86_64-unknown-linux-musl/release/hyperspace-relay
+          RELAY=target/x86_64-unknown-linux-musl/relay/hyperspace-relay
           $RELAY --version
           # Without --allow or --open it must refuse to start (exit 2), not hang.
           code=0; timeout 5 $RELAY > relay.log 2>&1 || code=$?
@@ -59,8 +64,9 @@ jobs:
         run: |
           mkdir -p dist
           cp target/release/hyperspace-host target/release/hyperspace-client dist/
-          cp target/x86_64-unknown-linux-musl/release/hyperspace-relay dist/
+          cp target/x86_64-unknown-linux-musl/relay/hyperspace-relay dist/
           ls -la dist
+          sha256sum dist/*
       - uses: actions/upload-artifact@v4
         with:
           name: linux-x64

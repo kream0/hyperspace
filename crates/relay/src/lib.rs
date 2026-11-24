@@ -25,7 +25,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
-use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
@@ -60,8 +60,12 @@ const DATA_BYTES: usize = 512 * 1024;
 const CTRL_RESERVE: usize = 64;
 /// Queued messages written in one batch before flushing.
 const WRITE_BATCH: usize = 64;
-/// How long a closing link waits for the peer's half of the close handshake.
+/// How long a refused link waits for the peer's half of the close
+/// handshake, and an authenticated one for the reply to the peer's close.
 const CLOSE_GRACE: Duration = Duration::from_secs(2);
+/// Time a link the room let go of has, from that moment, to take what is
+/// still queued for it and the close handshake. Past it, it is dropped.
+const CLOSE_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Write one timestamped line to stderr. Never panics (eprintln! does when
 /// stderr is gone).
@@ -162,12 +166,14 @@ pub struct Config {
     pub rate: Option<Rate>,
     /// WebSocket connections still authenticating; more are answered HTTP 503.
     pub max_pending: usize,
-    /// WebSocket connections in all, authenticated or not; more are
-    /// answered HTTP 503.
+    /// WebSocket connections in all, authenticated or not, including links
+    /// still closing; more are answered HTTP 503. This is what bounds the
+    /// relay's memory: each link can hold up to about 0.8 MiB (its queue and
+    /// WebSocket buffers).
     pub max_links: usize,
     /// Time a new connection has to answer the challenge.
     pub auth_timeout: Duration,
-    /// Interval between pings the relay sends on an idle link.
+    /// Interval between the pings the relay sends on every link.
     pub ping_interval: Duration,
     /// A link that sends nothing (not even a pong) for this long is closed.
     pub idle_timeout: Duration,
@@ -184,7 +190,8 @@ impl Config {
             max_clients: 4,
             rate: Rate::from_mbit(60),
             max_pending: 64,
-            max_links: 256,
+            // 128 x 0.8 MiB stays under the service's 128 MiB memory cap.
+            max_links: 128,
             auth_timeout: Duration::from_secs(5),
             ping_interval: Duration::from_secs(20),
             idle_timeout: Duration::from_secs(60),
@@ -238,8 +245,10 @@ struct LinkState {
     queued: AtomicUsize,
     /// Ends the connection at once (it could not take a control message).
     kill: Notify,
-    /// Set just before the room drops the link.
+    /// Set just before the room drops the link...
     removed: OnceLock<Removed>,
+    /// ...and then notified, which starts the writer's close deadline.
+    gone: Notify,
 }
 
 /// The room's handle on one authenticated connection.
@@ -285,6 +294,13 @@ impl Link {
         }
     }
 
+    // The byte count cannot drift. It belongs to this one link, and dies
+    // with it: bytes still counted when a non-empty Outbox is dropped are
+    // never looked at again (every later send fails and is undone). Every
+    // send happens under the rooms lock, so fits() and queue() see no other
+    // sender in between. The count is raised before the send, so the
+    // Outbox can never take away bytes not yet added (no wrap below zero),
+    // and a send that fails is undone at once.
     fn queue(&self, bytes: Bytes) -> bool {
         let len = bytes.len();
         self.state.queued.fetch_add(len, Ordering::Relaxed);
@@ -298,6 +314,8 @@ impl Link {
     /// Let go of the link: its connection closes, telling the peer why.
     fn remove(self, why: Removed) {
         let _ = self.state.removed.set(why);
+        // Keeps a permit if the writer is not waiting yet.
+        self.state.gone.notify_one();
     }
 }
 
@@ -681,27 +699,30 @@ async fn connection(
     let id = shared.next_link.fetch_add(1, Ordering::Relaxed);
     let (link, outbox) = Link::new(id);
     let state = link.state.clone();
-    let (first, seat) = match role {
+    // The guard is made first thing once the seat is taken, so nothing runs
+    // between the two: whatever happens next, the seat is given back.
+    let (first, seat, mut seated) = match role {
         Role::Host => match shared.join_host(room, link) {
             Ok((first, replaced)) => {
+                let seated = Seated { shared: shared.clone(), room, seat: Seat::Host, id, why: None, slot: Some(slot) };
                 let note = if replaced { " (replacing the previous host)" } else { "" };
                 log!("host joined room {} from {from}{note}", room.masked());
-                (first, Seat::Host)
+                (first, Seat::Host, seated)
             }
             Err(reason) => return refuse(ws, who, reason, &from).await,
         },
         Role::Client => match shared.join_client(room, link) {
             Ok((first, peer, online)) => {
+                let seat = Seat::Client(peer);
+                let seated = Seated { shared: shared.clone(), room, seat, id, why: None, slot: Some(slot) };
                 let note = if online { "host online" } else { "waiting for the host" };
                 log!("client {peer} joined room {} from {from} ({note})", room.masked());
-                (first, Seat::Client(peer))
+                (first, seat, seated)
             }
             Err(reason) => return refuse(ws, who, reason, &from).await,
         },
     };
-
     drop(pending);
-    let mut seated = Seated { shared: shared.clone(), room, seat, id, why: None, slot: Some(slot) };
 
     let (sink, stream) = ws.split();
     let why = tokio::select! {
@@ -746,7 +767,8 @@ async fn refuse(mut ws: WebSocket, who: Option<(Role, RoomId)>, reason: u8, from
     }
     let _ = tokio::time::timeout(CLOSE_GRACE, async {
         ws.send(Message::Binary(encode(Msg::Refused(reason)))).await?;
-        ws.send(Message::Close(Some(CloseFrame { code: close_code::POLICY, reason: "refused".into() }))).await?;
+        let close = CloseFrame { code: proto::close::REFUSED, reason: proto::close::REFUSED_REASON.into() };
+        ws.send(Message::Close(Some(close))).await?;
         // Let the peer read everything and answer the close.
         while let Some(Ok(m)) = ws.recv().await {
             if matches!(m, Message::Close(_)) {
@@ -759,19 +781,48 @@ async fn refuse(mut ws: WebSocket, who: Option<(Role, RoomId)>, reason: u8, from
 }
 
 /// Writes everything queued for the link, plus pings. Returns when the link
-/// fails or the room lets go of it (then it closes the WebSocket, saying why).
+/// fails or the room lets go of it: then it writes what is still queued and
+/// closes the WebSocket, saying why, all within [`CLOSE_DEADLINE`].
 async fn write(mut sink: SplitSink<WebSocket, Message>, mut outbox: Outbox, first: Vec<Bytes>, config: &Config) -> String {
-    if let Err(why) = pump(&mut sink, &mut outbox, first, config).await {
-        return why;
-    }
-    let (code, reason, why) = match outbox.state.removed.get() {
+    let state = outbox.state.clone();
+    let deadline = {
+        let pump = pump(&mut sink, &mut outbox, first, config);
+        tokio::pin!(pump);
+        // Until the room lets go of the link only each write is bounded (by
+        // the write timeout). From then on the rest of the queue and the
+        // close share one deadline, so a peer that reads slowly, or not at
+        // all, cannot keep a removed link (and its memory) for long. The
+        // same pump goes on: dropping it could lose a message half written.
+        let done = tokio::select! {
+            biased;
+            _ = state.gone.notified() => None,
+            done = &mut pump => Some(done),
+        };
+        let deadline = tokio::time::Instant::now() + CLOSE_DEADLINE;
+        let done = match done {
+            Some(done) => done,
+            None => match tokio::time::timeout_at(deadline, &mut pump).await {
+                Ok(done) => done,
+                Err(_) => return "too slow to take its last messages".to_string(),
+            },
+        };
+        if let Err(why) = done {
+            return why;
+        }
+        deadline
+    };
+    let (code, reason, why) = match state.removed.get() {
         Some(Removed::Replaced) => (proto::close::REPLACED, proto::close::REPLACED_REASON, "replaced by a new host"),
-        Some(Removed::ByHost) | None => (close_code::NORMAL, "closed by the host", "closed by the host"),
+        Some(Removed::ByHost) | None => {
+            (proto::close::CLOSED_BY_HOST, proto::close::CLOSED_BY_HOST_REASON, "closed by the host")
+        }
     };
     let close = CloseFrame { code, reason: reason.into() };
-    let _ = tokio::time::timeout(CLOSE_GRACE, sink.send(Message::Close(Some(close)))).await;
-    // Leave the reader time to see the peer's close.
-    tokio::time::sleep(CLOSE_GRACE).await;
+    if let Ok(Ok(())) = tokio::time::timeout_at(deadline, sink.send(Message::Close(Some(close)))).await {
+        // Leave the reader until the deadline to see the peer's close; the
+        // connection ends as soon as it does.
+        tokio::time::sleep_until(deadline).await;
+    }
     why.to_string()
 }
 
@@ -964,8 +1015,8 @@ mod tests {
     #[test]
     fn forwarded_for_is_trusted_from_loopback_only() {
         let mut headers = HeaderMap::new();
-        // The client sent "10.1.2.3"; the proxy appended the address it saw.
-        headers.insert("x-forwarded-for", "10.1.2.3, 192.0.2.7".parse().unwrap());
+        // The client sent "203.0.113.5"; the proxy appended the address it saw.
+        headers.insert("x-forwarded-for", "203.0.113.5, 192.0.2.7".parse().unwrap());
         let local: SocketAddr = "127.0.0.1:5000".parse().unwrap();
         let remote: SocketAddr = "198.51.100.1:5000".parse().unwrap();
         assert_eq!(remote_addr(local, &headers), "192.0.2.7");
@@ -975,7 +1026,7 @@ mod tests {
         headers.insert("x-real-ip", "203.0.113.66".parse().unwrap());
         assert_eq!(remote_addr(local, &headers), "192.0.2.7");
         // Many entries, and a second header line: the last entry of the last line.
-        headers.append("x-forwarded-for", "10.0.0.1 , 10.0.0.2,192.0.2.8".parse().unwrap());
+        headers.append("x-forwarded-for", "203.0.113.10 , 203.0.113.11,192.0.2.8".parse().unwrap());
         assert_eq!(remote_addr(local, &headers), "192.0.2.8");
         // Not from loopback: no proxy of ours, so every header is ignored.
         assert_eq!(remote_addr(remote, &headers), "198.51.100.1");

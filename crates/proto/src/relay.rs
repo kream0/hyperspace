@@ -67,12 +67,57 @@
 //!
 //! # Closing
 //!
-//! When the relay closes a link it sends a WebSocket close frame. Its code
-//! says why when it matters ([`close`]): a host closed with
-//! [`close::REPLACED`] lost its room to a newer host with the same pairing
-//! key. It must not reconnect at once (the two would take the room from each
-//! other in a loop) but back off, or stop and say so. Any other close, or a
-//! lost connection, may be followed by a reconnect.
+//! The relay sends a WebSocket close frame in exactly three cases ([`close`]):
+//!
+//! | code | reason                 | sent to  | when                                                  |
+//! |------|------------------------|----------|-------------------------------------------------------|
+//! | 1008 | `"refused"`            | any peer | right after REFUSED, also when it did not authenticate in time ([`refused::TIMEOUT`]) |
+//! | 4001 | `"replaced"`           | a host   | a newer host with the same pairing key took the room  |
+//! | 1000 | `"closed by the host"` | a client | its host sent PEER_CLOSE for it                       |
+//!
+//! Before 4001 or 1000 the relay writes what was already queued for the
+//! link. A link that does not take that and the close frame within 5
+//! seconds is dropped without a close frame.
+//!
+//! Every other end is a dropped TCP connection, with no close frame (in
+//! particular no 1009 for a message too big):
+//!
+//! - a message over the relay's WebSocket size limit, or a data message
+//!   with a datagram over [`MAX_PAYLOAD`];
+//! - a message that does not decode, or that is not meant for the peer's
+//!   role (HOST_DATA from a client, for example);
+//! - a link the relay hears nothing from (not even a pong) for 60 seconds
+//!   (the default);
+//! - a peer that does not take one of the relay's writes within 10 seconds
+//!   (the default), or whose queue is too full to take a control message;
+//! - before authentication: a message over the size limit, a broken
+//!   WebSocket frame, or the peer closing (it gets no REFUSED either).
+//!
+//! When an authenticated peer closes first, the relay answers its close
+//! frame and ends the link.
+//!
+//! # Rules for a bridge
+//!
+//! - HTTP 503 instead of the WebSocket upgrade: the relay is busy. Back off
+//!   before trying again.
+//! - Answer CHALLENGE with HELLO within 5 seconds (the default), or the
+//!   relay refuses the connection with [`refused::TIMEOUT`].
+//! - Keep reading, and answer pings: the relay pings every 20 seconds (the
+//!   default) and drops a link it hears nothing from for 60 seconds.
+//! - Drop a datagram over [`MAX_PAYLOAD`] locally: sending it drops the
+//!   whole link.
+//! - After 1008 `"refused"`, act on the REFUSED reason: retrying soon does
+//!   not help for [`refused::NOT_ALLOWED`], [`refused::BAD_SIGNATURE`] or
+//!   [`refused::VERSION_MISMATCH`] (say so), while [`refused::ROOM_FULL`],
+//!   [`refused::RELAY_FULL`] and [`refused::TIMEOUT`] may pass after a
+//!   back-off.
+//! - After 1000 `"closed by the host"` (a client): the host let this client
+//!   go. Do not reconnect at once.
+//! - After 4001 `"replaced"` (a host): back off, or stop and say so.
+//!   Reconnecting at once takes the room from the newer host, which then
+//!   does the same, in a loop.
+//! - Any end without a close frame, or a lost connection: reconnect, with
+//!   back-off.
 
 use crate::rendezvous::derive;
 use crate::secure::Key;
@@ -106,11 +151,18 @@ pub mod mt {
     pub const CLIENT_DATA: u8 = 9;
 }
 
-/// WebSocket close codes the relay uses beyond the standard ones (1000
-/// normal, 1008 policy after REFUSED, 1009 message too big, ...).
+/// The only WebSocket close frames the relay sends (see the module docs,
+/// "Closing"). Every other end of a link is a dropped TCP connection.
 pub mod close {
-    /// A newer host joined the room; reason text `"replaced"`. Back off
-    /// before reconnecting instead of taking the room back at once.
+    /// Right after REFUSED (policy violation); reason text `"refused"`.
+    pub const REFUSED: u16 = 1008;
+    pub const REFUSED_REASON: &str = "refused";
+    /// To a client its host closed with PEER_CLOSE (normal closure); reason
+    /// text `"closed by the host"`. Do not reconnect at once.
+    pub const CLOSED_BY_HOST: u16 = 1000;
+    pub const CLOSED_BY_HOST_REASON: &str = "closed by the host";
+    /// To a host: a newer host joined the room; reason text `"replaced"`.
+    /// Back off before reconnecting instead of taking the room back at once.
     pub const REPLACED: u16 = 4001;
     pub const REPLACED_REASON: &str = "replaced";
 }

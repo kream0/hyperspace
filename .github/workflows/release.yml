@@ -116,13 +116,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
           rustup target add x86_64-unknown-linux-musl
-          cargo build --release -p hyperspace-relay --target x86_64-unknown-linux-musl
-          file target/x86_64-unknown-linux-musl/release/hyperspace-relay
-          file target/x86_64-unknown-linux-musl/release/hyperspace-relay | grep -Eq 'statically linked|static-pie linked'
+          cargo build --profile relay -p hyperspace-relay --target x86_64-unknown-linux-musl
+          file target/x86_64-unknown-linux-musl/relay/hyperspace-relay
+          file target/x86_64-unknown-linux-musl/relay/hyperspace-relay | grep -Eq 'statically linked|static-pie linked'
       - name: Package
         run: |
           mkdir dist
-          cp target/x86_64-unknown-linux-musl/release/hyperspace-relay README.md dist/
+          cp target/x86_64-unknown-linux-musl/relay/hyperspace-relay README.md dist/
           tar -czf "hyperspace-relay-linux-x64.tar.gz" -C dist .
       - uses: actions/upload-artifact@v4
         with:

@@ -1,3 +1,4 @@
+use std::io::{self, Write as _};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -36,6 +37,13 @@ ENDPOINTS:
     GET /v1               WebSocket for hosts and clients
 ";
 
+/// Like eprintln!, but never panics (eprintln! does when stderr is gone).
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        let _ = writeln!(io::stderr(), $($arg)*);
+    }};
+}
+
 fn parse_args() -> Result<(SocketAddr, Config), String> {
     let mut listen: SocketAddr = DEFAULT_LISTEN.parse().expect("valid default address");
     let mut allow_file: Option<PathBuf> = None;
@@ -48,11 +56,11 @@ fn parse_args() -> Result<(SocketAddr, Config), String> {
         let mut val = |name: &str| args.next().ok_or(format!("{name} needs a value"));
         match a.as_str() {
             "-h" | "--help" => {
-                print!("{HELP}");
+                let _ = io::stdout().write_all(HELP.as_bytes());
                 std::process::exit(0);
             }
             "-V" | "--version" => {
-                println!("hyperspace-relay {}", env!("CARGO_PKG_VERSION"));
+                let _ = writeln!(io::stdout(), "hyperspace-relay {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             "--listen" => {
@@ -83,7 +91,7 @@ fn main() {
     let (listen, config) = match parse_args() {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("error: {e}");
+            say!("error: {e}");
             std::process::exit(2);
         }
     };
@@ -94,23 +102,26 @@ fn main() {
         Allow::File(path) => match read_allow_file(path) {
             Ok((ids, bad)) => {
                 if bad > 0 {
-                    eprintln!("warning: {bad} line(s) of {} are not room ids and are ignored", path.display());
+                    say!("warning: {bad} line(s) of {} are not room ids and are ignored", path.display());
                 }
                 format!("{} room(s) allowed by {}", ids.len(), path.display())
             }
             Err(e) => {
-                eprintln!("error: cannot read the allow list {}: {e}", path.display());
+                say!("error: cannot read the allow list {}: {e}", path.display());
                 std::process::exit(1);
             }
         },
     };
     let rate = config.rate.map_or("no rate limit".to_string(), |r| format!("{r} per room and direction"));
-    let limits = format!("at most {} rooms, {} clients per room, {rate}", config.max_rooms, config.max_clients);
+    let limits = format!(
+        "at most {} rooms, {} clients per room, {} connections, {rate}",
+        config.max_rooms, config.max_clients, config.max_links
+    );
 
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("error: cannot start: {e}");
+            say!("error: cannot start: {e}");
             std::process::exit(1);
         }
     };
@@ -124,7 +135,7 @@ fn main() {
         hyperspace_relay::serve(listener, config).await
     });
     if let Err(e) = result {
-        eprintln!("error: {e}");
+        say!("error: {e}");
         std::process::exit(1);
     }
 }
