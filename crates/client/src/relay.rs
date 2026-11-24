@@ -107,6 +107,29 @@ pub fn stats_line(s: &LinkStats) -> String {
     line
 }
 
+/// What a status of the relay link means for the user, as one sentence;
+/// `host` is the relay's host name, for the IT department.
+pub fn status_line(status: Status, host: &str) -> String {
+    match status {
+        Status::Connecting => "no answer from the relay yet (still connecting).".to_string(),
+        Status::CannotReach(why) => format!(
+            "the relay is not reachable: {}. On a company network, ask IT to allow {host}.",
+            why.trim_end_matches('.')
+        ),
+        Status::RelayBusy => "the relay is busy; retrying.".to_string(),
+        Status::Refused(refused::NOT_ALLOWED) => "this relay does not serve this PC yet: its operator must add the \
+             PC's relay id (shown by hyperspace-host --relay-id)."
+            .to_string(),
+        Status::Refused(r) => format!("the relay refused the connection: {}.", refused::describe(r)),
+        Status::HostOffline => "the PC is not connected to the relay (host not running, older than 0.3.0, or \
+             started without --relay)."
+            .to_string(),
+        Status::HostOnline => "the PC is connected to the relay but did not answer.".to_string(),
+        Status::ClosedByHost => "the host closed this connection through the relay.".to_string(),
+        Status::Closed(why) => format!("the relay link stopped: {}.", why.trim_end_matches('.')),
+    }
+}
+
 /// The link to the relay. Owned by the thread that runs the sessions; every
 /// call returns at once (the link runs on a thread of its own).
 pub struct Relay {
@@ -144,11 +167,21 @@ impl Relay {
     /// asks for a new one if the host closed the last. Returns the loopback
     /// address that stands for the host, or None if the link cannot start.
     pub fn start(&mut self) -> Option<SocketAddr> {
-        if let Some(b) = &self.bridge {
-            if b.status() == Status::ClosedByHost {
-                b.reconnect();
+        match self.bridge.as_ref().map(ClientBridge::status) {
+            None => {}
+            // The link stopped for good: a new one, below.
+            Some(Status::Closed(why)) => {
+                log!("relay: starting a new relay link (the last one stopped: {why})");
+                self.report();
+                self.bridge = None;
             }
-            return Some(b.local_addr());
+            Some(status) => {
+                let b = self.bridge.as_ref()?;
+                if status == Status::ClosedByHost {
+                    b.reconnect();
+                }
+                return Some(b.local_addr());
+            }
         }
         match ClientBridge::start(&self.url, &self.key) {
             Ok((bridge, addr)) => {
@@ -213,23 +246,7 @@ impl Relay {
                 None => "not tried.".to_string(),
             };
         };
-        match status {
-            Status::Connecting => "no answer from the relay yet (still connecting).".to_string(),
-            Status::CannotReach(why) => {
-                format!("the relay is not reachable: {why}. On a company network, ask IT to allow {}.", self.host)
-            }
-            Status::RelayBusy => "the relay is busy; retrying.".to_string(),
-            Status::Refused(refused::NOT_ALLOWED) => "this relay does not serve this PC yet: its operator must add the \
-                 PC's relay id (shown by hyperspace-host --relay-id)."
-                .to_string(),
-            Status::Refused(r) => format!("the relay refused the connection: {}.", refused::describe(r)),
-            Status::HostOffline => "the PC is not connected to the relay (host not running, older than 0.3.0, or \
-                 started without --relay)."
-                .to_string(),
-            Status::HostOnline => "the PC is connected to the relay but did not answer.".to_string(),
-            Status::ClosedByHost => "the host closed this connection through the relay.".to_string(),
-            Status::Closed(why) => format!("the relay link stopped: {why}."),
-        }
+        status_line(status, &self.host)
     }
 
     /// Once a second during a session: a line when the link came back after
@@ -367,6 +384,43 @@ mod tests {
             "relay link: up 0 s, 2 reconnects, last close: no traffic for 35 s, in 12.3 MB / out 0.3 MB, dropped 3 \
              (and 7 while the link was down)"
         );
+    }
+
+    #[test]
+    fn every_status_has_its_line() {
+        let host = "relay.example";
+        let cases = [
+            (
+                Status::CannotReach("cannot connect to relay.example port 443: timed out.".into()),
+                "the relay is not reachable: cannot connect to relay.example port 443: timed out. On a company \
+                 network, ask IT to allow relay.example.",
+            ),
+            (
+                Status::Refused(refused::NOT_ALLOWED),
+                "this relay does not serve this PC yet: its operator must add the PC's relay id (shown by \
+                 hyperspace-host --relay-id).",
+            ),
+            (
+                Status::HostOffline,
+                "the PC is not connected to the relay (host not running, older than 0.3.0, or started without \
+                 --relay).",
+            ),
+            (Status::RelayBusy, "the relay is busy; retrying."),
+            (Status::Connecting, "no answer from the relay yet (still connecting)."),
+            (Status::HostOnline, "the PC is connected to the relay but did not answer."),
+            (Status::ClosedByHost, "the host closed this connection through the relay."),
+            (Status::Closed("the local socket failed".into()), "the relay link stopped: the local socket failed."),
+        ];
+        for (status, line) in cases {
+            assert_eq!(status_line(status, host), line);
+        }
+        let other = status_line(Status::Refused(refused::RELAY_FULL), host);
+        assert!(other.starts_with("the relay refused the connection: ") && other.ends_with('.'), "{other}");
+        // No internal names in what the user reads.
+        for status in [Status::RelayBusy, Status::HostOffline, Status::Refused(refused::NOT_ALLOWED)] {
+            let line = status_line(status, host);
+            assert!(!line.contains("Status") && !line.contains("bridge") && !line.contains("room"), "{line}");
+        }
     }
 
     #[test]
