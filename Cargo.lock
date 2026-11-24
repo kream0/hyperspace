@@ -836,6 +836,7 @@ dependencies = [
 name = "hyperspace-client"
 version = "0.2.1"
 dependencies = [
+ "hyperspace-bridge",
  "hyperspace-proto",
  "if-addrs",
  "objc2 0.6.5",

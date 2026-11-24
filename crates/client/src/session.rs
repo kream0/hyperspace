@@ -1,6 +1,9 @@
 //! Platform-independent client session: encrypted handshake, receive loop,
-//! loss repair, clock sync, bitrate control and the input sender.
+//! loss repair, clock sync, bitrate control and the input sender, and the
+//! reconnects when a relay is configured.
 
+use crate::relay::Relay;
+use hyperspace_bridge::Status;
 use hyperspace_proto::clock::{now_us, ClockSync};
 use hyperspace_proto::cursor::CursorShape;
 use hyperspace_proto::frag::{Action, Frame, Reassembler};
@@ -19,6 +22,16 @@ use std::time::{Duration, Instant};
 
 const HOST_TIMEOUT: Duration = Duration::from_secs(5);
 const PING_INTERVAL_US: u64 = 200_000;
+/// The head start the host's direct addresses get before the relay joins the
+/// race: on a network where UDP gets through, the direct path wins.
+const RELAY_JOIN_AFTER: Duration = Duration::from_millis(600);
+/// Waits between reconnect attempts: doubling from the first to the last.
+const RETRY_FIRST: Duration = Duration::from_millis(500);
+const RETRY_MAX: Duration = Duration::from_secs(5);
+/// Connect attempts after a session is lost, before giving up.
+const RETRY_ATTEMPTS: u32 = 3;
+/// A session that lasted this long resets the wait between attempts.
+const STABLE_SESSION: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -62,6 +75,37 @@ pub struct Connection {
     pub peer: SocketAddr,
     /// Addresses learned from the lookup service during this connect (to be saved).
     pub learned: Vec<String>,
+    /// The session goes through the relay.
+    pub relayed: bool,
+    /// The relay's count of hosts when this session started: a rise means
+    /// the host restarted or was replaced, and the session is gone.
+    pub hosts_seen: u64,
+}
+
+impl Connection {
+    /// How the session reaches the host, for the log.
+    pub fn path(&self) -> String {
+        if self.relayed {
+            "through the relay".to_string()
+        } else {
+            format!("directly at {}", self.peer)
+        }
+    }
+}
+
+enum Via {
+    Direct(usize),
+    Relay,
+}
+
+/// The host's answer to the handshake, if `data` is one.
+fn answer(init: &mut Initiator, data: &[u8]) -> Result<Option<secure::Session>, String> {
+    let Some((session, payload)) = init.finish(data) else { return Ok(None) };
+    match payload.first() {
+        Some(&wire::ACCEPT_OK) => Ok(Some(session)),
+        Some(&wire::ACCEPT_VERSION_MISMATCH) => Err(bye::describe(bye::VERSION_MISMATCH).into()),
+        _ => Err("the host sent an invalid answer".into()),
+    }
 }
 
 fn make_socket(host: SocketAddr) -> std::io::Result<UdpSocket> {
@@ -121,8 +165,11 @@ fn why_unreachable(sock: &UdpSocket, addr: SocketAddr) -> String {
 }
 
 /// Connect: authenticate with the pairing key over whichever address answers
-/// first, then wait for the host to start its stream.
-pub fn connect(opts: &Options) -> Result<Connection, String> {
+/// first, then wait for the host to start its stream. With a relay, its link
+/// starts at once and joins the race after the direct addresses' head start
+/// (at once if there is no direct address, or if the relay carried the last
+/// session); if the host answers directly, the link closes.
+pub fn connect(opts: &Options, mut relay: Option<&mut Relay>, stop: &AtomicBool) -> Result<Connection, String> {
     let hello = wire::hello(&Hello {
         nonce: 0,
         codecs: opts.codecs,
@@ -144,10 +191,30 @@ pub fn connect(opts: &Options) -> Result<Connection, String> {
         add(&mut socks, c);
     }
     let list = |socks: &[(UdpSocket, SocketAddr)]| socks.iter().map(|(_, a)| a.to_string()).collect::<Vec<_>>().join(", ");
-    if socks.is_empty() && !opts.lookup {
-        return Err("no usable address for the host".into());
+
+    // The relay's end on this machine: a loopback address that stands for the host.
+    let mut relay_sock: Option<(UdpSocket, SocketAddr)> = None;
+    if let Some(r) = relay.as_deref_mut() {
+        if let Some(addr) = r.start() {
+            match make_socket(addr) {
+                Ok(s) => relay_sock = Some((s, addr)),
+                Err(e) => log!("cannot use the relay: no local socket for it ({e})"),
+            }
+        }
     }
-    log!("connecting to {} ...", if socks.is_empty() { "the host (looking up its address)".to_string() } else { list(&socks) });
+    let relay_line = |relay: Option<&Relay>| relay.map(|r| format!("\n  relay {}: {}", r.url(), r.diagnose())).unwrap_or_default();
+    if socks.is_empty() && !opts.lookup && relay_sock.is_none() {
+        return Err(format!("no usable address for the host{}", relay_line(relay.as_deref())));
+    }
+    let mut relay_joined = relay_sock.is_some() && (socks.is_empty() || relay.as_deref().is_some_and(Relay::won_last));
+    let relay_url = relay.as_deref().map(|r| r.url().to_string()).unwrap_or_default();
+    match (socks.is_empty(), relay_sock.is_some()) {
+        (true, false) => log!("connecting to the host (looking up its address) ..."),
+        (false, false) => log!("connecting to {} ...", list(&socks)),
+        (true, true) => log!("connecting to the host through the relay at {relay_url} ..."),
+        (false, true) if relay_joined => log!("connecting to {} and through the relay at {relay_url} ...", list(&socks)),
+        (false, true) => log!("connecting to {} (then through the relay at {relay_url} too) ...", list(&socks)),
+    }
 
     let (tx, rx) = mpsc::channel::<Option<Vec<String>>>();
     let mut lookup_started = false;
@@ -155,18 +222,43 @@ pub fn connect(opts: &Options) -> Result<Connection, String> {
     let mut learned: Vec<String> = Vec::new();
     let start = Instant::now();
     let mut last_send: Option<Instant> = None;
+    let mut relay_hosts = relay.as_deref().map_or(0, Relay::hosts_seen);
     let mut buf = [0u8; 2048];
-    let (session, winner) = 'handshake: loop {
-        if start.elapsed() > opts.timeout || (socks.is_empty() && lookup_done) {
-            let mut msg = if socks.is_empty() {
+    let (session, via) = 'handshake: loop {
+        if stop.load(Ordering::Relaxed) {
+            return Err("stopped".into());
+        }
+        if !relay_joined && relay_sock.is_some() && (socks.is_empty() || start.elapsed() >= RELAY_JOIN_AFTER) {
+            relay_joined = true;
+            last_send = None;
+            log!("no direct answer yet: trying through the relay too");
+        }
+        if relay_joined {
+            // The host just came online at the relay: knock at once.
+            let seen = relay.as_deref().map_or(0, Relay::hosts_seen);
+            if seen != relay_hosts {
+                relay_hosts = seen;
+                last_send = None;
+            }
+        }
+        // Nothing left to wait for: no address, the lookup is over, and the
+        // relay (if any) failed in a way waiting will not fix.
+        let gave_up = socks.is_empty()
+            && lookup_done
+            && (relay_sock.is_none() || relay.as_deref().is_none_or(Relay::failed));
+        if start.elapsed() > opts.timeout || gave_up {
+            let mut tried = String::new();
+            for (s, addr) in &socks {
+                tried += &format!("\n  {addr}: {}", why_unreachable(s, *addr));
+            }
+            tried += &relay_line(relay.as_deref());
+            let mut msg = if tried.is_empty() {
                 "the host's address is unknown and the lookup found nothing - is hyperspace-host running?".to_string()
             } else {
-                let mut m = "no answer from the host. Addresses tried:".to_string();
-                for (s, addr) in &socks {
-                    m += &format!("\n  {addr}: {}", why_unreachable(s, *addr));
-                }
-                m += "\nAlso check that hyperspace-host is running and that this is the pairing string it printed.";
-                m
+                format!(
+                    "no answer from the host. Addresses tried:{tried}\nAlso check that hyperspace-host is running and \
+                     that this is the pairing string it printed."
+                )
             };
             if cfg!(target_os = "macos") {
                 msg += "\nOn macOS, System Settings > Privacy & Security > Local Network must allow the terminal you launched this from.";
@@ -176,6 +268,9 @@ pub fn connect(opts: &Options) -> Result<Connection, String> {
         if last_send.is_none_or(|t| t.elapsed() >= Duration::from_millis(250)) {
             last_send = Some(Instant::now());
             for (s, _) in &socks {
+                let _ = s.send(init.packet());
+            }
+            if let Some((s, _)) = relay_sock.as_ref().filter(|_| relay_joined) {
                 let _ = s.send(init.packet());
             }
         }
@@ -208,29 +303,58 @@ pub fn connect(opts: &Options) -> Result<Connection, String> {
         for (i, (s, _)) in socks.iter().enumerate() {
             // Errors (ICMP unreachable, no route) just mean "not this address".
             if let Ok(n) = s.recv(&mut buf) {
-                if let Some((session, payload)) = init.finish(&buf[..n]) {
-                    match payload.first() {
-                        Some(&wire::ACCEPT_OK) => break 'handshake (session, i),
-                        Some(&wire::ACCEPT_VERSION_MISMATCH) => return Err(bye::describe(bye::VERSION_MISMATCH).into()),
-                        _ => return Err("the host sent an invalid answer".into()),
-                    }
+                if let Some(session) = answer(&mut init, &buf[..n])? {
+                    break 'handshake (session, Via::Direct(i));
+                }
+            }
+        }
+        if let Some((s, _)) = relay_sock.as_ref().filter(|_| relay_joined) {
+            if let Ok(n) = s.recv(&mut buf) {
+                if let Some(session) = answer(&mut init, &buf[..n])? {
+                    break 'handshake (session, Via::Relay);
                 }
             }
         }
         std::thread::sleep(Duration::from_millis(2));
     };
 
-    let (sock, peer) = socks.swap_remove(winner);
+    let (sock, peer, relayed) = match via {
+        Via::Direct(i) => {
+            let (sock, peer) = socks.swap_remove(i);
+            (sock, peer, false)
+        }
+        Via::Relay => {
+            let (sock, peer) = relay_sock.take().ok_or("the relay link closed")?;
+            (sock, peer, true)
+        }
+    };
+    drop(relay_sock);
+    let mut hosts_seen = 0;
+    match relay.as_deref_mut() {
+        Some(r) if relayed => {
+            r.won();
+            hosts_seen = r.hosts_seen();
+            log!("authenticated with the host through the relay ({})", r.url());
+        }
+        r => {
+            if let Some(r) = r {
+                r.stop();
+            }
+            log!("authenticated with {peer}{}", if is_local(peer.ip()) { "" } else { " (over the internet)" });
+        }
+    }
     sock.set_nonblocking(false).map_err(|e| e.to_string())?;
     sock.set_read_timeout(Some(Duration::from_millis(100))).map_err(|e| e.to_string())?;
     let link = Link { sock, secure: session };
-    log!("authenticated with {peer}{}", if is_local(peer.ip()) { "" } else { " (over the internet)" });
 
     // Our first encrypted packet proves to the host that we hold the session
     // keys; it then starts capturing and tells us about the stream.
     let mut plain = Vec::new();
     let start = Instant::now();
     while start.elapsed() < opts.timeout {
+        if stop.load(Ordering::Relaxed) {
+            return Err("stopped".into());
+        }
         link.send(&wire::req_welcome());
         let n = match link.sock.recv(&mut buf) {
             Ok(n) => n,
@@ -241,7 +365,7 @@ pub fn connect(opts: &Options) -> Result<Connection, String> {
                 if (w.chunk as usize) < 64 || w.width == 0 || w.height == 0 {
                     return Err("host sent an invalid WELCOME".into());
                 }
-                return Ok(Connection { link: Arc::new(link), welcome: w, peer, learned });
+                return Ok(Connection { link: Arc::new(link), welcome: w, peer, learned, relayed, hosts_seen });
             }
             Some(Packet::Bye(reason)) => {
                 return Err(format!("host refused the connection: {}", bye::describe(reason)));
@@ -255,11 +379,11 @@ pub fn connect(opts: &Options) -> Result<Connection, String> {
 /// Sends input with redundancy until acked. Shared between the UI thread
 /// (events) and the network thread (acks, resends).
 pub struct InputTx {
-    link: Arc<Link>,
     state: Mutex<InputState>,
 }
 
 struct InputState {
+    link: Arc<Link>,
     q: InputQueue,
     buf: Vec<u8>,
     last_send_us: u64,
@@ -268,9 +392,17 @@ struct InputState {
 impl InputTx {
     pub fn new(link: Arc<Link>) -> InputTx {
         InputTx {
-            link,
-            state: Mutex::new(InputState { q: InputQueue::default(), buf: Vec::with_capacity(1500), last_send_us: 0 }),
+            state: Mutex::new(InputState { link, q: InputQueue::default(), buf: Vec::with_capacity(1500), last_send_us: 0 }),
         }
+    }
+
+    /// A new session replaced the last: send on its link, from a fresh queue
+    /// (the new session numbers input from the start).
+    pub fn set_link(&self, link: Arc<Link>) {
+        let mut s = self.state.lock().unwrap();
+        s.link = link;
+        s.q = InputQueue::default();
+        s.last_send_us = 0;
     }
 
     /// Queue an event and put it on the wire immediately.
@@ -278,7 +410,7 @@ impl InputTx {
     pub fn send(&self, ev: InputEvent) {
         let mut s = self.state.lock().unwrap();
         s.q.push(ev);
-        Self::flush(&self.link, &mut s);
+        Self::flush(&mut s);
     }
 
     /// Queue several events and send them in one datagram.
@@ -290,11 +422,11 @@ impl InputTx {
         for ev in evs {
             s.q.push(*ev);
         }
-        Self::flush(&self.link, &mut s);
+        Self::flush(&mut s);
     }
 
-    fn flush(link: &Link, s: &mut InputState) {
-        let InputState { q, buf, last_send_us, .. } = s;
+    fn flush(s: &mut InputState) {
+        let InputState { link, q, buf, last_send_us } = s;
         if q.encode(buf) {
             link.send(buf);
             *last_send_us = now_us();
@@ -309,14 +441,13 @@ impl InputTx {
     pub fn resend_if_stale(&self, now: u64, after_us: u64) {
         let mut s = self.state.lock().unwrap();
         if s.q.has_unacked() && now.saturating_sub(s.last_send_us) >= after_us {
-            Self::flush(&self.link, &mut s);
+            Self::flush(&mut s);
         }
     }
 
     pub fn has_unacked(&self) -> bool {
         self.state.lock().unwrap().q.has_unacked()
     }
-
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -331,6 +462,8 @@ pub struct Stats {
     pub frames_dropped: u64,
     pub nacks: u64,
     pub keyframe_requests: u64,
+    /// The session goes through the relay.
+    pub relayed: bool,
 }
 
 impl Stats {
@@ -346,6 +479,9 @@ impl Stats {
         if self.frames_dropped != 0 || self.nacks != 0 {
             s += &format!("  dropped {}  nacks {}", self.frames_dropped, self.nacks);
         }
+        if self.relayed {
+            s += "  via relay";
+        }
         s
     }
 }
@@ -359,6 +495,9 @@ pub trait Handler {
     fn stats(&mut self, stats: &Stats);
     /// Called once per loop iteration (at least every 20 ms), frames or not.
     fn idle(&mut self) {}
+    /// A new session replaced the last one (after a reconnect): the stream
+    /// starts over with a keyframe.
+    fn new_session(&mut self, _welcome: &Welcome, _relayed: bool) {}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -368,6 +507,10 @@ pub enum Exit {
     /// The host said goodbye.
     Host(u8),
     HostTimeout,
+    /// Through the relay: the host restarted, or another took its place.
+    NewHost,
+    /// Through the relay: the host closed this client's connection.
+    RelayClosed,
     Error(String),
 }
 
@@ -377,6 +520,8 @@ impl Exit {
             Exit::Local => "disconnected".into(),
             Exit::Host(r) => format!("host closed the session: {}", bye::describe(*r)),
             Exit::HostTimeout => "lost contact with the host".into(),
+            Exit::NewHost => "the host reconnected to the relay (restarted or replaced)".into(),
+            Exit::RelayClosed => "the host closed the connection through the relay".into(),
             Exit::Error(e) => e.clone(),
         }
     }
@@ -385,12 +530,13 @@ impl Exit {
 /// Run until `stop` is set, the host goes away, or the socket fails. Sends BYE
 /// on the way out when the exit is ours. `keyframe_every_us` periodically asks
 /// the host for a keyframe (testing only).
-pub fn receive_loop(
+fn receive_loop(
     conn: &Connection,
     input: &InputTx,
     stop: &AtomicBool,
     handler: &mut dyn Handler,
     keyframe_every_us: Option<u64>,
+    mut relay: Option<&mut Relay>,
 ) -> Exit {
     let link = &*conn.link;
     let sock = &link.sock;
@@ -424,6 +570,10 @@ pub fn receive_loop(
     let exit = loop {
         if stop.load(Ordering::Relaxed) {
             break Exit::Local;
+        }
+        // A host the relay reports anew has no session with us (one atomic load).
+        if conn.relayed && relay.as_deref().is_some_and(|r| r.hosts_seen() > conn.hosts_seen) {
+            break Exit::NewHost;
         }
         // Wake quickly while repairs or input acks are pending; otherwise idle.
         let want_ms = if video.busy() || cursor.busy() || input.has_unacked() { 1 } else { 20 };
@@ -560,6 +710,7 @@ pub fn receive_loop(
                 frames_dropped: video.stats.frames_dropped,
                 nacks: video.stats.nacks_sent,
                 keyframe_requests: video.stats.keyframe_requests,
+                relayed: conn.relayed,
             });
             // Ask the host for less (or more) if the path changed.
             let sample = Sample {
@@ -583,6 +734,12 @@ pub fn receive_loop(
             st_lat_sum = 0;
             st_lat_n = 0;
             st_handler_sum = 0;
+            if let Some(r) = relay.as_deref_mut() {
+                r.tick();
+                if conn.relayed && r.status() == Some(Status::ClosedByHost) {
+                    break Exit::RelayClosed;
+                }
+            }
         }
     };
 
@@ -592,4 +749,137 @@ pub fn receive_loop(
         }
     }
     exit
+}
+
+/// Worth connecting again (with a relay configured): the session was lost,
+/// not ended. Never after the host said goodbye or replaced this client.
+fn retryable(exit: &Exit) -> bool {
+    match exit {
+        Exit::HostTimeout | Exit::NewHost | Exit::RelayClosed | Exit::Error(_) => true,
+        Exit::Host(reason) => matches!(*reason, bye::TIMEOUT | bye::UNKNOWN_SESSION),
+        Exit::Local => false,
+    }
+}
+
+/// 75 to 125 % of `d`, so clients cut at the same moment do not all come back
+/// at the same moment. The clock's low bits are random enough for that.
+fn jittered(d: Duration) -> Duration {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |t| t.subsec_nanos());
+    d.mul_f64(0.75 + f64::from(nanos % 1000) / 2000.0)
+}
+
+/// Sleeps `d` unless `stop` is set first; false if it was.
+fn wait_unless_stopped(d: Duration, stop: &AtomicBool) -> bool {
+    let until = Instant::now() + d;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return false;
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        std::thread::sleep(left.min(Duration::from_millis(50)));
+    }
+}
+
+/// Runs sessions until one ends for good. With a relay configured, a lost
+/// session (silence, a new host at the relay, the host closing the relayed
+/// connection) is followed by a new connect, racing the direct addresses and
+/// the relay again, with a growing wait between attempts. `on_connect` sees
+/// each new connection; the handler hears about it through `new_session`.
+#[allow(clippy::too_many_arguments)]
+pub fn run_sessions(
+    opts: &Options,
+    mut conn: Connection,
+    input: &InputTx,
+    stop: &AtomicBool,
+    handler: &mut dyn Handler,
+    keyframe_every_us: Option<u64>,
+    mut relay: Option<&mut Relay>,
+    on_connect: &mut dyn FnMut(&Connection),
+) -> Exit {
+    let mut wait = RETRY_FIRST;
+    loop {
+        let began = Instant::now();
+        let exit = receive_loop(&conn, input, stop, handler, keyframe_every_us, relay.as_deref_mut());
+        if relay.is_none() || stop.load(Ordering::Relaxed) || !retryable(&exit) {
+            if exit == Exit::Local && conn.relayed {
+                // The goodbyes are queued on the relay link: give it a moment
+                // to carry them before it closes.
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            return exit;
+        }
+        if began.elapsed() >= STABLE_SESSION {
+            wait = RETRY_FIRST;
+        }
+        log!("{}; connecting again", exit.describe());
+        let mut attempts = 0;
+        conn = loop {
+            if !wait_unless_stopped(jittered(wait), stop) {
+                return Exit::Local;
+            }
+            wait = (wait * 2).min(RETRY_MAX);
+            match connect(opts, relay.as_deref_mut(), stop) {
+                Ok(c) => break c,
+                Err(_) if stop.load(Ordering::Relaxed) => return Exit::Local,
+                Err(e) => {
+                    attempts += 1;
+                    if attempts >= RETRY_ATTEMPTS {
+                        return Exit::Error(e);
+                    }
+                    log!("{e}");
+                    log!("connecting again");
+                }
+            }
+        };
+        on_connect(&conn);
+        input.set_link(conn.link.clone());
+        handler.new_session(&conn.welcome, conn.relayed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_lost_sessions_are_retried() {
+        for exit in [Exit::HostTimeout, Exit::NewHost, Exit::RelayClosed, Exit::Error("network error: x".into())] {
+            assert!(retryable(&exit), "{exit:?}");
+        }
+        assert!(retryable(&Exit::Host(bye::TIMEOUT)));
+        assert!(retryable(&Exit::Host(bye::UNKNOWN_SESSION)));
+        // The host said goodbye, another client took over, or we stopped.
+        for exit in [Exit::Local, Exit::Host(bye::QUIT), Exit::Host(bye::REPLACED), Exit::Host(bye::STREAM_ENDED)] {
+            assert!(!retryable(&exit), "{exit:?}");
+        }
+    }
+
+    #[test]
+    fn retry_waits_are_jittered_within_bounds() {
+        for _ in 0..100 {
+            let d = jittered(Duration::from_secs(2));
+            assert!(d >= Duration::from_millis(1500) && d <= Duration::from_millis(2500), "{d:?}");
+        }
+    }
+
+    #[test]
+    fn waiting_stops_early() {
+        let stop = AtomicBool::new(true);
+        let t = Instant::now();
+        assert!(!wait_unless_stopped(Duration::from_secs(5), &stop));
+        assert!(t.elapsed() < Duration::from_secs(1));
+        stop.store(false, Ordering::Relaxed);
+        assert!(wait_unless_stopped(Duration::from_millis(20), &stop));
+    }
+
+    #[test]
+    fn stats_line_says_relay() {
+        let mut s = Stats::default();
+        assert!(!s.summary().contains("relay"));
+        s.relayed = true;
+        assert!(s.summary().ends_with("  via relay"));
+    }
 }

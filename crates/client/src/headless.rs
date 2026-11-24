@@ -6,6 +6,7 @@ use crate::Args;
 use hyperspace_proto::cursor::CursorShape;
 use hyperspace_proto::frag::Frame;
 use hyperspace_proto::input::InputEvent;
+use hyperspace_proto::wire::Welcome;
 use hyperspace_proto::{annexb, log, Codec};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -62,10 +63,33 @@ impl Handler for Headless {
             log!("{}", s.summary());
         }
     }
+
+    fn new_session(&mut self, w: &Welcome, _relayed: bool) {
+        // The new stream starts with a keyframe and numbers its frames anew.
+        self.codec = w.codec;
+        self.have_params = false;
+        self.last_id = None;
+    }
+}
+
+fn log_connected(conn: &session::Connection) {
+    let w = conn.welcome;
+    log!(
+        "connected {}: {}x{} @ {} fps, {}, {:.1} Mbit/s (headless)",
+        conn.path(),
+        w.width,
+        w.height,
+        w.fps,
+        w.codec.name(),
+        w.bitrate_kbps as f64 / 1000.0
+    );
 }
 
 pub fn run(args: &Args) -> i32 {
-    let conn = match session::connect(&args.session_options(if args.fps == 0 { 60 } else { args.fps })) {
+    let opts = args.session_options(if args.fps == 0 { 60 } else { args.fps });
+    let mut relay = args.relay_link();
+    let stop = Arc::new(AtomicBool::new(false));
+    let conn = match session::connect(&opts, relay.as_mut(), &stop) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: {e}");
@@ -73,15 +97,8 @@ pub fn run(args: &Args) -> i32 {
         }
     };
     args.remember(&conn);
+    log_connected(&conn);
     let w = conn.welcome;
-    log!(
-        "connected: {}x{} @ {} fps, {}, {:.1} Mbit/s (headless)",
-        w.width,
-        w.height,
-        w.fps,
-        w.codec.name(),
-        w.bitrate_kbps as f64 / 1000.0
-    );
     let input = InputTx::new(conn.link.clone());
     if args.test_input {
         // Harmless on a real host: nudge the pointer, tap and release Shift.
@@ -93,7 +110,6 @@ pub fn run(args: &Args) -> i32 {
             InputEvent::Wheel { dx: 0, dy: 0 },
         ]);
     }
-    let stop = Arc::new(AtomicBool::new(false));
     let mut h = Headless {
         codec: w.codec,
         frames: 0,
@@ -107,7 +123,12 @@ pub fn run(args: &Args) -> i32 {
         print_stats: args.stats,
         last: Stats::default(),
     };
-    let exit = session::receive_loop(&conn, &input, &stop, &mut h, args.test_keyframes.then_some(150_000));
+    let mut on_connect = |c: &session::Connection| {
+        args.remember(c);
+        log_connected(c);
+    };
+    let keyframes = args.test_keyframes.then_some(150_000);
+    let exit = session::run_sessions(&opts, conn, &input, &stop, &mut h, keyframes, relay.as_mut(), &mut on_connect);
     log!(
         "{}: {} frames ({} invalid), {} dropped, {} nacks, {} keyframe requests, {} cursor shapes, input acked: {}",
         exit.describe(),

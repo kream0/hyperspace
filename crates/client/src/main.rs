@@ -5,6 +5,7 @@ mod headless;
 mod keymap;
 #[cfg(target_os = "macos")]
 mod mac;
+mod relay;
 mod session;
 
 use hyperspace_proto::pairing::{config_dir, resolve_addr, Pairing};
@@ -28,6 +29,10 @@ OPTIONS:
     --packet-size <N>     Largest UDP payload to receive [default: host decides]
     --no-lookup           Only try the addresses already known for the host
     --connect-timeout <S> Give up connecting after S seconds [default: 15]
+    --relay <URL|off>     Also connect through this relay (wss://...) when the host's
+                          addresses do not answer; remembered. `off`: never [default:
+                          the remembered setting, else the relay in the pairing string]
+    --relay-check <URL>   Check that this relay can be reached from here, then exit
     --config-dir <DIR>    Where the remembered host is kept
     --fullscreen          Start in fullscreen
     --cmd-as-ctrl         Send the Command key as Ctrl instead of the Windows key
@@ -68,6 +73,10 @@ pub struct Args {
     pub frames: Option<u64>,
     pub test_input: bool,
     pub test_keyframes: bool,
+    /// The relay to fall back on (canonical address), if any.
+    pub relay: Option<String>,
+    /// The relay entry of the saved pairing string, kept when it is updated.
+    pub pairing_relay: Option<String>,
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
@@ -91,7 +100,11 @@ fn parse_args() -> Result<Option<Args>, String> {
         frames: None,
         test_input: false,
         test_keyframes: false,
+        relay: None,
+        pairing_relay: None,
     };
+    let mut relay_arg = relay::RelayArg::Unset;
+    let mut relay_check: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut val = |name: &str| args.next().ok_or(format!("{name} needs a value"));
@@ -144,10 +157,26 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--frames" => a.frames = Some(val("--frames")?.parse().map_err(|_| "invalid --frames")?),
             "--test-input" => a.test_input = true,
             "--test-keyframes" => a.test_keyframes = true,
+            "--relay" => relay_arg = relay::RelayArg::parse(&val("--relay")?)?,
+            "--relay-check" => relay_check = Some(val("--relay-check")?),
             s if s.starts_with('-') => return Err(format!("unknown option '{s}' (try --help)")),
             s => positional.push(s.to_string()),
         }
     }
+    if let Some(url) = relay_check {
+        // Needs no pairing: run it before looking for one.
+        match hyperspace_bridge::check(&url) {
+            Ok(line) => {
+                println!("{line}");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    let relay_path = dir.join("relay.txt");
     a.saved_path = dir.join("host.txt");
     let saved = Pairing::load(&a.saved_path);
     let save = |p: &Pairing| p.save(&a.saved_path).map_err(|e| format!("cannot save to {}: {e}", a.saved_path.display()));
@@ -157,6 +186,9 @@ fn parse_args() -> Result<Option<Args>, String> {
         ["pair", s] => {
             let p = Pairing::parse(s).ok_or("that is not a pairing string (it starts with 'hs1.')")?;
             save(&p)?;
+            if relay_arg != relay::RelayArg::Unset {
+                relay::setting(&relay_arg, &relay_path, None);
+            }
             println!("Paired. Run `hyperspace-client` to connect.");
             return Ok(None);
         }
@@ -170,25 +202,30 @@ fn parse_args() -> Result<Option<Args>, String> {
             p
         }
         [host] => {
-            // An explicit address, authenticated with the remembered key.
-            let key = saved.ok_or("no host is paired yet: run `hyperspace-client pair <PAIRING-STRING>` first")?.key;
+            // An explicit address, authenticated with the remembered key
+            // (and its relay, if the remembered pairing names one).
+            let saved = saved.ok_or("no host is paired yet: run `hyperspace-client pair <PAIRING-STRING>` first")?;
             a.lookup = false;
-            Pairing { key, addrs: vec![host.to_string()] }
+            let mut p = Pairing { key: saved.key.clone(), addrs: vec![host.to_string()] };
+            p.set_relay(saved.relay().as_deref())?;
+            p
         }
         _ => return Err("too many arguments (try --help)".into()),
     };
     a.key = pairing.key.clone();
-    for entry in &pairing.addrs {
+    for entry in pairing.addresses() {
         for addr in resolve_addr(entry, DEFAULT_PORT) {
             if !a.candidates.contains(&addr) {
                 a.candidates.push(addr);
             }
         }
     }
-    if a.candidates.is_empty() && !a.lookup {
-        return Err(format!("cannot resolve '{}'", pairing.addrs.join(", ")));
+    a.pairing_relay = pairing.relay();
+    a.relay = relay::setting(&relay_arg, &relay_path, a.pairing_relay.as_deref());
+    if a.candidates.is_empty() && !a.lookup && a.relay.is_none() {
+        return Err(format!("cannot resolve '{}'", pairing.addresses().collect::<Vec<_>>().join(", ")));
     }
-    a.host_name = pairing.addrs.first().cloned().unwrap_or_else(|| "host".into()).replace('/', ":");
+    a.host_name = pairing.addresses().next().unwrap_or("host").replace('/', ":");
     Ok(Some(a))
 }
 
@@ -206,16 +243,34 @@ impl Args {
         }
     }
 
+    /// The relay link for the sessions, if a relay is set.
+    pub fn relay_link(&self) -> Option<relay::Relay> {
+        self.relay.clone().map(|url| relay::Relay::new(url, self.key.clone()))
+    }
+
     /// Remember addresses the lookup service returned, so the next connect is direct.
     pub fn remember(&self, conn: &session::Connection) {
         if conn.learned.is_empty() {
             return;
         }
-        let p = Pairing { key: self.key.clone(), addrs: conn.learned.clone() };
+        // The pairing's relay entry stays (the --relay setting has its own file).
+        let p = remembered(&self.key, &conn.learned, self.pairing_relay.as_deref());
         if let Err(e) = p.save(&self.saved_path) {
             hyperspace_proto::log!("could not update {}: {e}", self.saved_path.display());
         }
     }
+}
+
+/// The pairing to save after a lookup: the addresses it found, and the relay
+/// the pairing named, if any.
+fn remembered(key: &Key, learned: &[String], relay: Option<&str>) -> Pairing {
+    let mut p = Pairing { key: key.clone(), addrs: learned.to_vec() };
+    if relay.is_some() {
+        if let Err(e) = p.set_relay(relay) {
+            hyperspace_proto::log!("not keeping the pairing's relay: {e}");
+        }
+    }
+    p
 }
 
 fn main() {
@@ -240,5 +295,36 @@ fn main() {
         }
     };
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remembered_addresses_keep_the_relay() {
+        let key = Key::from_bytes([3; 32]);
+        let learned = vec!["192.0.2.7/45800".to_string(), "2001:db8::7/45800".to_string()];
+        let p = remembered(&key, &learned, Some("wss://relay.example/v1"));
+        assert_eq!(p.relay().as_deref(), Some("wss://relay.example/v1"));
+        assert_eq!(p.addresses().collect::<Vec<_>>(), ["192.0.2.7/45800", "2001:db8::7/45800"]);
+        assert_eq!(p.key, key);
+        // Through the pairing string and back, as it is saved.
+        let back = Pairing::parse(&p.encode()).unwrap();
+        assert_eq!(back.relay().as_deref(), Some("wss://relay.example/v1"));
+        assert_eq!(back.addresses().count(), 2);
+
+        // No relay in the pairing: none appears.
+        let p = remembered(&key, &learned, None);
+        assert_eq!(p.relay(), None);
+        assert_eq!(p.addrs, learned);
+
+        // A relay entry among the learned addresses is not doubled.
+        let mut with_relay = learned.clone();
+        with_relay.push("relay=wss://relay.example/v1".into());
+        let p = remembered(&key, &with_relay, Some("wss://relay.example/v1"));
+        assert_eq!(p.addrs.iter().filter(|a| a.starts_with("relay=")).count(), 1);
+        assert_eq!(p.addresses().count(), 2);
+    }
 }
 

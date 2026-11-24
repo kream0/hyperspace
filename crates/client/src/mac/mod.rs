@@ -15,6 +15,7 @@ use hyperspace_proto::cursor::CursorShape;
 use hyperspace_proto::frag::Frame;
 use hyperspace_proto::input::InputEvent;
 use hyperspace_proto::log;
+use hyperspace_proto::wire::Welcome;
 use objc2::rc::{autoreleasepool, Retained};
 use objc2_core_graphics::{CGEventFlags, CGEventSource, CGEventSourceStateID};
 use objc2_quartz_core::CAMetalLayer;
@@ -57,7 +58,26 @@ enum UserEvent {
     Cursor(CursorShape),
     CursorVisible(bool),
     Stats(Stats),
+    /// A new session replaced the last (after a reconnect).
+    Session { relayed: bool },
     Ended { exit: Exit, decoded: u64, presented: u64 },
+}
+
+fn window_title(host: &str, relayed: bool) -> String {
+    format!("hyperspace - {host}{}", if relayed { " (relay)" } else { "" })
+}
+
+fn log_connected(conn: &session::Connection) {
+    let w = conn.welcome;
+    log!(
+        "connected {}: {}x{} @ {} fps, {}, {:.1} Mbit/s",
+        conn.path(),
+        w.width,
+        w.height,
+        w.fps,
+        w.codec.name(),
+        w.bitrate_kbps as f64 / 1000.0
+    );
 }
 
 struct NetHandler {
@@ -105,6 +125,12 @@ impl Handler for NetHandler {
             log!("{}", stats.summary());
         }
         let _ = self.proxy.send_event(UserEvent::Stats(*stats));
+    }
+
+    fn new_session(&mut self, w: &Welcome, relayed: bool) {
+        // The new stream starts over with its own parameter sets.
+        self.decoder = Decoder::new(w.codec);
+        let _ = self.proxy.send_event(UserEvent::Session { relayed });
     }
 
     fn idle(&mut self) {
@@ -182,17 +208,13 @@ impl App {
             let hz = monitor.as_ref().and_then(|m| m.refresh_rate_millihertz()).map(|m| (m + 500) / 1000).unwrap_or(60);
             hz.clamp(30, 240) as u16
         };
-        let conn = session::connect(&self.args.session_options(fps))?;
+        let opts = self.args.session_options(fps);
+        let mut relay = self.args.relay_link();
+        let stop = Arc::new(AtomicBool::new(false));
+        let conn = session::connect(&opts, relay.as_mut(), &stop)?;
         self.args.remember(&conn);
+        log_connected(&conn);
         let w = conn.welcome;
-        log!(
-            "connected: {}x{} @ {} fps, {}, {:.1} Mbit/s",
-            w.width,
-            w.height,
-            w.fps,
-            w.codec.name(),
-            w.bitrate_kbps as f64 / 1000.0
-        );
 
         // Pixel-exact when it fits, otherwise the largest size that does.
         let (vw, vh) = (w.width as f64, w.height as f64);
@@ -203,7 +225,7 @@ impl App {
                 scale = scale.min(s.width as f64 * 0.92 / vw).min(s.height as f64 * 0.82 / vh);
             }
         }
-        let title = format!("hyperspace - {}", self.args.host_name);
+        let title = window_title(&self.args.host_name, conn.relayed);
         let mut attrs = Window::default_attributes()
             .with_title(title.clone())
             .with_inner_size(PhysicalSize::new((vw * scale).round().max(320.0) as u32, (vh * scale).round().max(200.0) as u32));
@@ -227,9 +249,9 @@ impl App {
         shared.surface_h.store(size.height, Ordering::Relaxed);
 
         let input = Arc::new(InputTx::new(conn.link.clone()));
-        let stop = Arc::new(AtomicBool::new(false));
         let net = {
             let (input, stop, shared, proxy) = (input.clone(), stop.clone(), shared.clone(), self.proxy.clone());
+            let args = self.args.clone();
             let (max_frames, print_stats, codec) = (self.args.frames, self.args.stats, w.codec);
             std::thread::Builder::new()
                 .name("net-decode-present".into())
@@ -248,7 +270,13 @@ impl App {
                         print_stats,
                         last_surface: (0, 0),
                     };
-                    let exit = session::receive_loop(&conn, &input, &stop, &mut h, None);
+                    let mut on_connect = |c: &session::Connection| {
+                        args.remember(c);
+                        log_connected(c);
+                    };
+                    let exit = session::run_sessions(&opts, conn, &input, &stop, &mut h, None, relay.as_mut(), &mut on_connect);
+                    // The relay link's last counters go to the log before the window closes.
+                    drop(relay);
                     let _ = proxy.send_event(UserEvent::Ended { exit, decoded: h.decoded, presented: h.renderer.presented });
                 })
                 .map_err(|e| format!("cannot start network thread: {e}"))?
@@ -518,6 +546,10 @@ impl ApplicationHandler<UserEvent> for App {
                 r.apply_cursor(el);
             }
             UserEvent::CursorVisible(v) => r.window.set_cursor_visible(v),
+            UserEvent::Session { relayed } => {
+                r.title = window_title(&self.args.host_name, relayed);
+                r.window.set_title(&r.title);
+            }
             UserEvent::Stats(s) => {
                 if r.show_stats {
                     r.window.set_title(&format!("{} - {}", r.title, s.summary()));
