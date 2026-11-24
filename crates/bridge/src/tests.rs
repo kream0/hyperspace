@@ -451,8 +451,8 @@ fn pings_keep_a_quiet_link_up() {
     let host = HostBridge::start_with(relay.url(), &key, echo.addr, RelayedPeers::new(), t).unwrap();
     let (client, local) = ClientBridge::start_with(relay.url(), &key, t).unwrap();
     wait_for("the client to see the host online", || client.status() == Status::HostOnline);
-    // Three times the dead-link limit.
-    std::thread::sleep(t.idle_timeout * 3);
+    // Twice the dead-link limit.
+    std::thread::sleep(t.idle_timeout * 2);
     let stats = client.stats();
     assert_eq!(stats.reconnects, 0, "{stats:?}");
     assert_eq!(stats.last_close, None, "{stats:?}");

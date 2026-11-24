@@ -72,19 +72,21 @@ impl PortMapping {
             opts.broadcast_address = addr;
             opts.allowed_gateway_ips = vec![addr.ip()];
         }
-        let gateway = igd_next::search_gateway(opts).map_err(|e| format!("no UPnP router found ({e})"))?;
+        let gateway = igd_next::search_gateway(opts).map_err(|e| format!("no UPnP router found ({})", plain_error(&e)))?;
         // Our address on the interface that faces the router.
         let local_ip = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
             .and_then(|s| s.connect(gateway.addr).and_then(|_| s.local_addr()))
             .map(|a| a.ip())
-            .map_err(|e| format!("cannot determine the LAN address: {e}"))?;
+            .map_err(|e| format!("cannot determine the LAN address: {}", plain_error(&e)))?;
         let local = SocketAddr::new(local_ip, port);
         let external_port = match gateway.add_port(PortMappingProtocol::UDP, port, local, LEASE_SECS, "hyperspace") {
             Ok(()) => port,
             // The same port may be taken by another machine: take any free one.
             Err(first) => gateway
                 .add_any_port(PortMappingProtocol::UDP, local, LEASE_SECS, "hyperspace")
-                .map_err(|e| format!("the router refused to forward a port ({first}; {e})"))?,
+                .map_err(|e| {
+                    format!("the router refused to forward a port ({}; {})", plain_error(&first), plain_error(&e))
+                })?,
         };
         let external_ip = gateway.get_external_ip().ok();
         let mut m = PortMapping { gateway, local, external_port, external_ip, pinholes: Vec::new() };
@@ -109,7 +111,7 @@ impl PortMapping {
         if let Err(e) =
             self.gateway.add_port(PortMappingProtocol::UDP, self.external_port, self.local, LEASE_SECS, "hyperspace")
         {
-            log!("could not renew the router's port mapping: {e}");
+            log!("could not renew the router's port mapping: {}", plain_error(&e));
         }
         if let Ok(ip) = self.gateway.get_external_ip() {
             self.external_ip = Some(ip);
@@ -356,7 +358,7 @@ pub fn run(opts: Options) {
                 Some(d)
             }
             Err(e) => {
-                log!("address lookup service unavailable: {e}");
+                log!("address lookup service unavailable: {}", plain_error(&e));
                 None
             }
         }

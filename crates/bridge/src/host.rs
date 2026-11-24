@@ -218,8 +218,7 @@ async fn session(ws: Ws, target: SocketAddr, peers: &RelayedPeers, t: &Timing) -
     // Dropping a peer closes its socket and takes its address out of `peers`,
     // so every return below also forgets every client.
     let mut open: HashMap<u32, Peer> = HashMap::new();
-    // Each reader sends at most one message, so this holds at most one per
-    // peer ever opened on this link.
+    // Unbounded, but each reader sends at most one message: bounded by the peers opened on this link.
     let (failed_tx, mut failed_rx) = mpsc::unbounded_channel::<(u32, u64)>();
     // Tells a peer from an older one with the same id.
     let mut serial: u64 = 0;
@@ -369,7 +368,7 @@ async fn peer_reader(id: u32, sock: Arc<UdpSocket>, tx: Tx) {
             }
             Err(e) if link::transient(&e) => {}
             Err(e) => {
-                log!("relay: loopback socket for client {id} failed: {}; dropping the client", errors::plain(e));
+                log!("relay: loopback socket for client {id} failed, dropping the client: {}", errors::plain(e));
                 return;
             }
         }

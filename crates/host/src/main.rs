@@ -271,7 +271,7 @@ fn relay_setting(extra: &Extra) -> Option<RelayUrl> {
             match saved {
                 Ok(()) => log!("relay setting saved to {} (--relay off removes it)", path.display()),
                 Err(e) => log!(
-                    "cannot save the relay setting to {}: {}; using it for this run only",
+                    "cannot save the relay setting to {}, using it for this run only: {}",
                     path.display(),
                     plain_error(&e)
                 ),
@@ -282,7 +282,7 @@ fn relay_setting(extra: &Extra) -> Option<RelayUrl> {
             match std::fs::remove_file(&path) {
                 Ok(()) => log!("relay setting removed: clients connect over UDP only"),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => log!("cannot remove {}: {}; not using a relay for this run", path.display(), plain_error(&e)),
+                Err(e) => log!("cannot remove {}, not using a relay for this run: {}", path.display(), plain_error(&e)),
             }
             None
         }
@@ -297,7 +297,7 @@ fn relay_setting(extra: &Extra) -> Option<RelayUrl> {
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
-                log!("cannot read {}: {}; not using a relay", path.display(), plain_error(&e));
+                log!("cannot read {}, not using a relay: {}", path.display(), plain_error(&e));
                 None
             }
         },
@@ -343,7 +343,8 @@ fn serve(mut cfg: Config, extra: Extra) -> Result<(), String> {
         let target = relay_target(local.unwrap_or_else(|| SocketAddr::from((Ipv4Addr::LOCALHOST, cfg.port))));
         match HostBridge::start(&url.to_string(), &cfg.key, target, server.relayed_peers()) {
             Ok(b) => bridge = Some(b),
-            Err(e) => log!("relay: cannot start the relay link: {e}"),
+            // The bridge's errors already say "cannot start the relay link".
+            Err(e) => log!("relay: {e}"),
         }
     }
     let reach = {
@@ -356,7 +357,7 @@ fn serve(mut cfg: Config, extra: Extra) -> Result<(), String> {
             config_dir: extra.config_dir,
             relay: relay.as_ref().map(|u| u.to_string()),
         };
-        std::thread::Builder::new().name("reach".into()).spawn(move || reach::run(opts)).map_err(|e| e.to_string())?
+        std::thread::Builder::new().name("reach".into()).spawn(move || reach::run(opts)).map_err(|e| plain_error(&e))?
     };
     let result = server.run();
     // Let the reach thread withdraw the router's port mapping.
