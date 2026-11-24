@@ -131,7 +131,8 @@ mod tests {
     /// Publish and resolve through a private DHT running on localhost.
     #[test]
     fn publish_and_resolve_over_a_local_dht() {
-        let testnet = mainline::Testnet::new(8).expect("local dht");
+        // Bound to localhost explicitly: only Linux lets you send to 0.0.0.0.
+        let testnet = mainline::Testnet::builder(8).build().expect("local dht");
         let host = Dht::builder().bootstrap(&testnet.bootstrap).build().unwrap();
         let client = Dht::builder().bootstrap(&testnet.bootstrap).build().unwrap();
         let key = Key::generate();
