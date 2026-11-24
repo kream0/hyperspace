@@ -75,6 +75,7 @@ pub struct Renderer {
     /// Textures (and their pixel buffer) must outlive the GPU's use of them.
     keep: VecDeque<(CFRetained<CVMetalTexture>, CFRetained<CVMetalTexture>, CFRetained<CVPixelBuffer>)>,
     drawable_size: (u32, u32),
+    warned: bool,
     pub presented: u64,
 }
 
@@ -118,7 +119,7 @@ impl Renderer {
         let cache = NonNull::new(cache).filter(|_| st == 0).ok_or(format!("CVMetalTextureCacheCreate failed ({st})"))?;
         let cache = unsafe { CFRetained::from_raw(cache) };
 
-        Ok(Renderer { layer, queue, pipeline, cache, keep: VecDeque::new(), drawable_size: (0, 0), presented: 0 })
+        Ok(Renderer { layer, queue, pipeline, cache, keep: VecDeque::new(), drawable_size: (0, 0), warned: false, presented: 0 })
     }
 
     fn plane_texture(&self, pb: &CVPixelBuffer, format: MTLPixelFormat, plane: usize) -> Option<CFRetained<CVMetalTexture>> {
@@ -152,6 +153,10 @@ impl Renderer {
         let (Some(ty), Some(tc)) =
             (self.plane_texture(pb, MTLPixelFormat::R8Unorm, 0), self.plane_texture(pb, MTLPixelFormat::RG8Unorm, 1))
         else {
+            if !self.warned {
+                self.warned = true;
+                hyperspace_proto::log!("cannot wrap the decoded frame as Metal textures; nothing will be shown");
+            }
             return false;
         };
         let (Some(luma), Some(chroma)) = (CVMetalTextureGetTexture(&ty), CVMetalTextureGetTexture(&tc)) else {
@@ -188,6 +193,19 @@ impl Renderer {
         }
         self.presented += 1;
         true
+    }
+
+    /// Redraw the last frame if the window changed while the stream was idle
+    /// (the host sends nothing while its desktop is still).
+    pub fn refresh(&mut self, shared: &UiShared) {
+        let want = (shared.surface_w.load(Ordering::Relaxed), shared.surface_h.load(Ordering::Relaxed));
+        if shared.redraw.swap(false, Ordering::Relaxed) || want != self.drawable_size {
+            if let Some(pb) = self.keep.back().map(|k| k.2.clone()) {
+                if self.present(&pb, shared) {
+                    self.presented -= 1;
+                }
+            }
+        }
     }
 }
 

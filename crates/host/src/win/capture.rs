@@ -92,6 +92,8 @@ pub struct Capture {
     shape_buf: Vec<u8>,
     cursor_visible: bool,
     holding_frame: bool,
+    /// The first frame after (re)opening is always a full image.
+    first_after_open: bool,
 }
 
 impl Capture {
@@ -139,10 +141,11 @@ impl Capture {
             return Err(format!("D3D11CreateDevice on '{}' failed: {last_err}", out.adapter_name));
         };
         // Media Foundation and our threads share the immediate context.
-        if let Ok(mt) = context.cast::<ID3D11Multithread>() {
-            unsafe {
+        match context.cast::<ID3D11Multithread>() {
+            Ok(mt) => unsafe {
                 let _ = mt.SetMultithreadProtected(true);
-            }
+            },
+            Err(_) => log!("warning: cannot enable D3D11 multithread protection (Windows 10 1607+ required)"),
         }
         if let Ok(dxgi) = device.cast::<IDXGIDevice1>() {
             unsafe {
@@ -171,6 +174,7 @@ impl Capture {
             shape_buf: Vec::new(),
             cursor_visible: true,
             holding_frame: false,
+            first_after_open: true,
         };
         cap.reopen().map_err(|e| format!("cannot start desktop duplication on {}: {e}", cap.output_name))?;
         Ok(cap)
@@ -181,6 +185,7 @@ impl Capture {
     pub fn reopen(&mut self) -> Result<(), String> {
         self.dupl = None;
         self.holding_frame = false;
+        self.first_after_open = true;
         let dupl = unsafe { self.output.DuplicateOutput(&self.device) }.map_err(|e| {
             if e.code() == E_ACCESSDENIED {
                 "access denied (secure desktop is active)".to_string()
@@ -251,7 +256,8 @@ impl Capture {
         self.holding_frame = true;
 
         let mut image = false;
-        if info.LastPresentTime != 0 || info.AccumulatedFrames != 0 {
+        if info.LastPresentTime != 0 || info.AccumulatedFrames != 0 || self.first_after_open {
+            self.first_after_open = false;
             if let Some(tex) = resource.as_ref().and_then(|r| r.cast::<ID3D11Texture2D>().ok()) {
                 unsafe { self.context.CopyResource(target, &tex) };
                 image = true;

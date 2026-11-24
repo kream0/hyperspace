@@ -41,8 +41,10 @@ pub struct Encoder {
     pub uses_d3d: bool,
     in_id: u32,
     out_id: u32,
-    provides_samples: bool,
-    out_size: u32,
+    /// (MFT allocates output samples, output buffer size); queried once streaming has begun.
+    out_info: Mutex<Option<(bool, u32)>>,
+    /// Set if the transform rejected an on-demand keyframe request.
+    pub keyframe_unsupported: AtomicBool,
     params: EncoderParams,
     seq_header: Mutex<Vec<u8>>,
     credits: Mutex<u32>,
@@ -231,7 +233,7 @@ impl Encoder {
             let _ = mft.GetStreamIDs(std::slice::from_mut(&mut in_id), std::slice::from_mut(&mut out_id));
 
             let codec_api: Option<ICodecAPI> = mft.cast().ok();
-            let mut enc = Encoder {
+            let enc = Encoder {
                 mft,
                 codec_api,
                 _manager: manager,
@@ -242,8 +244,8 @@ impl Encoder {
                 uses_d3d,
                 in_id,
                 out_id,
-                provides_samples: false,
-                out_size: 0,
+                out_info: Mutex::new(None),
+                keyframe_unsupported: AtomicBool::new(false),
                 params: *p,
                 seq_header: Mutex::new(Vec::new()),
                 credits: Mutex::new(0),
@@ -281,15 +283,6 @@ impl Encoder {
             }
             enc.configure(true);
 
-            if let Ok(info) = enc.mft.GetOutputStreamInfo(enc.out_id) {
-                let f = info.dwFlags;
-                enc.provides_samples =
-                    f & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0 as u32) != 0;
-                enc.out_size = info.cbSize;
-            }
-            if enc.is_async {
-                enc.provides_samples = true;
-            }
             enc.read_sequence_header();
 
             enc.mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0).map_err(|x| e("BEGIN_STREAMING", x))?;
@@ -298,12 +291,16 @@ impl Encoder {
         }
     }
 
-    fn set(&self, api: &GUID, value: VARIANT, what: &str, verbose: bool) {
-        let Some(c) = &self.codec_api else { return };
+    fn set(&self, api: &GUID, value: VARIANT, what: &str, verbose: bool) -> bool {
+        let Some(c) = &self.codec_api else { return false };
         unsafe {
-            if let Err(e) = c.SetValue(api, &value) {
-                if verbose {
-                    log!("  encoder option {what} not applied: {}", hr_str(&e));
+            match c.SetValue(api, &value) {
+                Ok(()) => true,
+                Err(e) => {
+                    if verbose {
+                        log!("  encoder option {what} not applied: {}", hr_str(&e));
+                    }
+                    false
                 }
             }
         }
@@ -351,6 +348,8 @@ impl Encoder {
             *e = Some(msg);
         }
         drop(e);
+        // Hold the lock so a waiter between its predicate check and its sleep cannot miss this.
+        let _guard = self.credits.lock().unwrap();
         self.credit_cv.notify_all();
     }
 
@@ -373,8 +372,11 @@ impl Encoder {
 
     fn feed(&self, buffer: &IMFMediaBuffer, ts_us: u64, force_key: bool) -> Result<(), String> {
         unsafe {
-            if force_key {
-                self.set(&CODECAPI_AVEncVideoForceKeyFrame, VARIANT::from(1u32), "force keyframe", false);
+            if force_key
+                && !self.set(&CODECAPI_AVEncVideoForceKeyFrame, VARIANT::from(1u32), "force keyframe", false)
+                && !self.keyframe_unsupported.swap(true, Ordering::Relaxed)
+            {
+                log!("encoder '{}' rejects on-demand keyframes; it will be restarted when one is needed", self.name);
             }
             let sample = MFCreateSample().map_err(|e| format!("MFCreateSample: {}", hr_str(&e)))?;
             sample.AddBuffer(buffer).map_err(|e| format!("AddBuffer: {}", hr_str(&e)))?;
@@ -453,9 +455,20 @@ impl Encoder {
                 dwStatus: 0,
                 pEvents: ManuallyDrop::new(None),
             };
-            if !self.provides_samples {
+            // Whether we or the transform allocate output samples is only
+            // reliable once the types are committed and streaming has started.
+            let (provides_samples, out_size) = *self.out_info.lock().unwrap().get_or_insert_with(|| {
+                match self.mft.GetOutputStreamInfo(self.out_id) {
+                    Ok(info) => (
+                        info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0 as u32) != 0,
+                        info.cbSize,
+                    ),
+                    Err(_) => (self.is_async, 0),
+                }
+            });
+            if !provides_samples {
                 let sample = MFCreateSample().map_err(|e| format!("MFCreateSample: {}", hr_str(&e)))?;
-                let size = self.out_size.max(self.params.width * self.params.height * 2).max(1 << 20);
+                let size = out_size.max(self.params.width * self.params.height * 2).max(1 << 20);
                 let buf = MFCreateMemoryBuffer(size).map_err(|e| format!("MFCreateMemoryBuffer: {}", hr_str(&e)))?;
                 sample.AddBuffer(&buf).map_err(|e| format!("AddBuffer: {}", hr_str(&e)))?;
                 out.pSample = ManuallyDrop::new(Some(sample));
@@ -472,6 +485,7 @@ impl Encoder {
                     // The encoder refined its output type; accept and carry on.
                     let t = self.mft.GetOutputAvailableType(self.out_id, 0).map_err(|e| format!("stream change: {}", hr_str(&e)))?;
                     self.mft.SetOutputType(self.out_id, &t, 0).map_err(|e| format!("stream change: {}", hr_str(&e)))?;
+                    *self.out_info.lock().unwrap() = None;
                     self.read_sequence_header();
                     return Ok(true);
                 }
@@ -515,8 +529,25 @@ impl Encoder {
             self.in_flight.fetch_sub(1, Ordering::Relaxed);
         }
         self.frames_out.fetch_add(1, Ordering::Relaxed);
-        if info.keyframe && !info.has_param_sets {
-            // The decoder needs SPS/PPS in-band with every keyframe.
+        if info.keyframe && info.has_param_sets {
+            // Remember the parameter sets in case a later keyframe omits them.
+            let ps = annexb::param_sets(self.codec, data);
+            if ps.complete(self.codec) {
+                let mut hdr = self.seq_header.lock().unwrap();
+                hdr.clear();
+                for nal in [&ps.vps, &ps.sps, &ps.pps] {
+                    if !nal.is_empty() {
+                        hdr.extend_from_slice(&[0, 0, 0, 1]);
+                        hdr.extend_from_slice(nal);
+                    }
+                }
+            }
+        } else if info.keyframe {
+            // The decoder needs SPS/PPS in-band with every keyframe. Hardware
+            // encoders often only publish the header once they have produced output.
+            if self.seq_header.lock().unwrap().is_empty() {
+                self.read_sequence_header();
+            }
             let hdr = self.seq_header.lock().unwrap();
             if !hdr.is_empty() {
                 let mut s = self.scratch.lock().unwrap();
@@ -559,7 +590,7 @@ impl Encoder {
             } else if ty == METransformDrainComplete.0 as u32 {
                 break;
             } else if ty == MEError.0 as u32 {
-                let hr = unsafe { ev.GetStatus() }.err().map(|e| hr_str(&e)).unwrap_or_default();
+                let hr = unsafe { ev.GetStatus() }.map(|h| format!("0x{:08X}", h.0 as u32)).unwrap_or_default();
                 self.fail(format!("encoder reported an error: {hr}"));
                 break;
             }
@@ -593,6 +624,14 @@ impl Drop for Encoder {
         unsafe {
             let _ = self.mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
             let _ = self.mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+            // Asynchronous transforms must be shut down explicitly or their event
+            // queue, worker threads and the GPU encode session outlive the object
+            // (consumer NVIDIA cards only allow a few concurrent sessions).
+            if self.is_async {
+                if let Ok(s) = self.mft.cast::<IMFShutdown>() {
+                    let _ = s.Shutdown();
+                }
+            }
         }
     }
 }

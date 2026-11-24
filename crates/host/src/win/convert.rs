@@ -14,6 +14,7 @@ pub struct GpuConverter {
     in_view: ID3D11VideoProcessorInputView,
     out_views: Vec<ID3D11VideoProcessorOutputView>,
     textures: Vec<ID3D11Texture2D>,
+    context: ID3D11DeviceContext,
     next: usize,
     last: Option<usize>,
 }
@@ -94,6 +95,12 @@ impl GpuConverter {
             let ycbcr_709_limited = D3D11_VIDEO_PROCESSOR_COLOR_SPACE { _bitfield: (1 << 2) | (1 << 4) };
             vctx.VideoProcessorSetStreamColorSpace(&vp, 0, &rgb_full);
             vctx.VideoProcessorSetOutputColorSpace(&vp, &ycbcr_709_limited);
+            // Windows 10's explicit colour-space API is honoured more
+            // consistently across drivers; it overrides the legacy call where present.
+            if let Ok(v1) = vctx.cast::<ID3D11VideoContext1>() {
+                v1.VideoProcessorSetStreamColorSpace1(&vp, 0, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+                v1.VideoProcessorSetOutputColorSpace1(&vp, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709);
+            }
             vctx.VideoProcessorSetStreamFrameFormat(&vp, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
             // No driver "enhancements" (denoise, edge enhancement ...): pixels in, pixels out.
             vctx.VideoProcessorSetStreamAutoProcessingMode(&vp, 0, false);
@@ -102,14 +109,15 @@ impl GpuConverter {
             vctx.VideoProcessorSetStreamDestRect(&vp, 0, true, Some(&rect));
             vctx.VideoProcessorSetOutputTargetRect(&vp, true, Some(&rect));
 
-            Ok(GpuConverter { vctx, vp, in_view, out_views, textures, next: 0, last: None })
+            Ok(GpuConverter { vctx, vp, in_view, out_views, textures, context: context.clone(), next: 0, last: None })
         }
     }
 
-    /// Convert the current contents of the BGRA texture; returns the NV12 texture.
+    /// Convert the current contents of the BGRA texture; returns the NV12
+    /// texture. The same pool slot is reused until [`Self::accepted`] is called,
+    /// so frames the encoder turned down never eat into the pool.
     pub fn convert(&mut self) -> Result<&ID3D11Texture2D, String> {
         let i = self.next;
-        self.next = (self.next + 1) % self.textures.len();
         let mut stream = D3D11_VIDEO_PROCESSOR_STREAM {
             Enable: true.into(),
             pInputSurface: ManuallyDrop::new(Some(self.in_view.clone())),
@@ -118,8 +126,18 @@ impl GpuConverter {
         let r = unsafe { self.vctx.VideoProcessorBlt(&self.vp, &self.out_views[i], 0, std::slice::from_ref(&stream)) };
         unsafe { ManuallyDrop::drop(&mut stream.pInputSurface) };
         r.map_err(|e| format!("VideoProcessorBlt: {}", hr_str(&e)))?;
+        // Hand the work to the GPU now instead of leaving it in the command buffer.
+        unsafe { self.context.Flush() };
         self.last = Some(i);
         Ok(&self.textures[i])
+    }
+
+    /// The encoder took the last converted texture and may read it for a
+    /// while: move on to the next pool slot.
+    pub fn accepted(&mut self) {
+        if self.last == Some(self.next) {
+            self.next = (self.next + 1) % self.textures.len();
+        }
     }
 
     /// The most recently converted frame (for re-encoding as a keyframe).

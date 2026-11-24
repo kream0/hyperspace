@@ -210,6 +210,8 @@ pub trait Handler {
     fn cursor_shape(&mut self, shape: CursorShape);
     fn cursor_visible(&mut self, visible: bool);
     fn stats(&mut self, stats: &Stats);
+    /// Called once per loop iteration (at least every 20 ms), frames or not.
+    fn idle(&mut self) {}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -342,6 +344,8 @@ pub fn receive_loop(
             }
             Err(e) => break Exit::Error(format!("network error: {e}")),
         }
+
+        handler.idle();
 
         let now = now_us();
         video.poll(now, |a| match a {

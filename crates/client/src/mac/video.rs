@@ -48,13 +48,21 @@ pub struct Decoder {
     params: ParamSets,
     format: Option<CFRetained<CMFormatDescription>>,
     session: Option<CFRetained<VTDecompressionSession>>,
-    slot: Box<Slot>,
+    /// Heap slot the output callback writes through; owned, freed in Drop.
+    slot: *mut Slot,
     sample: Vec<u8>,
 }
 
 impl Decoder {
     pub fn new(codec: Codec) -> Decoder {
-        Decoder { codec, params: ParamSets::default(), format: None, session: None, slot: Box::default(), sample: Vec::new() }
+        Decoder {
+            codec,
+            params: ParamSets::default(),
+            format: None,
+            session: None,
+            slot: Box::into_raw(Box::<Slot>::default()),
+            sample: Vec::new(),
+        }
     }
 
     fn make_format(codec: Codec, ps: &ParamSets) -> Result<CFRetained<CMFormatDescription>, String> {
@@ -107,7 +115,7 @@ impl Decoder {
 
         let record = VTDecompressionOutputCallbackRecord {
             decompressionOutputCallback: Some(output_callback),
-            decompressionOutputRefCon: (&mut *self.slot as *mut Slot).cast(),
+            decompressionOutputRefCon: self.slot.cast(),
         };
         let mut session: *mut VTDecompressionSession = std::ptr::null_mut();
         let status = unsafe {
@@ -133,7 +141,7 @@ impl Decoder {
             unsafe { s.invalidate() };
         }
         self.format = None;
-        self.slot.image = None;
+        unsafe { (*self.slot).image = None };
     }
 
     /// Decode one access unit (Annex B). `Ok(None)` means the unit produced no
@@ -195,15 +203,17 @@ impl Decoder {
             CFRetained::from_raw(sb)
         };
 
-        self.slot.image = None;
-        self.slot.status = 0;
+        unsafe {
+            (*self.slot).image = None;
+            (*self.slot).status = 0;
+        }
         let mut info = VTDecodeInfoFlags(0);
-        // No async flag: the callback has run by the time this returns.
+        // No async flag: the callback has completed by the time this returns.
+        // No 1x-realtime flag either: that would let the decoder idle in a low-power mode.
         let status = unsafe {
-            session.decode_frame(&sample_buffer, VTDecodeFrameFlags::Frame_1xRealTimePlayback, std::ptr::null_mut(), &mut info)
+            session.decode_frame(&sample_buffer, VTDecodeFrameFlags::empty(), std::ptr::null_mut(), &mut info)
         };
-        let cb_status = self.slot.status;
-        let image = self.slot.image.take();
+        let (cb_status, image) = unsafe { ((*self.slot).status, (*self.slot).image.take()) };
         if status != 0 || cb_status != 0 {
             // -12903 (invalid session) follows sleep or a GPU change; any error
             // means the reference chain is gone, so start over on the next keyframe.
@@ -218,5 +228,7 @@ impl Decoder {
 impl Drop for Decoder {
     fn drop(&mut self) {
         self.close();
+        // The session is invalidated, so the callback can no longer run.
+        drop(unsafe { Box::from_raw(self.slot) });
     }
 }

@@ -8,7 +8,7 @@
 mod render;
 mod video;
 
-use crate::keymap::{scancode, SC_CAPS};
+use crate::keymap::{scancode, EXT, SC_CAPS, SC_RCTRL};
 use crate::session::{self, Exit, Handler, InputTx, Options, Stats};
 use crate::Args;
 use hyperspace_proto::cursor::CursorShape;
@@ -16,6 +16,7 @@ use hyperspace_proto::frag::Frame;
 use hyperspace_proto::input::InputEvent;
 use hyperspace_proto::log;
 use objc2::rc::{autoreleasepool, Retained};
+use objc2_core_graphics::{CGEventFlags, CGEventSource, CGEventSourceStateID};
 use objc2_quartz_core::CAMetalLayer;
 use render::{letterbox, Renderer};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -48,6 +49,8 @@ pub struct UiShared {
     pub video_w: AtomicU32,
     pub video_h: AtomicU32,
     pub occluded: AtomicBool,
+    /// Ask the render thread to draw the last frame again.
+    pub redraw: AtomicBool,
 }
 
 enum UserEvent {
@@ -66,6 +69,7 @@ struct NetHandler {
     max_frames: Option<u64>,
     decoded: u64,
     print_stats: bool,
+    last_surface: (u32, u32),
 }
 
 impl Handler for NetHandler {
@@ -102,6 +106,21 @@ impl Handler for NetHandler {
         }
         let _ = self.proxy.send_event(UserEvent::Stats(*stats));
     }
+
+    fn idle(&mut self) {
+        let want = (self.shared.surface_w.load(Ordering::Relaxed), self.shared.surface_h.load(Ordering::Relaxed));
+        if self.shared.redraw.load(Ordering::Relaxed) || want != self.last_surface {
+            self.last_surface = want;
+            autoreleasepool(|_| self.renderer.refresh(&self.shared));
+        }
+    }
+}
+
+const SC_LWIN: u16 = EXT | 0x5b;
+const SC_RWIN: u16 = EXT | 0x5c;
+
+fn caps_lock_on() -> bool {
+    CGEventSource::flags_state(CGEventSourceStateID::CombinedSessionState).contains(CGEventFlags::MaskAlphaShift)
 }
 
 struct Running {
@@ -120,6 +139,9 @@ struct Running {
     cursor_scale: f64,
     stopping_since: Option<Instant>,
     fallback_video: (u32, u32),
+    caps: bool,
+    /// A local shortcut was used while Command was held.
+    mask_win: bool,
 }
 
 struct App {
@@ -229,6 +251,7 @@ impl App {
                         max_frames,
                         decoded: 0,
                         print_stats,
+                        last_surface: (0, 0),
                     };
                     let exit = session::receive_loop(&conn, &input, &stop, &mut h, None);
                     let _ = proxy.send_event(UserEvent::Ended { exit, decoded: h.decoded, presented: h.renderer.presented });
@@ -252,6 +275,8 @@ impl App {
             cursor_scale: 0.0,
             stopping_since: None,
             fallback_video: (w.width as u32, w.height as u32),
+            caps: caps_lock_on(),
+            mask_win: false,
         })
     }
 }
@@ -273,9 +298,32 @@ impl Running {
         letterbox(s.width as f64, s.height as f64, vw, vh)
     }
 
+    /// A Windows key that goes down and up with nothing in between opens the
+    /// Start menu. When that "tap" is an artefact (Cmd+Tab away from the
+    /// window, a local shortcut), slip a harmless key in before the release.
+    fn win_mask() -> [InputEvent; 2] {
+        [InputEvent::Key { scancode: SC_RCTRL, down: true }, InputEvent::Key { scancode: SC_RCTRL, down: false }]
+    }
+
+    /// macOS reports Caps Lock as a state, not a key: mirror changes as taps.
+    fn sync_caps(&mut self) {
+        let caps = caps_lock_on();
+        if caps != self.caps {
+            self.caps = caps;
+            self.input.send_all(&[
+                InputEvent::Key { scancode: SC_CAPS, down: true },
+                InputEvent::Key { scancode: SC_CAPS, down: false },
+            ]);
+        }
+    }
+
     fn release_all(&mut self) {
-        let mut evs: Vec<InputEvent> =
-            self.pressed.drain(..).rev().map(|scancode| InputEvent::Key { scancode, down: false }).collect();
+        let mut evs: Vec<InputEvent> = Vec::new();
+        if self.pressed.iter().any(|&k| k == SC_LWIN || k == SC_RWIN) {
+            evs.extend(Self::win_mask());
+        }
+        self.mask_win = false;
+        evs.extend(self.pressed.drain(..).rev().map(|scancode| InputEvent::Key { scancode, down: false }));
         for button in 0..8u8 {
             if self.buttons & (1 << button) != 0 {
                 evs.push(InputEvent::Button { button, down: false });
@@ -303,7 +351,14 @@ impl Running {
         let (vw, _) = self.video_size();
         // Cursor images are sized in points; the video is scaled in pixels.
         let scale = (w / vw / self.window.scale_factor()).clamp(0.1, 4.0);
-        let scaled = shape.scaled(scale);
+        let mut scaled = shape.scaled(scale);
+        // AppKit expects premultiplied alpha; the wire format is straight alpha.
+        for px in scaled.rgba.chunks_exact_mut(4) {
+            let a = px[3] as u32;
+            for c in &mut px[..3] {
+                *c = ((*c as u32 * a + 127) / 255) as u8;
+            }
+        }
         if let Ok(src) = CustomCursor::from_rgba(scaled.rgba, scaled.width, scaled.height, scaled.hot_x, scaled.hot_y) {
             self.window.set_cursor(el.create_custom_cursor(src));
             self.cursor_scale = scale;
@@ -322,8 +377,14 @@ impl Running {
                     self.apply_cursor(el);
                 }
             }
-            WindowEvent::Occluded(o) => self.shared.occluded.store(o, Ordering::Relaxed),
+            WindowEvent::Occluded(o) => {
+                self.shared.occluded.store(o, Ordering::Relaxed);
+                if !o {
+                    self.shared.redraw.store(true, Ordering::Relaxed);
+                }
+            }
             WindowEvent::Focused(false) => self.release_all(),
+            WindowEvent::Focused(true) => self.sync_caps(),
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 let (x, y, w, h) = self.video_rect();
@@ -380,7 +441,11 @@ impl Running {
                 // layout prints, so they work on any keyboard layout).
                 if down && self.mods.control_key() && self.mods.alt_key() && self.mods.super_key() {
                     if let Key::Character(c) = event.key_without_modifiers() {
-                        match c.to_lowercase().as_str() {
+                        let c = c.to_lowercase();
+                        if matches!(c.as_str(), "f" | "s") {
+                            self.mask_win = true;
+                        }
+                        match c.as_str() {
                             "q" => return self.begin_stop(el),
                             "f" => {
                                 if !event.repeat {
@@ -405,13 +470,12 @@ impl Running {
                 let PhysicalKey::Code(code) = event.physical_key else { return };
                 let Some(sc) = scancode(code, cmd_as_ctrl) else { return };
                 if sc == SC_CAPS {
-                    // macOS reports Caps Lock as one event per toggle (down when
-                    // it turns on, up when it turns off); the host wants a tap each time.
-                    self.input.send_all(&[
-                        InputEvent::Key { scancode: sc, down: true },
-                        InputEvent::Key { scancode: sc, down: false },
-                    ]);
-                    return;
+                    return self.sync_caps();
+                }
+                if down {
+                    self.sync_caps();
+                } else if (sc == SC_LWIN || sc == SC_RWIN) && std::mem::take(&mut self.mask_win) && self.pressed.contains(&sc) {
+                    self.input.send_all(&Self::win_mask());
                 }
                 if down {
                     if !self.pressed.contains(&sc) {

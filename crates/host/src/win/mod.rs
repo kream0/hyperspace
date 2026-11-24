@@ -132,6 +132,8 @@ enum Outcome {
     ModeChanged,
     /// The hardware encoder path failed; retry in software.
     HardwareFailed(String),
+    /// Rebuild the encoder (it cannot emit a keyframe on demand).
+    Restart,
 }
 
 /// Software path: read the frame back and convert on the CPU.
@@ -213,6 +215,12 @@ pub fn run(cfg: &Config, req: StreamRequest, ctl: Arc<Control>, sink: Arc<dyn Si
                     }
                     log!("hardware encoding failed ({e}); falling back to the software encoder");
                     force_software = true;
+                    // Desktop Duplication only reports changes: start over so
+                    // the new pipeline gets a full image even on a still desktop.
+                    let _ = cap.reopen();
+                }
+                Outcome::Restart => {
+                    let _ = cap.reopen();
                 }
             }
         }
@@ -293,6 +301,8 @@ fn run_mode(
             .name("encoder-events".into())
             .spawn(move || {
                 let _rt = MediaRuntime::new(false);
+                // Declared after the runtime so they are released before COM is torn down.
+                let (enc, sink) = (enc, sink);
                 unsafe {
                     let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
                 }
@@ -344,10 +354,12 @@ fn frame_loop(
 ) -> Result<Outcome, String> {
     let (cap_w, cap_h) = (cap.width, cap.height);
     let interval = Duration::from_secs_f64(1.0 / fps as f64);
-    // Slightly under the nominal interval so a source running at exactly `fps`
-    // is never held back by timer jitter.
-    let min_gap = interval.mul_f64(0.9);
-    let mut last_submit = Instant::now() - interval;
+    // Frames are due on a fixed cadence (so the average rate is exactly `fps`,
+    // which is what the rate control was configured for), with a little slack
+    // so a source running at exactly `fps` is never held back by jitter.
+    let slack = interval / 10;
+    let mut next_due = Instant::now();
+    let mut last_submit = Instant::now();
     let mut have_image = false;
     let mut pending_image = false;
     let mut pending_ts = 0u64;
@@ -355,6 +367,7 @@ fn frame_loop(
     let mut force_key = true;
     let mut submitted = 0u64;
     let mut first_submit: Option<Instant> = None;
+    let mut starved_since: Option<Instant> = None;
     let sink_ref: &dyn Sink = &**sink;
 
     loop {
@@ -365,16 +378,19 @@ fn frame_loop(
             return Err(e);
         }
         if let Some(t0) = first_submit {
-            if submitted >= 3 && enc.frames_out.load(Ordering::Relaxed) == 0 && t0.elapsed() > Duration::from_secs(3) {
+            if enc.frames_out.load(Ordering::Relaxed) == 0 && t0.elapsed() > Duration::from_secs(3) {
                 return Err("encoder accepted frames but produced no output".into());
             }
         }
 
-        // While a captured frame waits for its slot, only wait that long;
-        // a newer frame arriving meanwhile simply replaces it.
-        let since = last_submit.elapsed();
-        let ready = have_image && (pending_image || force_key);
-        let wait_ms = if ready { min_gap.saturating_sub(since).as_millis().min(4) as u32 } else { 4 };
+        // An encoder that keeps a frame back would leave the newest image
+        // unsent when the desktop goes still: nudge it by repeating that frame.
+        let stuck = have_image && enc.in_flight.load(Ordering::Relaxed) > 0 && last_submit.elapsed() > Duration::from_millis(100);
+        // While a frame waits for its slot, only wait that long; a newer
+        // frame arriving meanwhile simply replaces it.
+        let ready = have_image && (pending_image || force_key || stuck);
+        let until_due = next_due.saturating_duration_since(Instant::now() + slack);
+        let wait_ms = if ready { until_due.as_millis().min(4) as u32 } else { 4 };
         match cap.acquire(wait_ms, target, &mut |shape, visible| sink_ref.cursor(shape, visible))? {
             Acquired::Frame { image: true } => {
                 pending_ts = now_us();
@@ -404,11 +420,16 @@ fn frame_loop(
         if ctl.keyframe.swap(false, Ordering::Relaxed) {
             force_key = true;
         }
-        if !have_image || !(pending_image || force_key) || last_submit.elapsed() < min_gap {
+        if force_key && submitted > 0 && enc.keyframe_unsupported.load(Ordering::Relaxed) {
+            // This encoder cannot produce a keyframe on demand; a fresh one starts with one.
+            return Ok(Outcome::Restart);
+        }
+        let now = Instant::now();
+        if !have_image || !(pending_image || force_key || stuck) || now + slack < next_due {
             continue;
         }
 
-        // A forced keyframe with no new image re-encodes the previous frame.
+        // Without a new image (forced keyframe, nudge) the previous frame is re-encoded.
         let ts = if pending_image { pending_ts } else { now_us() };
         let accepted = if let Some(g) = gpu.as_deref_mut() {
             let tex = if !converted || g.last().is_none() {
@@ -417,7 +438,11 @@ fn frame_loop(
             } else {
                 g.last().unwrap()
             };
-            enc.submit_texture(tex, ts, force_key, interval, sink_ref)?
+            let ok = enc.submit_texture(tex, ts, force_key, interval, sink_ref)?;
+            if ok {
+                g.accepted();
+            }
+            ok
         } else {
             let c = cpu.as_deref_mut().expect("either gpu or cpu path exists");
             if !converted || !c.valid {
@@ -430,8 +455,13 @@ fn frame_loop(
             pending_image = false;
             force_key = false;
             last_submit = Instant::now();
+            // Keep the cadence, but never bank more than one interval of credit.
+            next_due = (next_due + interval).max(last_submit);
             submitted += 1;
             first_submit.get_or_insert(last_submit);
+            starved_since = None;
+        } else if starved_since.get_or_insert_with(Instant::now).elapsed() > Duration::from_secs(2) {
+            return Err("encoder stopped accepting frames".into());
         }
     }
 }

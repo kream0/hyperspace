@@ -15,12 +15,13 @@ pub struct WinInjector {
     /// Captured display in virtual-desktop pixels.
     rect: (i32, i32, i32, i32),
     count: u64,
+    warned: std::cell::Cell<bool>,
 }
 
 impl WinInjector {
     pub fn new() -> Self {
         let rect = unsafe { (0, 0, GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN)) };
-        Self { held: HeldState::default(), rect, count: 0 }
+        Self { held: HeldState::default(), rect, count: 0, warned: std::cell::Cell::new(false) }
     }
 
     fn mouse(&self, dx: i32, dy: i32, data: i32, flags: MOUSE_EVENT_FLAGS) {
@@ -30,8 +31,16 @@ impl WinInjector {
                 mi: MOUSEINPUT { dx, dy, mouseData: data as u32, dwFlags: flags, time: 0, dwExtraInfo: 0 },
             },
         };
-        unsafe {
-            SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+        self.send(input);
+    }
+
+    fn send(&self, input: INPUT) {
+        let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+        if sent == 0 && !self.warned.replace(true) {
+            hyperspace_proto::log!(
+                "input was blocked by Windows (an elevated window or the secure desktop has focus); \
+                 run hyperspace-host as administrator to control elevated applications"
+            );
         }
     }
 
@@ -105,9 +114,7 @@ impl WinInjector {
                         },
                     },
                 };
-                unsafe {
-                    SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
-                }
+                self.send(input);
             }
         }
     }
