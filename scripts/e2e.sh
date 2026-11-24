@@ -18,6 +18,17 @@ start_host() { # name stream port
   for _ in $(seq 50); do [ -s "$HOSTCFG/pairing.txt" ] && grep -q "listening" "$LOGS/$1.host.log" && break; sleep 0.1; done
 }
 
+start_forwarder() { # log listen_port host_port loss_percent: until it is bound (sets FWD_PID)
+  python3 scripts/lossy_relay.py "$2" "$3" "$4" 2>"$1" &
+  FWD_PID=$!
+  for _ in $(seq 100); do
+    grep -q "listening on 127.0.0.1:$2" "$1" && return 0
+    kill -0 $FWD_PID 2>/dev/null || return 1
+    sleep 0.1
+  done
+  return 1
+}
+
 run_case() { # name stream host_port client_port extra_client_args...
   local name=$1 stream=$2 hport=$3 cport=$4; shift 4
   echo "=== $name"
@@ -116,8 +127,8 @@ if command -v python3 >/dev/null; then
   rm -f "$HOSTCFG/pairing.txt"
 
   for loss in 2 10; do
-    python3 scripts/lossy_relay.py $((45910 + loss)) $((45930 + loss)) $loss 2>"$LOGS/relay$loss.log" &
-    sleep 0.3
+    start_forwarder "$LOGS/relay$loss.log" $((45910 + loss)) $((45930 + loss)) $loss \
+      || { echo "FAILED: the forwarder did not start"; cat "$LOGS/relay$loss.log"; exit 1; }
     run_case "loss-${loss}pct" testdata/testsrc_720p.h264 $((45930 + loss)) $((45910 + loss)) --frames 300 --test-input
     grep -E "nacks" "$LOGS/loss-${loss}pct.client.log" | tail -1 || true
   done
@@ -370,12 +381,16 @@ if command -v python3 >/dev/null; then
   # The direct path runs through a forwarder (no loss), so it can be cut
   # while the host, its relay link and its session stay up.
   start_rhost relay-i 45975 || true
-  python3 scripts/lossy_relay.py 45977 45975 0 2>"$LOGS/relay-i.forward.log" &
-  FWD_PID=$!
+  # Bound before the client starts: it tries the relay 600 ms in, so a slow
+  # python start would let the relay win the first session.
+  start_forwarder "$LOGS/relay-i.forward.log" 45977 45975 0 \
+    || ERRS+="  relay-i.forward.log: the forwarder did not start"$'\n'
   rpair rc-i "hs1.$KEY.127.0.0.1/45977,relay=$RELAY/v1"
   timeout 90 "$BIN/hyperspace-client" --headless --no-lookup --stats --frames 600 --config-dir "$LOGS/rc-i" >"$LOGS/relay-i.client.log" 2>&1 &
   CLIENT_PID=$!
   for _ in $(seq 150); do grep -q "connected directly" "$LOGS/relay-i.client.log" && break; sleep 0.1; done
+  grep -q "connected directly" "$LOGS/relay-i.client.log" \
+    || ERRS+="  relay-i.client.log: no direct session within 15 s (through the forwarder on 45977)"$'\n'
   sleep 1
   stop_pid $FWD_PID
   RC=0

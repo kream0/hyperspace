@@ -83,28 +83,7 @@ pub struct Args {
 fn parse_args() -> Result<Option<Args>, String> {
     let mut positional: Vec<String> = Vec::new();
     let mut dir = config_dir();
-    let mut a = Args {
-        key: Key::from_bytes([0; 32]),
-        candidates: Vec::new(),
-        lookup: true,
-        connect_timeout: std::time::Duration::from_secs(15),
-        host_name: String::new(),
-        saved_path: PathBuf::new(),
-        fps: 0,
-        bitrate_kbps: 0,
-        codecs: wire::CODEC_MASK_ALL,
-        max_datagram: 0,
-        fullscreen: false,
-        cmd_as_ctrl: false,
-        stats: false,
-        headless: !cfg!(target_os = "macos"),
-        frames: None,
-        test_input: false,
-        test_keyframes: false,
-        test_reconnect: false,
-        relay: None,
-        pairing_relay: None,
-    };
+    let mut a = Args::defaults();
     let mut relay_arg = relay::RelayArg::Unset;
     let mut relay_check: Option<String> = None;
     let mut args = std::env::args().skip(1);
@@ -235,6 +214,32 @@ fn parse_args() -> Result<Option<Args>, String> {
 }
 
 impl Args {
+    /// Before the command line is read.
+    fn defaults() -> Args {
+        Args {
+            key: Key::from_bytes([0; 32]),
+            candidates: Vec::new(),
+            lookup: true,
+            connect_timeout: std::time::Duration::from_secs(15),
+            host_name: String::new(),
+            saved_path: PathBuf::new(),
+            fps: 0,
+            bitrate_kbps: 0,
+            codecs: wire::CODEC_MASK_ALL,
+            max_datagram: 0,
+            fullscreen: false,
+            cmd_as_ctrl: false,
+            stats: false,
+            headless: !cfg!(target_os = "macos"),
+            frames: None,
+            test_input: false,
+            test_keyframes: false,
+            test_reconnect: false,
+            relay: None,
+            pairing_relay: None,
+        }
+    }
+
     pub fn session_options(&self, fps: u16) -> session::Options {
         session::Options {
             key: self.key.clone(),
@@ -245,7 +250,10 @@ impl Args {
             bitrate_kbps: self.bitrate_kbps,
             codecs: self.codecs,
             max_datagram: self.max_datagram,
-            cut_first_session: self.test_reconnect.then_some(std::time::Duration::from_secs(2)),
+            // Headless only: the Mac app builds its options here too, and
+            // must never drop its session for a test.
+            cut_first_session: (self.headless && self.test_reconnect)
+                .then_some(std::time::Duration::from_secs(2)),
         }
     }
 
@@ -306,6 +314,18 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_reconnect_test_flag_never_reaches_the_window() {
+        let mut a = Args::defaults();
+        a.test_reconnect = true;
+        a.headless = false;
+        assert_eq!(a.session_options(60).cut_first_session, None);
+        a.headless = true;
+        assert_eq!(a.session_options(60).cut_first_session, Some(std::time::Duration::from_secs(2)));
+        a.test_reconnect = false;
+        assert_eq!(a.session_options(60).cut_first_session, None);
+    }
 
     #[test]
     fn remembered_addresses_keep_the_relay() {

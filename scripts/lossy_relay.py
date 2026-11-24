@@ -20,6 +20,8 @@ back = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 back.connect(("127.0.0.1", host_port))
 for s in (front, back):
     s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
+# e2e.sh waits for this line before it starts the client.
+print(f"relay: listening on 127.0.0.1:{listen_port}", file=sys.stderr, flush=True)
 client = None
 seen = dropped = 0
 try:
