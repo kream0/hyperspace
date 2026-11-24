@@ -2,7 +2,7 @@
 //! the saved setting, or the pairing string's), and the link to it, which
 //! joins the race of the host's direct addresses.
 
-use hyperspace_bridge::{ClientBridge, LinkStats, RelayUrl, Status};
+use hyperspace_bridge::{plain_error, ClientBridge, LinkStats, RelayUrl, Status};
 use hyperspace_proto::log;
 use hyperspace_proto::pairing::{check_relay_url, Pairing, RELAY_PREFIX};
 use hyperspace_proto::relay::refused;
@@ -60,14 +60,14 @@ pub fn setting(arg: &RelayArg, path: &Path, pairing: Option<&str>) -> Option<Str
         RelayArg::Set(url) => {
             match save(&format!("{url}\n")) {
                 Ok(()) => log!("relay setting saved to {} (--relay off turns the relay off)", path.display()),
-                Err(e) => log!("cannot save the relay setting to {}: {e}; using it for this run only", path.display()),
+                Err(e) => log!("cannot save the relay setting to {}: {}; using it for this run only", path.display(), plain_error(&e)),
             }
             return Some(url.to_string());
         }
         RelayArg::Off => {
             match save("off\n") {
                 Ok(()) => log!("relay off (saved in {}; --relay URL turns it back on)", path.display()),
-                Err(e) => log!("relay off for this run (cannot save it to {}: {e})", path.display()),
+                Err(e) => log!("relay off for this run (cannot save it to {}: {})", path.display(), plain_error(&e)),
             }
             return None;
         }
@@ -88,7 +88,7 @@ pub fn setting(arg: &RelayArg, path: &Path, pairing: Option<&str>) -> Option<Str
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => log!("cannot read {}: {e}", path.display()),
+        Err(e) => log!("cannot read {}: {}", path.display(), plain_error(&e)),
     }
     match RelayUrl::parse(pairing?) {
         Ok(url) => Some(url.to_string()),
@@ -223,8 +223,9 @@ impl Relay {
             }
             Err(e) => {
                 // The link is of no use without it: it closes here.
-                log!("relay: cannot use the relay: no local socket for it ({e})");
-                self.start_error = Some(format!("no local socket for it ({e})"));
+                let why = format!("no local socket for it ({})", plain_error(&e));
+                log!("relay: cannot use the relay: {why}");
+                self.start_error = Some(why);
                 None
             }
         }
@@ -246,7 +247,7 @@ impl Relay {
                 Some((s, bridge.local_addr()))
             }
             Err(e) => {
-                log!("relay: cannot use the relay link's socket: {e}");
+                log!("relay: cannot use the relay link's socket: {}", plain_error(&e));
                 None
             }
         }
