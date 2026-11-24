@@ -39,9 +39,10 @@ fn fast() -> Timing {
 }
 
 /// Pings and a dead-link limit far shorter than the defaults (and than the
-/// relay's own 20 s pings), so a test sees whether pings keep a link up.
+/// relay's own 20 s pings), so a test sees whether pings keep a link up, yet
+/// long enough that a busy test machine does not cut a healthy link.
 fn short_idle() -> Timing {
-    Timing { ping_interval: Duration::from_millis(100), idle_timeout: Duration::from_millis(600), ..fast() }
+    Timing { ping_interval: Duration::from_millis(400), idle_timeout: Duration::from_millis(2500), ..fast() }
 }
 
 /// A relay on its own runtime, so stopping it closes every link at once.
@@ -158,7 +159,7 @@ impl Silent {
         let joined = self.joined();
         let gap = joined[1] - joined[0];
         assert!(gap >= idle - Duration::from_millis(100), "reconnected after only {gap:?}");
-        assert!(gap < idle + Duration::from_millis(2500), "reconnected only after {gap:?}");
+        assert!(gap < idle + Duration::from_millis(3000), "reconnected only after {gap:?}");
     }
 }
 
@@ -382,15 +383,17 @@ fn both_ends_reconnect_after_a_relay_restart() {
 #[test]
 fn pings_keep_a_quiet_link_up() {
     // The relay pings every 20 s and drops a link after 60 s of silence;
-    // here the bridges give up after 0.6 s without traffic, so only their
+    // here the bridges give up after 2.5 s without traffic, so only their
     // own pings (answered by the relay) keep the links up.
     let relay = Relay::start(Allow::Open);
     let key = Key::generate();
     let echo = Echo::start();
-    let host = HostBridge::start_with(relay.url(), &key, echo.addr, RelayedPeers::new(), short_idle()).unwrap();
-    let (client, local) = ClientBridge::start_with(relay.url(), &key, short_idle()).unwrap();
+    let t = short_idle();
+    let host = HostBridge::start_with(relay.url(), &key, echo.addr, RelayedPeers::new(), t).unwrap();
+    let (client, local) = ClientBridge::start_with(relay.url(), &key, t).unwrap();
     wait_for("the client to see the host online", || client.status() == Status::HostOnline);
-    std::thread::sleep(Duration::from_secs(2));
+    // Three times the dead-link limit.
+    std::thread::sleep(t.idle_timeout * 3);
     let stats = client.stats();
     assert_eq!(stats.reconnects, 0, "{stats:?}");
     assert_eq!(stats.last_close, None, "{stats:?}");
@@ -411,7 +414,7 @@ fn a_client_finds_a_silent_link_dead_and_reconnects() {
     relay.wait_for_a_reconnect(t.idle_timeout);
     wait_for("the reconnect to be counted", || client.stats().reconnects >= 1);
     let stats = client.stats();
-    assert_eq!(stats.last_close.as_deref(), Some("no traffic for 0.6 s"), "{stats:?}");
+    assert_eq!(stats.last_close.as_deref(), Some("no traffic for 2.5 s"), "{stats:?}");
     // The link came back to a host that was online before the cut: the
     // session carries on, no new handshake.
     assert_eq!(client.hosts_seen(), 1);
@@ -485,6 +488,64 @@ fn a_client_the_host_closed_waits_to_be_asked() {
     assert_eq!(client.hosts_seen(), 2);
     drop(client);
     drop(host);
+}
+
+#[test]
+fn a_client_whose_loopback_socket_fails_is_dropped() {
+    let relay = Relay::start(Allow::Open);
+    let s = Setup::new(&relay);
+    let app = app();
+    echo_through(&app, s.local, b"before");
+    assert_eq!(s.peers.len(), 1);
+
+    // The echo sends this back, and the host bridge's socket for this client
+    // fails as it reads it: the client is dropped, not left half open.
+    app.send_to(crate::host::FAIL_READER, s.local).unwrap();
+    wait_for("the peer to be unregistered", || s.peers.is_empty());
+    wait_for("the client to see it closed", || s.client().status() == Status::ClosedByHost);
+
+    // The host's link itself is fine: the client comes back as a new peer.
+    s.client().reconnect();
+    wait_for("the client to see the host again", || s.client().status() == Status::HostOnline);
+    echo_through(&app, s.local, b"after");
+    wait_for("one peer", || s.peers.len() == 1);
+    assert_eq!(s.client().hosts_seen(), 2);
+}
+
+#[test]
+fn only_the_first_local_sender_is_served() {
+    // A length no other datagram in this test has.
+    const ODD: usize = 333;
+    let relay = Relay::start(Allow::Open);
+    let addr = relay.addr;
+    let s = Setup::new(&relay);
+    let (first, stranger) = (app(), app());
+    stranger.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+    let mut buf = vec![0u8; 65536];
+    echo_through(&first, s.local, b"mine");
+
+    // Another local program gets nothing back, and nothing of it reaches
+    // the host.
+    stranger.send_to(&[5u8; ODD], s.local).unwrap();
+    assert!(stranger.recv_from(&mut buf).is_err(), "the bridge answered another socket");
+    wait_for("the stranger's datagram to be counted", || s.client().stats().dropped >= 1);
+    echo_through(&first, s.local, b"still mine");
+
+    // Nor while the link is down, or once it is back.
+    relay.stop();
+    wait_for("the client to notice", || matches!(s.client().status(), Status::CannotReach(_)));
+    let down = s.client().stats();
+    stranger.send_to(&[5u8; ODD], s.local).unwrap();
+    wait_for("the stranger's datagram to be counted", || s.client().stats().dropped > down.dropped);
+    assert_eq!(s.client().stats().discarded_while_down, down.discarded_while_down);
+    let relay = Relay::start_on(addr, Allow::Open);
+    wait_for("the host to come back", || s.client().status() == Status::HostOnline);
+    stranger.send_to(&[5u8; ODD], s.local).unwrap();
+    echo_through(&first, s.local, b"mine again");
+    assert!(stranger.recv_from(&mut buf).is_err(), "the bridge answered another socket");
+
+    assert!(s.echo.seen.lock().unwrap().iter().all(|(_, n)| *n != ODD), "the stranger's datagram reached the host");
+    drop(relay);
 }
 
 #[test]
@@ -611,6 +672,7 @@ fn check_tells_what_works() {
     };
     let err = check(&format!("ws://127.0.0.1:{port}")).unwrap_err();
     assert!(err.starts_with("cannot connect to 127.0.0.1 port"), "{err}");
+    assert!(!err.contains("os error"), "{err}");
 
     // Not a relay address at all.
     assert!(check("https://relay.example").is_err());
@@ -803,8 +865,10 @@ fn other_tls_failures_keep_a_short_detail() {
     assert_eq!(tls_line(openssl("certificate is not yet valid", 9)), format!("{failed} (certificate is not yet valid)"));
     let wrong = "error:0A00010B:SSL routines::wrong version number:../ssl/record/ssl3_record.c:354:".to_string();
     assert_eq!(tls_line((wrong.clone(), wrong)), format!("{failed} (wrong version number)"));
+    // An OS error: its message, without the number, which differs between
+    // OSes.
     let reset = "Connection reset by peer (os error 104)".to_string();
-    assert_eq!(errors::tls_error("relay.example", &reset, &reset), format!("{failed} (Connection reset by peer (os error 104))"));
+    assert_eq!(tls_line((reset.clone(), reset)), format!("{failed} (Connection reset by peer)"));
     // macOS and Windows: the number, since their messages are translated.
     assert_eq!(tls_line(macos(-9800, "erreur de protocole SSL")), format!("{failed} (error -9800)"));
     assert_eq!(tls_line(windows(0x8009_0326, "Le message reçu était inattendu.")), format!("{failed} (error 0x80090326)"));
@@ -830,8 +894,15 @@ fn openssl_text_is_cut_to_its_reason() {
         errors::clean("error:0A000126:SSL routines::a:../x.c:1:, error:0A000127:SSL routines::b:../y.c:2:data"),
         "a, b"
     );
-    // Not OpenSSL: kept as it is.
-    for text in ["IO error: Connection reset by peer (os error 104)", "error: something", "network error:"] {
+    // std's OS error numbers, Windows' negative ones included, are taken out.
+    assert_eq!(errors::clean("IO error: Connection reset by peer (os error 104)"), "IO error: Connection reset by peer");
+    assert_eq!(errors::clean("Connection reset by peer (os error 10054)"), "Connection reset by peer");
+    assert_eq!(errors::clean("Le message reçu était inattendu. (os error -2146893018)"), "Le message reçu était inattendu.");
+    assert_eq!(errors::clean("a (os error 5) b (os error 6)"), "a b");
+    let gone = errors::plain(std::io::Error::from_raw_os_error(2));
+    assert!(!gone.is_empty() && !gone.contains("os error"), "{gone:?}");
+    // Anything else: kept as it is.
+    for text in ["error: something", "network error:", "(os error x)", "a (os error 5 b", "(os error )", "(os error -)"] {
         assert_eq!(errors::clean(text), text);
     }
 }
@@ -848,4 +919,8 @@ fn a_connect_failure_names_the_address_only_for_a_host_name() {
         errors::connect_error("127.0.0.1", 9, &addr, "connection refused"),
         "cannot connect to 127.0.0.1 port 9: connection refused"
     );
+    // The same line on every OS.
+    for why in ["Connection refused (os error 111)", "Connection refused (os error 61)", "Connection refused (os error 10061)"] {
+        assert_eq!(errors::connect_error("127.0.0.1", 9, &addr, why), "cannot connect to 127.0.0.1 port 9: Connection refused");
+    }
 }

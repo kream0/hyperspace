@@ -317,7 +317,6 @@ fn serve(mut cfg: Config, extra: Extra) -> Result<(), String> {
     #[cfg(windows)]
     win::process_setup();
     cfg.key = load_key(&extra)?;
-    let relay = relay_setting(&extra);
     let mut server = server::Server::new(cfg.clone())?;
     let local = server.local_addr();
     log!(
@@ -325,6 +324,8 @@ fn serve(mut cfg: Config, extra: Extra) -> Result<(), String> {
         env!("CARGO_PKG_VERSION"),
         local.map(|a| a.to_string()).unwrap_or_else(|| cfg.port.to_string())
     );
+    // Only once the server is up: a run that fails to start saves nothing.
+    let relay = relay_setting(&extra);
     // Kept until the server stops: dropping it closes the relay link.
     let mut bridge = None;
     if let Some(url) = &relay {

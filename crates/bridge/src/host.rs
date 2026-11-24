@@ -14,10 +14,11 @@ use hyperspace_proto::log;
 use hyperspace_proto::relay::{self, refused, Msg, Role, RoomKey};
 use hyperspace_proto::secure::Key;
 use tokio::net::UdpSocket;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::{self, Bytes, Message};
 
-use crate::link::{self, secs, Backoff, Failure, Quiet, Timing, Ws};
+use crate::errors;
+use crate::link::{self, jitter, secs, Backoff, Failure, Quiet, Timing, Ws};
 use crate::queue::{self, Tx};
 use crate::{RelayUrl, RelayedPeers};
 
@@ -26,6 +27,12 @@ use crate::{RelayUrl, RelayedPeers};
 const MAX_PEERS: usize = 32;
 /// Socket buffers of each loopback socket, as for the server's own socket.
 const UDP_BUFFER: usize = 1 << 20;
+/// Replaced this many times in a row: another host with the same pairing key
+/// is running, and they would keep taking the room from each other.
+const REPLACED_LIMIT: u32 = 3;
+/// Tests make a peer's reader fail with this datagram, as an OS error would.
+#[cfg(test)]
+pub(crate) const FAIL_READER: &[u8] = b"test: fail this reader";
 
 /// Runs while it lives; dropping it closes the link and the loopback sockets.
 pub struct HostBridge {
@@ -53,7 +60,7 @@ impl HostBridge {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|e| format!("cannot start the relay link: {e}"))?;
+            .map_err(|e| format!("cannot start the relay link: {}", errors::plain(e)))?;
         let room = RoomKey::derive(key);
         let (stop, stopped) = oneshot::channel::<()>();
         let thread = std::thread::Builder::new()
@@ -67,7 +74,7 @@ impl HostBridge {
                 });
                 rt.shutdown_background();
             })
-            .map_err(|e| format!("cannot start the relay link: {e}"))?;
+            .map_err(|e| format!("cannot start the relay link: {}", errors::plain(e)))?;
         Ok(HostBridge { stop: Some(stop), thread: Some(thread) })
     }
 }
@@ -101,6 +108,8 @@ async fn run(url: RelayUrl, room: RoomKey, target: SocketAddr, peers: RelayedPee
     let mut backoff = Backoff::new(&t);
     let mut quiet = Quiet::default();
     let wait_secs = t.refused_wait.as_secs();
+    // Links in a row that ended with another host taking the room.
+    let mut replaced = 0;
     loop {
         let wait = match link::connect(&url, &room, Role::Host).await {
             Ok(ws) => {
@@ -113,22 +122,33 @@ async fn run(url: RelayUrl, room: RoomKey, target: SocketAddr, peers: RelayedPee
                     backoff.reset();
                 }
                 // Backs off at length when replaced, so that two hosts with
-                // one key do not take the room from each other forever.
+                // one key do not take the room from each other forever, and
+                // never sooner than after any other lost link.
                 let wait = match end {
-                    End::Replaced => t.refused_wait,
-                    End::Lost(_) => backoff.next(),
+                    End::Replaced => {
+                        replaced += 1;
+                        let pause = if replaced < REPLACED_LIMIT { t.refused_wait } else { t.refused_wait * 10 };
+                        jitter(pause).max(backoff.next())
+                    }
+                    End::Lost(_) => {
+                        replaced = 0;
+                        backoff.next()
+                    }
                 };
                 log!("relay link closed after {}: {}; reconnecting in {}", secs(lived), end.why(), secs(wait));
+                if replaced == REPLACED_LIMIT {
+                    log!("relay: another host with the same key is using this relay: stop one of them");
+                }
                 wait
             }
             Err(Failure::Refused(refused::NOT_ALLOWED)) => {
                 if quiet.changed("not allowed") {
                     log!(
-                        "relay: the relay at {url} does not serve this host yet: its operator must add relay id {}",
+                        "relay: this relay does not serve this PC yet: give its operator the relay id {}",
                         room.id().hex()
                     );
                 }
-                t.refused_wait
+                jitter(t.refused_wait)
             }
             Err(Failure::Refused(refused::TIMEOUT)) => {
                 let wait = backoff.next();
@@ -137,11 +157,13 @@ async fn run(url: RelayUrl, room: RoomKey, target: SocketAddr, peers: RelayedPee
                 }
                 wait
             }
+            // PROTOCOL, BAD_SIGNATURE, VERSION_MISMATCH, ROOM_FULL,
+            // RELAY_FULL and reasons this program does not know.
             Err(Failure::Refused(reason)) => {
                 if quiet.changed(refused::describe(reason)) {
                     log!("relay: refused by {url}: {}; retrying every {wait_secs} s", refused::describe(reason));
                 }
-                t.refused_wait
+                jitter(t.refused_wait)
             }
             Err(Failure::Busy) => {
                 let wait = backoff.next();
@@ -167,6 +189,8 @@ enum Event {
     Relay(Option<Result<Message, tungstenite::Error>>),
     WriterDone(String),
     Idle,
+    /// The reader of this peer (id, serial) stopped on an error.
+    PeerFailed(u32, u64),
 }
 
 async fn session(ws: Ws, target: SocketAddr, peers: &RelayedPeers, t: &Timing) -> End {
@@ -179,14 +203,29 @@ async fn session(ws: Ws, target: SocketAddr, peers: &RelayedPeers, t: &Timing) -
     // Dropping a peer closes its socket and takes its address out of `peers`,
     // so every return below also forgets every client.
     let mut open: HashMap<u32, Peer> = HashMap::new();
+    // Each reader sends at most one message, so this holds at most one per
+    // peer ever opened on this link.
+    let (failed_tx, mut failed_rx) = mpsc::unbounded_channel::<(u32, u64)>();
+    // Tells a peer from an older one with the same id.
+    let mut serial: u64 = 0;
 
     loop {
         let event = tokio::select! {
             why = &mut writer => Event::WriterDone(why),
             _ = &mut idle => Event::Idle,
             msg = stream.next() => Event::Relay(msg),
+            Some((id, n)) = failed_rx.recv() => Event::PeerFailed(id, n),
         };
         let data: Bytes = match event {
+            Event::PeerFailed(id, n) => {
+                // Unless that client has left already, or come back as a new
+                // peer with the same id.
+                if open.get(&id).is_some_and(|p| p.serial == n) {
+                    open.remove(&id);
+                    tx.push_control(Msg::PeerClose(id).encode());
+                }
+                continue;
+            }
             Event::WriterDone(why) => return End::Lost(why),
             Event::Idle => return End::Lost(format!("no traffic for {}", secs(t.idle_timeout))),
             Event::Relay(Some(Ok(Message::Binary(b)))) => b,
@@ -218,13 +257,14 @@ async fn session(ws: Ws, target: SocketAddr, peers: &RelayedPeers, t: &Timing) -
                     tx.push_control(Msg::PeerClose(id).encode());
                     continue;
                 }
-                match Peer::open(id, target, peers, &tx) {
+                serial += 1;
+                match Peer::open(id, serial, target, peers, &tx, &failed_tx) {
                     Ok(p) => {
                         log!("relay: client {id} joined through the relay");
                         open.insert(id, p);
                     }
                     Err(e) => {
-                        log!("relay: cannot open a loopback socket for client {id}: {e}");
+                        log!("relay: cannot open a loopback socket for client {id}: {}", errors::plain(e));
                         tx.push_control(Msg::PeerClose(id).encode());
                     }
                 }
@@ -242,6 +282,7 @@ async fn session(ws: Ws, target: SocketAddr, peers: &RelayedPeers, t: &Timing) -
 /// One client seen through the relay: a loopback UDP socket connected to the
 /// host's server.
 struct Peer {
+    serial: u64,
     local: SocketAddr,
     sock: Arc<UdpSocket>,
     reader: tokio::task::JoinHandle<()>,
@@ -249,14 +290,27 @@ struct Peer {
 }
 
 impl Peer {
-    fn open(id: u32, target: SocketAddr, peers: &RelayedPeers, tx: &Tx) -> io::Result<Peer> {
+    fn open(
+        id: u32,
+        serial: u64,
+        target: SocketAddr,
+        peers: &RelayedPeers,
+        tx: &Tx,
+        failed: &mpsc::UnboundedSender<(u32, u64)>,
+    ) -> io::Result<Peer> {
         let std_sock = loopback_socket(target)?;
         let local = std_sock.local_addr()?;
         let sock = Arc::new(UdpSocket::from_std(std_sock)?);
         // Registered before the first datagram can reach the server.
         peers.insert(local);
-        let reader = tokio::spawn(peer_reader(id, sock.clone(), tx.clone()));
-        Ok(Peer { local, sock, reader, peers: peers.clone() })
+        let reader = {
+            let (sock, tx, failed) = (sock.clone(), tx.clone(), failed.clone());
+            tokio::spawn(async move {
+                peer_reader(id, sock, tx).await;
+                let _ = failed.send((id, serial));
+            })
+        };
+        Ok(Peer { serial, local, sock, reader, peers: peers.clone() })
     }
 }
 
@@ -280,11 +334,18 @@ fn loopback_socket(target: SocketAddr) -> io::Result<StdUdpSocket> {
     Ok(s.into())
 }
 
-/// The server's datagrams for client `id`, onto the link.
+/// The server's datagrams for client `id`, onto the link, until the socket
+/// fails.
 async fn peer_reader(id: u32, sock: Arc<UdpSocket>, tx: Tx) {
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        match sock.recv(&mut buf).await {
+        let got = sock.recv(&mut buf).await;
+        #[cfg(test)]
+        let got = match got {
+            Ok(n) if &buf[..n] == FAIL_READER => Err(io::Error::other("test failure")),
+            got => got,
+        };
+        match got {
             // Over the relay's limit: dropped, as on a path with a smaller MTU.
             Ok(n) if n > relay::MAX_PAYLOAD => {}
             // A full queue drops it too.
@@ -293,7 +354,7 @@ async fn peer_reader(id: u32, sock: Arc<UdpSocket>, tx: Tx) {
             }
             Err(e) if link::transient(&e) => {}
             Err(e) => {
-                log!("relay: loopback socket for client {id} failed: {e}");
+                log!("relay: loopback socket for client {id} failed: {}; dropping the client", errors::plain(e));
                 return;
             }
         }

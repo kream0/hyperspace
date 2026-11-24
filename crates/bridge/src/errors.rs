@@ -131,10 +131,21 @@ fn codes(text: &str) -> impl Iterator<Item = i64> + '_ {
     })
 }
 
+/// An error's message as [`clean`] leaves it.
+pub fn plain(e: impl std::fmt::Display) -> String {
+    clean(&e.to_string())
+}
+
 /// OpenSSL error entries ("error:0A000126:SSL routines::unexpected eof while
 /// reading:../ssl/record/rec_layer_s3.c:303:") cut down to their reason
-/// ("unexpected eof while reading"). Everything else is kept as it is.
+/// ("unexpected eof while reading"), and std's " (os error 104)" taken out:
+/// that number differs from one OS to the next for the same failure.
+/// Everything else is kept as it is.
 pub fn clean(text: &str) -> String {
+    without_os_error(&without_openssl(text))
+}
+
+fn without_openssl(text: &str) -> String {
     const MARK: &str = "error:";
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -164,8 +175,32 @@ pub fn clean(text: &str) -> String {
     out
 }
 
+/// `text` without std's "(os error N)" and the spaces before it.
+fn without_os_error(text: &str) -> String {
+    const MARK: &str = "(os error ";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(MARK) {
+        let after = &rest[i + MARK.len()..];
+        let digits = after
+            .char_indices()
+            .find(|&(j, c)| !(c.is_ascii_digit() || (j == 0 && c == '-')))
+            .map_or(after.len(), |(j, _)| j);
+        if after[..digits].parse::<i64>().is_ok() && after[digits..].starts_with(')') {
+            out.push_str(rest[..i].trim_end_matches(' '));
+            rest = &after[digits + 1..];
+        } else {
+            out.push_str(&rest[..i + MARK.len()]);
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// A TCP connect failure. The address is named only when `host` is a name.
 pub fn connect_error(host: &str, port: u16, addr: &SocketAddr, why: &str) -> String {
+    let why = clean(why);
     if host.parse::<IpAddr>().is_ok() {
         format!("cannot connect to {host} port {port}: {why}")
     } else {

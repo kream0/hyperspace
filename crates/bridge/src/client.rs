@@ -19,11 +19,15 @@ use tokio::net::UdpSocket;
 use tokio::sync::{oneshot, Notify};
 use tokio_tungstenite::tungstenite::{self, Message};
 
-use crate::link::{self, secs, Backoff, Failure, Timing, Ws};
+use crate::errors;
+use crate::link::{self, jitter, secs, Backoff, Failure, Timing, Ws};
 use crate::queue;
 use crate::RelayUrl;
 
 const UDP_BUFFER: usize = 1 << 20;
+/// Refusals that usually clear up soon (TIMEOUT, ROOM_FULL, RELAY_FULL) are
+/// retried with the backoff this many times in a row, then slowly.
+const QUICK_RETRIES: u32 = 5;
 
 /// Where the link to the relay stands, in words a user can act on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,7 +41,8 @@ pub enum Status {
     /// Retried with backoff.
     RelayBusy,
     /// The relay refused this client (a [`refused`] reason). Retried: soon
-    /// for a full room or relay, every minute otherwise.
+    /// for a full room or relay or a slow authentication (every minute after
+    /// five of those in a row), every minute otherwise.
     Refused(u8),
     /// Connected; the host is not connected to the relay.
     HostOffline,
@@ -82,7 +87,9 @@ pub struct LinkStats {
     pub bytes_out: u64,
     /// Datagrams dropped while the link was up: from the client, over
     /// [`relay::MAX_PAYLOAD`] or with the queue to the relay full; to the
-    /// client, with its socket buffer full.
+    /// client, with its socket buffer full. Also, link up or not, every
+    /// datagram from a socket other than the first one that sent to the
+    /// bridge.
     pub dropped: u64,
     /// Datagrams the client sent while there was no link (connecting, or
     /// waiting to reconnect). Lost too, but to an outage, not congestion.
@@ -191,12 +198,13 @@ impl ClientBridge {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|e| format!("cannot start the relay link: {e}"))?;
-        let std_sock = local_socket().map_err(|e| format!("cannot open a loopback UDP socket: {e}"))?;
-        let local = std_sock.local_addr().map_err(|e| format!("cannot open a loopback UDP socket: {e}"))?;
+            .map_err(|e| format!("cannot start the relay link: {}", errors::plain(e)))?;
+        let no_socket = |e: io::Error| format!("cannot open a loopback UDP socket: {}", errors::plain(e));
+        let std_sock = local_socket().map_err(no_socket)?;
+        let local = std_sock.local_addr().map_err(no_socket)?;
         let sock = {
             let _inside = rt.enter();
-            UdpSocket::from_std(std_sock).map_err(|e| format!("cannot open a loopback UDP socket: {e}"))?
+            UdpSocket::from_std(std_sock).map_err(no_socket)?
         };
         let shared = Arc::new(Shared {
             status: Mutex::new(Status::Connecting),
@@ -220,7 +228,7 @@ impl ClientBridge {
                 });
                 rt.shutdown_background();
             })
-            .map_err(|e| format!("cannot start the relay link: {e}"))?;
+            .map_err(|e| format!("cannot start the relay link: {}", errors::plain(e)))?;
         Ok((ClientBridge { shared, local, stop: Some(stop), thread: Some(thread) }, local))
     }
 
@@ -304,6 +312,16 @@ struct Local {
     buf: Vec<u8>,
 }
 
+impl Local {
+    /// Whether a datagram from `from` is the client's. The first sender is
+    /// the client for as long as the bridge lives, across reconnects: any
+    /// other local program could otherwise take the host's answers just by
+    /// sending one datagram.
+    fn is_app(&mut self, from: SocketAddr) -> bool {
+        *self.app.get_or_insert(from) == from
+    }
+}
+
 /// How a link that was up came down.
 enum End {
     /// Lost or closed by the relay: reconnect, with backoff.
@@ -320,8 +338,13 @@ async fn run(url: RelayUrl, room: RoomKey, sock: UdpSocket, shared: Arc<Shared>,
     // Whether the host was online when the last link ended.
     let mut host_online = false;
     let mut first = true;
+    // Refusals in a row that usually clear up soon.
+    let mut soon = 0;
     loop {
         let attempt = draining(link::connect(&url, &room, Role::Client), &mut local, &shared).await;
+        if !matches!(attempt, Err(Failure::Refused(refused::TIMEOUT | refused::ROOM_FULL | refused::RELAY_FULL))) {
+            soon = 0;
+        }
         let wait = match attempt {
             Ok(ws) => {
                 log!("relay: connected to {url}");
@@ -367,9 +390,20 @@ async fn run(url: RelayUrl, room: RoomKey, sock: UdpSocket, shared: Arc<Shared>,
                 shared.set(Status::Refused(reason));
                 match reason {
                     // A seat the relay has not freed yet (a link cut without
-                    // its noticing) or a slow moment: soon gone.
-                    refused::TIMEOUT | refused::ROOM_FULL | refused::RELAY_FULL => backoff.next(),
-                    _ => t.refused_wait,
+                    // its noticing) or a slow moment: soon gone, unless it
+                    // keeps coming back.
+                    refused::TIMEOUT | refused::ROOM_FULL | refused::RELAY_FULL => {
+                        soon += 1;
+                        if soon < QUICK_RETRIES {
+                            backoff.next()
+                        } else {
+                            jitter(t.refused_wait)
+                        }
+                    }
+                    // NOT_ALLOWED, PROTOCOL, BAD_SIGNATURE, VERSION_MISMATCH
+                    // and reasons this program does not know: not gone by
+                    // themselves.
+                    _ => jitter(t.refused_wait),
                 }
             }
             Err(Failure::Busy) => {
@@ -387,7 +421,7 @@ async fn run(url: RelayUrl, room: RoomKey, sock: UdpSocket, shared: Arc<Shared>,
 
 /// Runs `fut` while the link is down, reading and discarding what the client
 /// sends meanwhile (stale datagrams are worse than lost ones) but noting its
-/// address.
+/// address if it is the first datagram.
 async fn draining<F: Future>(fut: F, local: &mut Local, shared: &Shared) -> F::Output {
     tokio::pin!(fut);
     let mut broken = false;
@@ -397,10 +431,8 @@ async fn draining<F: Future>(fut: F, local: &mut Local, shared: &Shared) -> F::O
             r = local.sock.recv_from(&mut local.buf), if !broken => r,
         };
         match read {
-            Ok((_, from)) => {
-                local.app = Some(from);
-                bump(&shared.counters.discarded_while_down, 1);
-            }
+            Ok((_, from)) if local.is_app(from) => bump(&shared.counters.discarded_while_down, 1),
+            Ok(_) => bump(&shared.counters.dropped, 1),
             Err(e) if link::transient(&e) => {}
             // The session that follows reports it.
             Err(_) => broken = true,
@@ -437,8 +469,8 @@ async fn session(ws: Ws, local: &mut Local, shared: &Shared, t: &Timing, host_on
         match event {
             Event::WriterDone(why) => return End::Lost(why),
             Event::Idle => return End::Lost(format!("no traffic for {}", secs(t.idle_timeout))),
-            Event::Local(Ok((n, from))) => {
-                local.app = Some(from);
+            Event::Local(Ok((_, from))) if !local.is_app(from) => bump(&counters.dropped, 1),
+            Event::Local(Ok((n, _))) => {
                 // Over the relay's limit: dropped, as on a path with a smaller
                 // MTU. A full queue drops it too.
                 if n <= relay::MAX_PAYLOAD && tx.push(Msg::ClientData(&local.buf[..n]).encode()) {
@@ -449,7 +481,7 @@ async fn session(ws: Ws, local: &mut Local, shared: &Shared, t: &Timing, host_on
                 }
             }
             Event::Local(Err(e)) if link::transient(&e) => {}
-            Event::Local(Err(e)) => return End::Fatal(format!("the local UDP socket failed: {e}")),
+            Event::Local(Err(e)) => return End::Fatal(format!("the local UDP socket failed: {}", errors::plain(e))),
             Event::Relay(msg) => {
                 idle.as_mut().reset(tokio::time::Instant::now() + t.idle_timeout);
                 let data = match msg {

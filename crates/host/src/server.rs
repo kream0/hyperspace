@@ -276,6 +276,9 @@ struct Session {
     init: Vec<u8>,
     resp: Vec<u8>,
     started_at: Instant,
+    /// Whether the client is across the internet or comes through the relay,
+    /// as of its latest address.
+    wan: bool,
     last_rx: Instant,
     last_status: Instant,
     last_stats: Instant,
@@ -321,6 +324,12 @@ pub fn bind_socket(bind: Option<SocketAddr>, port: u16) -> std::io::Result<UdpSo
         Some(addr) => make(addr, false),
         None => make(SocketAddr::from(([0u16; 8], port)), true).or_else(|_| make(SocketAddr::from(([0u8; 4], port)), false)),
     }
+}
+
+/// Whether a client at `from` is across the internet. One through the relay
+/// is, though its datagrams come from a loopback socket of the relay bridge.
+fn is_wan(relayed: &RelayedPeers, from: SocketAddr) -> bool {
+    !is_local(from.ip()) || relayed.contains(from)
 }
 
 impl Server {
@@ -421,13 +430,27 @@ impl Server {
 
     fn on_data(&mut self, buf: &[u8], from: SocketAddr) {
         let mut plain = std::mem::take(&mut self.plain);
-        if let Some(s) = &self.session {
+        if let Some(s) = self.session.as_mut() {
             if s.shared.secure.open(buf, &mut plain).is_some() {
                 if s.shared.addr() != from {
                     // Authenticated packets from a new address: the client moved networks.
                     let via = if self.relayed.contains(from) { " (through the relay)" } else { "" };
                     log!("client moved to {}{via}", pretty(from));
                     *s.shared.addr.write().unwrap() = from;
+                    let wan = is_wan(&self.relayed, from);
+                    if wan != s.wan {
+                        // The packet size and the start bitrate were set for
+                        // the old path. The size cannot change mid-session (the
+                        // client reassembles with it) and the relay carries
+                        // any size; the client's rate control moves the
+                        // bitrate.
+                        s.wan = wan;
+                        log!(
+                            "the client is now {}; this session keeps {}-byte packets",
+                            if wan { "across the internet" } else { "on the local network" },
+                            s.shared.chunk + DATA_OVERHEAD + FRAG_HEADER_LEN
+                        );
+                    }
                 }
                 self.on_packet(&plain);
                 self.plain = plain;
@@ -503,10 +526,8 @@ impl Server {
             self.end_session(Some(bye::REPLACED));
         }
         let h = p.hello;
-        // A client through the relay is on the internet, though its datagrams
-        // come from a loopback socket of the relay bridge.
         let relayed = self.relayed.contains(from);
-        let wan = !is_local(from.ip()) || relayed;
+        let wan = is_wan(&self.relayed, from);
         let mut datagram = self.cfg.packet_size;
         if wan {
             datagram = datagram.min(wire::WAN_DATAGRAM);
@@ -566,6 +587,7 @@ impl Server {
             init: p.init,
             resp: p.resp,
             started_at: now,
+            wan,
             last_rx: now,
             last_status: now,
             last_stats: now,
@@ -667,4 +689,20 @@ impl Server {
 /// Address for log lines (IPv4 peers on the dual-stack socket shown as IPv4).
 fn pretty(addr: SocketAddr) -> SocketAddr {
     SocketAddr::new(addr.ip().to_canonical(), addr.port())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_client_is_on_the_internet_unless_its_address_is_local() {
+        let none = RelayedPeers::new();
+        for a in ["192.0.2.7:45800", "[2001:db8::7]:45800", "[::ffff:192.0.2.7]:45800"] {
+            assert!(is_wan(&none, a.parse().unwrap()), "{a}");
+        }
+        for a in ["127.0.0.1:50000", "192.168.1.20:45800", "10.0.0.2:45800", "[::1]:50000", "[fe80::1]:45800", "[::ffff:192.168.1.20]:45800"] {
+            assert!(!is_wan(&none, a.parse().unwrap()), "{a}");
+        }
+    }
 }

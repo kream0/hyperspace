@@ -148,7 +148,7 @@ pub async fn open(url: &RelayUrl) -> Result<Ws, Failure> {
     let port = url.port();
     let addrs: Vec<_> = match timeout(CONNECT_TIMEOUT, tokio::net::lookup_host((host, port))).await {
         Ok(Ok(a)) => a.collect(),
-        Ok(Err(e)) => return Err(format!("cannot resolve {host}: {e}").into()),
+        Ok(Err(e)) => return Err(format!("cannot resolve {host}: {}", errors::plain(e)).into()),
         Err(_) => return Err(format!("cannot resolve {host}: no answer within {} s", CONNECT_TIMEOUT.as_secs()).into()),
     };
     if addrs.is_empty() {

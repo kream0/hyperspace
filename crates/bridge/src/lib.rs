@@ -15,7 +15,15 @@
 //!   carries the answers back. The server tells these apart through
 //!   [`RelayedPeers`].
 //! - [`ClientBridge`] gives the client a loopback address to send to as if it
-//!   were the host's.
+//!   were the host's. The first socket that sends to that address is the
+//!   client for as long as the bridge lives, across reconnects; datagrams
+//!   from any other socket are dropped, so no other local program can take
+//!   the host's answers. Send from one socket: a new socket needs a new
+//!   bridge.
+//!
+//! The host's log names the full relay id (the one a relay operator adds to
+//! the allow list) in three places only: `--relay-id`, the line that starts
+//! the relay link, and the line saying the relay does not serve this PC yet.
 
 mod client;
 mod errors;
@@ -85,7 +93,7 @@ pub fn check(url: &str) -> Result<String, String> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| format!("cannot start the network runtime: {e}"))?;
+        .map_err(|e| format!("cannot start the network runtime: {}", errors::plain(e)))?;
     let result = rt.block_on(async {
         let mut ws = link::open(&url).await.map_err(|e| match e {
             link::Failure::Busy => format!("the relay at {url} is busy (HTTP 503): it has as many connections as it takes"),
