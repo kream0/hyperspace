@@ -21,6 +21,11 @@
 //!   the host's answers. Send from one socket: a new socket needs a new
 //!   bridge.
 //!
+//! Dropping a bridge closes its link the clean way, so the relay logs a
+//! close rather than a lost connection: a close frame, then the relay's
+//! answer, for a second at most. [`ClientBridge::close_in_background`] does
+//! the same without waiting.
+//!
 //! The host's log names the full relay id (the one a relay operator adds to
 //! the allow list) in three places only: `--relay-id`, the line that starts
 //! the relay link, and the line saying the relay does not serve this PC yet.

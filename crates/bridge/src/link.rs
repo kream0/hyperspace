@@ -1,14 +1,18 @@
 //! One WebSocket link to the relay: connect (DNS, TCP, TLS, upgrade),
-//! authenticate, and the writer that empties the outgoing queue and pings.
+//! authenticate, the writer that empties the outgoing queue and pings, and
+//! the close when the bridge is dropped.
 
+use std::future::Future;
 use std::time::Duration;
 
-use futures_util::stream::SplitSink;
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use hyperspace_proto::relay::{self, refused, Msg, Role, RoomKey};
 use tokio::net::TcpStream;
+use tokio::sync::watch;
 use tokio::time::{timeout, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::error::ProtocolError;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{self, Bytes, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -30,6 +34,15 @@ pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_WS_MESSAGE: usize = 64 * 1024;
 /// Messages written before each flush.
 const BATCH: usize = 64;
+/// A bridge that is dropped closes its link, and waits this long at most
+/// for the relay's answer.
+pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+/// After that, how long a bridge's thread still gives its link to end
+/// before it leaves it.
+const STOP_MARGIN: Duration = Duration::from_millis(250);
+
+/// Ends when the bridge is dropped (its sender with it). It never sends.
+pub type Stop = watch::Receiver<()>;
 
 /// Waits and limits of the reconnect loops; tests shorten them.
 #[derive(Clone, Copy, Debug)]
@@ -277,7 +290,7 @@ pub async fn connect(url: &RelayUrl, room: &RoomKey, role: Role) -> Result<Ws, F
 
 /// Writes queued messages in batches, and a ping every `ping`, until a
 /// write fails or stalls; returns why it stopped.
-pub async fn writer(mut sink: SplitSink<Ws, Message>, rx: Rx, ping: Duration) -> String {
+pub async fn writer(sink: &mut SplitSink<Ws, Message>, rx: Rx, ping: Duration) -> String {
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + ping, ping);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
@@ -306,6 +319,53 @@ pub async fn writer(mut sink: SplitSink<Ws, Message>, rx: Rx, ping: Duration) ->
             Err(_) => return format!("the relay took no data for {} s", WRITE_TIMEOUT.as_secs()),
         }
     }
+}
+
+/// Returns once the bridge is dropped.
+pub async fn stopped(stop: &mut Stop) {
+    while stop.changed().await.is_ok() {}
+}
+
+/// `fut`'s output, or None if the bridge is dropped first.
+pub async fn unless_stopped<F: Future>(fut: F, stop: &mut Stop) -> Option<F::Output> {
+    tokio::select! {
+        biased;
+        _ = stopped(stop) => None,
+        out = fut => Some(out),
+    }
+}
+
+/// Runs a bridge's loop on its thread until it returns, or until the
+/// bridge is dropped: the loop then closes its link (within
+/// [`CLOSE_TIMEOUT`]) and returns, and is left a little after that if it
+/// has not, so dropping a bridge never hangs.
+pub async fn drive(run: impl Future<Output = ()>, mut stop: Stop) {
+    tokio::pin!(run);
+    tokio::select! {
+        _ = &mut run => return,
+        _ = stopped(&mut stop) => {}
+    }
+    let _ = timeout(CLOSE_TIMEOUT + STOP_MARGIN, run).await;
+}
+
+/// Closes a link that is up the clean way: a close frame (1000, normal),
+/// then the relay's answer, all within [`CLOSE_TIMEOUT`] whatever the relay
+/// does. The relay then logs the link as closed rather than lost.
+pub async fn close(sink: &mut SplitSink<Ws, Message>, stream: &mut SplitStream<Ws>) {
+    let _ = timeout(CLOSE_TIMEOUT, async {
+        let normal = CloseFrame { code: CloseCode::Normal, reason: "".into() };
+        if sink.send(Message::Close(Some(normal))).await.is_err() {
+            return;
+        }
+        // Data still on its way is read past; the answer (or the end of
+        // the connection, or an error) ends the wait.
+        while let Some(Ok(msg)) = stream.next().await {
+            if matches!(msg, Message::Close(_)) {
+                return;
+            }
+        }
+    })
+    .await;
 }
 
 /// `" (code 1008: refused)"`, or nothing without a close frame.

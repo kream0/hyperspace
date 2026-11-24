@@ -11,16 +11,17 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::StreamExt;
 use hyperspace_proto::log;
 use hyperspace_proto::relay::{self, refused, Msg, Role, RoomKey};
 use hyperspace_proto::secure::Key;
 use tokio::net::UdpSocket;
-use tokio::sync::{oneshot, Notify};
+use tokio::sync::{watch, Notify};
 use tokio_tungstenite::tungstenite::{self, Message};
 
 use crate::errors;
-use crate::link::{self, jitter, secs, Backoff, Failure, Timing, Ws};
+use crate::link::{self, jitter, secs, Backoff, Failure, Stop, Timing, Ws};
 use crate::queue;
 use crate::RelayUrl;
 
@@ -176,11 +177,12 @@ impl Shared {
     }
 }
 
-/// Runs while it lives; dropping it closes the link and the local socket.
+/// Runs while it lives. Dropping it closes the link the clean way (a close
+/// frame, then the relay's answer: a second at most) and the local socket.
 pub struct ClientBridge {
     shared: Arc<Shared>,
     local: SocketAddr,
-    stop: Option<oneshot::Sender<()>>,
+    stop: Option<watch::Sender<()>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -215,17 +217,12 @@ impl ClientBridge {
             reconnect: Notify::new(),
         });
         let room = RoomKey::derive(key);
-        let (stop, stopped) = oneshot::channel::<()>();
+        let (stop, stopped) = watch::channel(());
         let state = shared.clone();
         let thread = std::thread::Builder::new()
             .name("relay".into())
             .spawn(move || {
-                rt.block_on(async move {
-                    tokio::select! {
-                        _ = run(url, room, sock, state, timing) => {}
-                        _ = stopped => {}
-                    }
-                });
+                rt.block_on(link::drive(run(url, room, sock, state, timing, stopped.clone()), stopped));
                 rt.shutdown_background();
             })
             .map_err(|e| format!("cannot start the relay link: {}", errors::plain(e)))?;
@@ -277,6 +274,13 @@ impl ClientBridge {
 
     pub fn local_addr(&self) -> SocketAddr {
         self.local
+    }
+
+    /// Closes the link as dropping the bridge does, without waiting: the
+    /// bridge's thread closes it (within a second) and ends by itself.
+    pub fn close_in_background(mut self) {
+        drop(self.stop.take());
+        drop(self.thread.take());
     }
 }
 
@@ -364,7 +368,7 @@ impl Refusals {
     }
 }
 
-async fn run(url: RelayUrl, room: RoomKey, sock: UdpSocket, shared: Arc<Shared>, t: Timing) {
+async fn run(url: RelayUrl, room: RoomKey, sock: UdpSocket, shared: Arc<Shared>, t: Timing, mut stop: Stop) {
     let mut local = Local { sock, app: None, buf: vec![0u8; 64 * 1024] };
     let mut backoff = Backoff::new(&t);
     // Whether the host was online when the last link ended.
@@ -372,7 +376,8 @@ async fn run(url: RelayUrl, room: RoomKey, sock: UdpSocket, shared: Arc<Shared>,
     let mut first = true;
     let mut refusals = Refusals::default();
     loop {
-        let attempt = draining(link::connect(&url, &room, Role::Client), &mut local, &shared).await;
+        let connect = draining(link::connect(&url, &room, Role::Client), &mut local, &shared);
+        let Some(attempt) = link::unless_stopped(connect, &mut stop).await else { return };
         if !matches!(attempt, Err(Failure::Refused(_))) {
             refusals.clear();
         }
@@ -382,7 +387,8 @@ async fn run(url: RelayUrl, room: RoomKey, sock: UdpSocket, shared: Arc<Shared>,
                 shared.link_up(first);
                 first = false;
                 let began = Instant::now();
-                let end = session(ws, &mut local, &shared, &t, &mut host_online).await;
+                // None: the bridge was dropped, and the link is closed.
+                let Some(end) = session(ws, &mut local, &shared, &t, &mut host_online, &mut stop).await else { return };
                 let lived = began.elapsed();
                 if lived >= t.stable {
                     backoff.reset();
@@ -402,7 +408,10 @@ async fn run(url: RelayUrl, room: RoomKey, sock: UdpSocket, shared: Arc<Shared>,
                         // after the client saw ClosedByHost count.
                         let asked = shared.reconnects_asked.load(Ordering::SeqCst);
                         shared.set_quietly(Status::ClosedByHost);
-                        draining(shared.reconnect_asked(asked), &mut local, &shared).await;
+                        let asking = draining(shared.reconnect_asked(asked), &mut local, &shared);
+                        if link::unless_stopped(asking, &mut stop).await.is_none() {
+                            return;
+                        }
                         shared.set(Status::Connecting);
                         // The host ended that session: the next host seen
                         // needs a new handshake.
@@ -430,7 +439,10 @@ async fn run(url: RelayUrl, room: RoomKey, sock: UdpSocket, shared: Arc<Shared>,
                 backoff.next()
             }
         };
-        draining(tokio::time::sleep(wait), &mut local, &shared).await;
+        let pause = draining(tokio::time::sleep(wait), &mut local, &shared);
+        if link::unless_stopped(pause, &mut stop).await.is_none() {
+            return;
+        }
     }
 }
 
@@ -460,12 +472,40 @@ enum Event {
     Local(io::Result<(usize, SocketAddr)>),
     WriterDone(String),
     Idle,
+    /// The bridge was dropped.
+    Stop,
 }
 
-/// One link that is up, until it ends. `host_online` is whether the host was
-/// online when the last link ended, and is kept up to date.
-async fn session(ws: Ws, local: &mut Local, shared: &Shared, t: &Timing, host_online: &mut bool) -> End {
-    let (sink, mut stream) = ws.split();
+/// One link that is up, until it ends, or None: until the bridge is
+/// dropped, and then the link is closed. `host_online` is whether the host
+/// was online when the last link ended, and is kept up to date.
+async fn session(
+    ws: Ws,
+    local: &mut Local,
+    shared: &Shared,
+    t: &Timing,
+    host_online: &mut bool,
+    stop: &mut Stop,
+) -> Option<End> {
+    let (mut sink, mut stream) = ws.split();
+    let end = carry(&mut sink, &mut stream, local, shared, t, host_online, stop).await;
+    if end.is_none() {
+        link::close(&mut sink, &mut stream).await;
+    }
+    end
+}
+
+/// The datagrams both ways, until the link ends (or None: until the bridge
+/// is dropped).
+async fn carry(
+    sink: &mut SplitSink<Ws, Message>,
+    stream: &mut SplitStream<Ws>,
+    local: &mut Local,
+    shared: &Shared,
+    t: &Timing,
+    host_online: &mut bool,
+    stop: &mut Stop,
+) -> Option<End> {
     let (tx, rx) = queue::queue(queue::MAX_COUNT, queue::MAX_BYTES);
     let writer = link::writer(sink, rx, t.ping_interval);
     tokio::pin!(writer);
@@ -478,12 +518,14 @@ async fn session(ws: Ws, local: &mut Local, shared: &Shared, t: &Timing, host_on
         let event = tokio::select! {
             why = &mut writer => Event::WriterDone(why),
             _ = &mut idle => Event::Idle,
+            _ = link::stopped(stop) => Event::Stop,
             msg = stream.next() => Event::Relay(msg),
             r = local.sock.recv_from(&mut local.buf) => Event::Local(r),
         };
         match event {
-            Event::WriterDone(why) => return End::Lost(why),
-            Event::Idle => return End::Lost(format!("no traffic for {}", secs(t.idle_timeout))),
+            Event::Stop => return None,
+            Event::WriterDone(why) => return Some(End::Lost(why)),
+            Event::Idle => return Some(End::Lost(format!("no traffic for {}", secs(t.idle_timeout)))),
             Event::Local(Ok((_, from))) if !local.is_app(from) => bump(&counters.dropped, 1),
             Event::Local(Ok((n, _))) => {
                 // Over the relay's limit: dropped, as on a path with a smaller
@@ -496,20 +538,20 @@ async fn session(ws: Ws, local: &mut Local, shared: &Shared, t: &Timing, host_on
                 }
             }
             Event::Local(Err(e)) if link::transient(&e) => {}
-            Event::Local(Err(e)) => return End::Fatal(format!("the local UDP socket failed: {}", errors::plain(e))),
+            Event::Local(Err(e)) => return Some(End::Fatal(format!("the local UDP socket failed: {}", errors::plain(e)))),
             Event::Relay(msg) => {
                 idle.as_mut().reset(tokio::time::Instant::now() + t.idle_timeout);
                 let data = match msg {
                     Some(Ok(Message::Binary(b))) => b,
                     Some(Ok(Message::Close(frame))) if link::is_closed_by_host(&frame) => {
-                        return End::ByHost(format!("the host closed this connection{}", link::close_text(&frame)))
+                        return Some(End::ByHost(format!("the host closed this connection{}", link::close_text(&frame))))
                     }
                     Some(Ok(Message::Close(frame))) => {
-                        return End::Lost(format!("the relay closed the connection{}", link::close_text(&frame)))
+                        return Some(End::Lost(format!("the relay closed the connection{}", link::close_text(&frame))))
                     }
                     Some(Ok(_)) => continue,
-                    Some(Err(e)) => return End::Lost(link::read_error(&e)),
-                    None => return End::Lost("the relay closed the connection".into()),
+                    Some(Err(e)) => return Some(End::Lost(link::read_error(&e))),
+                    None => return Some(End::Lost("the relay closed the connection".into())),
                 };
                 match Msg::decode(&data) {
                     Some(Msg::ClientData(payload)) => {

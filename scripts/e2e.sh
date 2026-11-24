@@ -222,6 +222,7 @@ MAIN_RELAY=$RELAY_PID
 echo "=== relay-a (the host's address does not answer: the session goes through the relay)"
 start_rhost relay-a 45971 || true
 rpair rc-a "hs1.$KEY.$DEAD,relay=$RELAY/v1"
+RELAY_SEEN=$(wc -l <"$LOGS/relay.log")
 rclient 40 relay-a.client.log rc-a --frames 120 --test-input --stats
 [ $RC = 0 ] || ERRS+="  client exited with $RC"$'\n'
 expect "$LOGS/relay-a.client.log" "CLIENT OK" "CLIENT OK"
@@ -233,6 +234,23 @@ for _ in $(seq 50); do grep -q "disconnected: peer quit" "$LOGS/relay-a.host.log
 expect "$LOGS/relay-a.host.log" "client .* connected through the relay" "the relayed client"
 expect "$LOGS/relay-a.host.log" "disconnected: peer quit" "a clean goodbye through the relay"
 grep -h -E "authenticated|connected through|relay link: " "$LOGS/relay-a.client.log" || true
+# The client closed its relay link the clean way at exit: the relay saw a
+# close, not a cut. Only the relay's lines from this client's run count.
+relay_a_lines() { tail -n +$((RELAY_SEEN + 1)) "$LOGS/relay.log" >"$LOGS/relay-a.relay.log"; }
+relay_a_lines
+PEER=$(grep -oE -m1 "client [0-9]+ joined room" "$LOGS/relay-a.relay.log" | grep -oE "[0-9]+" || true)
+if [ -n "$PEER" ]; then
+  for _ in $(seq 50); do
+    relay_a_lines
+    grep -qE "client $PEER left room" "$LOGS/relay-a.relay.log" && break
+    sleep 0.1
+  done
+  expect "$LOGS/relay-a.relay.log" "client $PEER left room [0-9a-f]{8}[^:]*: closed$" "the client's clean close"
+  reject "$LOGS/relay-a.relay.log" "client $PEER left room [^:]*: connection lost" "a cut relay link"
+  grep -h -E "client $PEER (joined|left) room" "$LOGS/relay-a.relay.log" || true
+else
+  ERRS+="  relay.log: no client joined a room during relay-a"$'\n'
+fi
 end_case relay-a "$LOGS/relay-a.client.log" "$LOGS/relay-a.host.log" "$LOGS/relay.log"
 
 echo "=== relay-b (the host answers directly too: the direct path wins, the relay link closes)"

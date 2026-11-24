@@ -39,6 +39,12 @@ extern "C" {
     fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
 }
 const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+/// After a quit, how long the window waits for the network thread to say
+/// goodbye to the host and report back.
+const STOP_WAIT: Duration = Duration::from_millis(600);
+/// The same through the relay: the goodbye's 300 ms on the relay link, then
+/// the link's close, which waits a second at most for the relay's answer.
+const STOP_WAIT_RELAYED: Duration = Duration::from_millis(1500);
 
 /// State shared between the UI thread and the render thread.
 #[derive(Default)]
@@ -164,6 +170,8 @@ struct Running {
     cursor_shape: Option<CursorShape>,
     cursor_scale: f64,
     stopping_since: Option<Instant>,
+    /// The session goes through the relay.
+    relayed: bool,
     fallback_video: (u32, u32),
     caps: bool,
     /// A local shortcut was used while Command was held.
@@ -226,6 +234,7 @@ impl App {
             }
         }
         let title = window_title(&self.args.host_name, conn.relayed);
+        let relayed = conn.relayed;
         let mut attrs = Window::default_attributes()
             .with_title(title.clone())
             .with_inner_size(PhysicalSize::new((vw * scale).round().max(320.0) as u32, (vh * scale).round().max(200.0) as u32));
@@ -297,6 +306,7 @@ impl App {
             cursor_shape: None,
             cursor_scale: 0.0,
             stopping_since: None,
+            relayed,
             fallback_video: (w.width as u32, w.height as u32),
             caps: caps_lock_on(),
             mask_win: false,
@@ -305,6 +315,14 @@ impl App {
 }
 
 impl Running {
+    fn stop_wait(&self) -> Duration {
+        if self.relayed {
+            STOP_WAIT_RELAYED
+        } else {
+            STOP_WAIT
+        }
+    }
+
     fn video_size(&self) -> (f64, f64) {
         let (w, h) = (self.shared.video_w.load(Ordering::Relaxed), self.shared.video_h.load(Ordering::Relaxed));
         if w == 0 || h == 0 {
@@ -361,9 +379,9 @@ impl Running {
             self.release_all();
             self.stop.store(true, Ordering::Relaxed);
             self.stopping_since = Some(Instant::now());
-            // The network thread says goodbye to the host and reports back;
-            // don't wait forever if it cannot.
-            el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(700)));
+            // The network thread says goodbye to the host (and closes the
+            // relay link) and reports back; don't wait forever if it cannot.
+            el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + self.stop_wait() + Duration::from_millis(100)));
         }
     }
 
@@ -547,6 +565,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::CursorVisible(v) => r.window.set_cursor_visible(v),
             UserEvent::Session { relayed } => {
+                r.relayed = relayed;
                 r.title = window_title(&self.args.host_name, relayed);
                 r.window.set_title(&r.title);
             }
@@ -577,7 +596,7 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         if let Some(r) = &self.running {
-            if r.stopping_since.is_some_and(|t| t.elapsed() > Duration::from_millis(600)) {
+            if r.stopping_since.is_some_and(|t| t.elapsed() > r.stop_wait()) {
                 el.exit();
             }
         }

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 use hyperspace_proto::relay::{self, refused, Msg, Role, RoomKey};
 use hyperspace_proto::secure::Key;
 use hyperspace_relay::{Allow, Config};
@@ -125,20 +125,7 @@ impl Silent {
             while let Ok((tcp, _)) = listener.accept().await {
                 let log = log.clone();
                 tokio::spawn(async move {
-                    let Ok(mut ws) = tokio_tungstenite::accept_async(MaybeTlsStream::Plain(tcp)).await else { return };
-                    let challenge = Msg::Challenge { version: relay::VERSION, nonce: [7; relay::NONCE_LEN] };
-                    if ws.send(Message::binary(challenge.encode())).await.is_err() {
-                        return;
-                    }
-                    // The HELLO, unchecked.
-                    if link::next_binary(&mut ws).await.is_err() {
-                        return;
-                    }
-                    for msg in [Msg::Ok, Msg::Status { host_online: true }] {
-                        if ws.send(Message::binary(msg.encode())).await.is_err() {
-                            return;
-                        }
-                    }
+                    let Some(ws) = let_in(tcp).await else { return };
                     log.lock().unwrap().push(Instant::now());
                     std::future::pending::<()>().await;
                     drop(ws);
@@ -168,6 +155,85 @@ impl Silent {
 }
 
 impl Drop for Silent {
+    fn drop(&mut self) {
+        if let Some(rt) = self.rt.take() {
+            rt.shutdown_background();
+        }
+    }
+}
+
+/// What a relay does to let a link in, without checking anything: the
+/// challenge, the HELLO read past, then OK and "host online".
+async fn let_in(tcp: tokio::net::TcpStream) -> Option<link::Ws> {
+    let mut ws = tokio_tungstenite::accept_async(MaybeTlsStream::Plain(tcp)).await.ok()?;
+    let challenge = Msg::Challenge { version: relay::VERSION, nonce: [7; relay::NONCE_LEN] };
+    ws.send(Message::binary(challenge.encode())).await.ok()?;
+    link::next_binary(&mut ws).await.ok()?;
+    for msg in [Msg::Ok, Msg::Status { host_online: true }] {
+        ws.send(Message::binary(msg.encode())).await.ok()?;
+    }
+    Some(ws)
+}
+
+/// A relay that lets every link in, reads it to the end, and notes how each
+/// one ended: "close 1000" for a close frame with that code (answered, as
+/// the relay does), "close without a code", or "cut" for a link that ended
+/// without a close frame.
+struct Closer {
+    rt: Option<tokio::runtime::Runtime>,
+    addr: SocketAddr,
+    joined: Arc<Mutex<usize>>,
+    ends: Arc<Mutex<Vec<String>>>,
+}
+
+impl Closer {
+    fn start() -> Closer {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (joined, ends) = (Arc::new(Mutex::new(0)), Arc::new(Mutex::new(Vec::new())));
+        let (joined_log, ends_log) = (joined.clone(), ends.clone());
+        rt.spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let (joined, ends) = (joined_log.clone(), ends_log.clone());
+                tokio::spawn(async move {
+                    let Some(mut ws) = let_in(tcp).await else { return };
+                    *joined.lock().unwrap() += 1;
+                    let end = loop {
+                        match ws.next().await {
+                            Some(Ok(Message::Close(frame))) => {
+                                // Reading once more sends the answer.
+                                let _ = tokio::time::timeout(WAIT, ws.next()).await;
+                                break match frame {
+                                    Some(f) => format!("close {}", u16::from(f.code)),
+                                    None => "close without a code".to_string(),
+                                };
+                            }
+                            Some(Ok(_)) => continue,
+                            Some(Err(_)) | None => break "cut".to_string(),
+                        }
+                    };
+                    ends.lock().unwrap().push(end);
+                });
+            }
+        });
+        Closer { rt: Some(rt), addr, joined, ends }
+    }
+
+    fn url(&self) -> RelayUrl {
+        RelayUrl::parse(&format!("ws://{}", self.addr)).unwrap()
+    }
+
+    fn joined(&self) -> usize {
+        *self.joined.lock().unwrap()
+    }
+
+    fn ends(&self) -> Vec<String> {
+        self.ends.lock().unwrap().clone()
+    }
+}
+
+impl Drop for Closer {
     fn drop(&mut self) {
         if let Some(rt) = self.rt.take() {
             rt.shutdown_background();
@@ -671,6 +737,66 @@ fn a_new_host_with_the_same_key_takes_over() {
     let began = Instant::now();
     drop(first);
     assert!(began.elapsed() < WAIT, "{:?}", began.elapsed());
+}
+
+/// How long `f` took.
+fn timed(f: impl FnOnce()) -> Duration {
+    let began = Instant::now();
+    f();
+    began.elapsed()
+}
+
+#[test]
+fn a_dropped_bridge_closes_its_link() {
+    let relay = Closer::start();
+    let echo = Echo::start();
+    let host = HostBridge::start_with(relay.url(), &Key::generate(), echo.addr, RelayedPeers::new(), fast()).unwrap();
+    wait_for("the host's link", || relay.joined() == 1);
+    let (client, _) = ClientBridge::start_with(relay.url(), &Key::generate(), fast()).unwrap();
+    wait_for("the client to see the host online", || client.status() == Status::HostOnline);
+
+    // The relay answers at once: neither waits out the close's time limit.
+    let took = timed(|| drop(client));
+    assert!(took < link::CLOSE_TIMEOUT, "the client took {took:?} to close");
+    wait_for("the client's close", || relay.ends().len() == 1);
+    let took = timed(|| drop(host));
+    assert!(took < link::CLOSE_TIMEOUT, "the host took {took:?} to close");
+    wait_for("the host's close", || relay.ends().len() == 2);
+    assert_eq!(relay.ends(), ["close 1000", "close 1000"]);
+}
+
+#[test]
+fn a_link_closed_in_the_background_closes_too() {
+    let relay = Closer::start();
+    let (client, _) = ClientBridge::start_with(relay.url(), &Key::generate(), fast()).unwrap();
+    wait_for("the client to see the host online", || client.status() == Status::HostOnline);
+    client.close_in_background();
+    wait_for("the client's close", || !relay.ends().is_empty());
+    assert_eq!(relay.ends(), ["close 1000"]);
+}
+
+#[test]
+fn a_dropped_bridge_waits_a_second_at_most_for_the_relay_to_answer() {
+    // Never answers, and leaves TCP open.
+    let relay = Silent::start();
+    let echo = Echo::start();
+    let host = HostBridge::start_with(relay.url(), &Key::generate(), echo.addr, RelayedPeers::new(), fast()).unwrap();
+    wait_for("the host's link", || relay.joined().len() == 1);
+    let (client, _) = ClientBridge::start_with(relay.url(), &Key::generate(), fast()).unwrap();
+    let (background, _) = ClientBridge::start_with(relay.url(), &Key::generate(), fast()).unwrap();
+    for c in [&client, &background] {
+        wait_for("the clients to see the host online", || c.status() == Status::HostOnline);
+    }
+
+    let at_least = link::CLOSE_TIMEOUT - Duration::from_millis(100);
+    let at_most = link::CLOSE_TIMEOUT + Duration::from_secs(2);
+    for (who, took) in [("the client", timed(|| drop(client))), ("the host", timed(|| drop(host)))] {
+        assert!(took >= at_least, "{who} gave up on the relay's answer after {took:?}");
+        assert!(took < at_most, "{who} took {took:?} to close");
+    }
+    // Closing in the background does not wait.
+    let took = timed(|| background.close_in_background());
+    assert!(took < Duration::from_millis(500), "closing in the background took {took:?}");
 }
 
 #[test]

@@ -144,7 +144,9 @@ pub fn status_line(status: Status, host: &str) -> String {
 }
 
 /// The link to the relay. Owned by the thread that runs the sessions; every
-/// call returns at once (the link runs on a thread of its own).
+/// call returns at once (the link runs on a thread of its own). Dropping it
+/// closes the link the clean way, which takes up to a second when the relay
+/// does not answer.
 pub struct Relay {
     url: String,
     host: String,
@@ -223,7 +225,9 @@ impl Relay {
                 self.socket()
             }
             Err(e) => {
-                // The link is of no use without it: it closes here.
+                // The link is of no use without it: it closes (in the
+                // background, so this call still returns at once).
+                bridge.close_in_background();
                 let why = format!("cannot open the session's loopback socket for the relay link: {}", plain_error(&e));
                 log!("relay: {why}");
                 self.start_error = Some(why);
@@ -258,11 +262,14 @@ impl Relay {
         }
     }
 
-    /// The host answered directly: the link is not needed.
+    /// The host answered directly: the link is not needed. It closes in the
+    /// background: this thread carries the session that just started.
     pub fn stop(&mut self) {
         if self.bridge.is_some() {
             self.report();
-            self.bridge = None;
+            if let Some(bridge) = self.bridge.take() {
+                bridge.close_in_background();
+            }
             self.sock = None;
             log!("relay link closed: the host answered directly");
         }
@@ -337,7 +344,8 @@ impl Relay {
 }
 
 impl Drop for Relay {
-    /// The counters once more at exit, then the link closes.
+    /// The counters once more at exit, then the link closes (within a
+    /// second).
     fn drop(&mut self) {
         self.report();
     }

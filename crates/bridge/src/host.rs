@@ -9,16 +9,17 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::StreamExt;
 use hyperspace_proto::log;
 use hyperspace_proto::relay::{self, refused, Msg, Role, RoomKey};
 use hyperspace_proto::secure::Key;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::{self, Bytes, Message};
 
 use crate::errors;
-use crate::link::{self, jitter, secs, Backoff, Failure, Quiet, Timing, Ws};
+use crate::link::{self, jitter, secs, Backoff, Failure, Quiet, Stop, Timing, Ws};
 use crate::queue::{self, Tx};
 use crate::{RelayUrl, RelayedPeers};
 
@@ -34,9 +35,11 @@ const REPLACED_LIMIT: u32 = 3;
 #[cfg(test)]
 pub(crate) const FAIL_READER: &[u8] = b"test: fail this reader";
 
-/// Runs while it lives; dropping it closes the link and the loopback sockets.
+/// Runs while it lives. Dropping it closes the link the clean way (a close
+/// frame, then the relay's answer: a second at most) and the loopback
+/// sockets.
 pub struct HostBridge {
-    stop: Option<oneshot::Sender<()>>,
+    stop: Option<watch::Sender<()>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -62,16 +65,11 @@ impl HostBridge {
             .build()
             .map_err(|e| format!("cannot start the relay link: {}", errors::plain(e)))?;
         let room = RoomKey::derive(key);
-        let (stop, stopped) = oneshot::channel::<()>();
+        let (stop, stopped) = watch::channel(());
         let thread = std::thread::Builder::new()
             .name("relay".into())
             .spawn(move || {
-                rt.block_on(async move {
-                    tokio::select! {
-                        _ = run(url, room, target, peers, timing) => {}
-                        _ = stopped => {}
-                    }
-                });
+                rt.block_on(link::drive(run(url, room, target, peers, timing, stopped.clone()), stopped));
                 rt.shutdown_background();
             })
             .map_err(|e| format!("cannot start the relay link: {}", errors::plain(e)))?;
@@ -127,18 +125,21 @@ impl Takeovers {
     }
 }
 
-async fn run(url: RelayUrl, room: RoomKey, target: SocketAddr, peers: RelayedPeers, t: Timing) {
+async fn run(url: RelayUrl, room: RoomKey, target: SocketAddr, peers: RelayedPeers, t: Timing, mut stop: Stop) {
     let mut backoff = Backoff::new(&t);
     let mut quiet = Quiet::default();
     let wait_secs = t.refused_wait.as_secs();
     let mut takeovers = Takeovers::default();
     loop {
-        let wait = match link::connect(&url, &room, Role::Host).await {
+        let connect = link::connect(&url, &room, Role::Host);
+        let Some(attempt) = link::unless_stopped(connect, &mut stop).await else { return };
+        let wait = match attempt {
             Ok(ws) => {
                 log!("relay: connected to {url}");
                 quiet.clear();
                 let began = Instant::now();
-                let end = session(ws, target, &peers, &t).await;
+                // None: the bridge was dropped, and the link is closed.
+                let Some(end) = session(ws, target, &peers, &t, &mut stop).await else { return };
                 let lived = began.elapsed();
                 if lived >= t.stable {
                     backoff.reset();
@@ -195,7 +196,9 @@ async fn run(url: RelayUrl, room: RoomKey, target: SocketAddr, peers: RelayedPee
                 wait
             }
         };
-        tokio::time::sleep(wait).await;
+        if link::unless_stopped(tokio::time::sleep(wait), &mut stop).await.is_none() {
+            return;
+        }
     }
 }
 
@@ -206,10 +209,31 @@ enum Event {
     Idle,
     /// The reader of this peer (id, serial) stopped on an error.
     PeerFailed(u32, u64),
+    /// The bridge was dropped.
+    Stop,
 }
 
-async fn session(ws: Ws, target: SocketAddr, peers: &RelayedPeers, t: &Timing) -> End {
-    let (sink, mut stream) = ws.split();
+/// One link that is up, until it ends, or None: until the bridge is
+/// dropped, and then the link is closed.
+async fn session(ws: Ws, target: SocketAddr, peers: &RelayedPeers, t: &Timing, stop: &mut Stop) -> Option<End> {
+    let (mut sink, mut stream) = ws.split();
+    let end = carry(&mut sink, &mut stream, target, peers, t, stop).await;
+    if end.is_none() {
+        link::close(&mut sink, &mut stream).await;
+    }
+    end
+}
+
+/// The clients' datagrams both ways, until the link ends (or None: until the
+/// bridge is dropped).
+async fn carry(
+    sink: &mut SplitSink<Ws, Message>,
+    stream: &mut SplitStream<Ws>,
+    target: SocketAddr,
+    peers: &RelayedPeers,
+    t: &Timing,
+    stop: &mut Stop,
+) -> Option<End> {
     let (tx, rx) = queue::queue(queue::MAX_COUNT, queue::MAX_BYTES);
     let writer = link::writer(sink, rx, t.ping_interval);
     tokio::pin!(writer);
@@ -227,6 +251,7 @@ async fn session(ws: Ws, target: SocketAddr, peers: &RelayedPeers, t: &Timing) -
         let event = tokio::select! {
             why = &mut writer => Event::WriterDone(why),
             _ = &mut idle => Event::Idle,
+            _ = link::stopped(stop) => Event::Stop,
             msg = stream.next() => Event::Relay(msg),
             Some((id, n)) = failed_rx.recv() => Event::PeerFailed(id, n),
         };
@@ -240,21 +265,22 @@ async fn session(ws: Ws, target: SocketAddr, peers: &RelayedPeers, t: &Timing) -
                 }
                 continue;
             }
-            Event::WriterDone(why) => return End::Lost(why),
-            Event::Idle => return End::Lost(format!("no traffic for {}", secs(t.idle_timeout))),
+            Event::Stop => return None,
+            Event::WriterDone(why) => return Some(End::Lost(why)),
+            Event::Idle => return Some(End::Lost(format!("no traffic for {}", secs(t.idle_timeout)))),
             Event::Relay(Some(Ok(Message::Binary(b)))) => b,
             Event::Relay(Some(Ok(Message::Close(frame)))) => {
                 if link::is_replaced(&frame) {
-                    return End::Replaced;
+                    return Some(End::Replaced);
                 }
-                return End::Lost(format!("the relay closed the connection{}", link::close_text(&frame)));
+                return Some(End::Lost(format!("the relay closed the connection{}", link::close_text(&frame))));
             }
             Event::Relay(Some(Ok(_))) => {
                 idle.as_mut().reset(tokio::time::Instant::now() + t.idle_timeout);
                 continue;
             }
-            Event::Relay(Some(Err(e))) => return End::Lost(link::read_error(&e)),
-            Event::Relay(None) => return End::Lost("the relay closed the connection".into()),
+            Event::Relay(Some(Err(e))) => return Some(End::Lost(link::read_error(&e))),
+            Event::Relay(None) => return Some(End::Lost("the relay closed the connection".into())),
         };
         idle.as_mut().reset(tokio::time::Instant::now() + t.idle_timeout);
 
