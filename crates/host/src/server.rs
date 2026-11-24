@@ -32,6 +32,12 @@ use std::time::{Duration, Instant};
 /// client, release held keys and return.
 pub static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+/// Outer packet type of the host's own reachability probe (see `reach`).
+pub const PT_PROBE: u8 = 0x83;
+/// Token of the probe currently in flight (0 = none) and whether it arrived.
+pub static PROBE_TOKEN: AtomicU64 = AtomicU64::new(0);
+pub static PROBE_SEEN: AtomicBool = AtomicBool::new(false);
+
 /// Frames kept for NACK retransmission.
 const STORE_FRAMES: usize = 48;
 const SESSION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -354,6 +360,13 @@ impl Server {
         match buf.first() {
             Some(&PT_INIT) => self.on_init(buf, from),
             Some(&PT_DATA) => self.on_data(buf, from),
+            // Our own probe came back in through the router: note it, answer nothing.
+            Some(&PT_PROBE) if buf.len() == 9 => {
+                let token = u64::from_le_bytes(buf[1..9].try_into().unwrap());
+                if token != 0 && token == PROBE_TOKEN.load(Ordering::Relaxed) {
+                    PROBE_SEEN.store(true, Ordering::Relaxed);
+                }
+            }
             _ => {}
         }
     }

@@ -7,7 +7,7 @@
 //! * keeps those addresses published (encrypted) in the BitTorrent DHT so a
 //!   paired client still finds the host after its home IP address changes.
 
-use crate::server::SHUTDOWN;
+use crate::server::{PROBE_SEEN, PROBE_TOKEN, PT_PROBE, SHUTDOWN};
 use hyperspace_proto::pairing::{format_addr, is_behind_nat, Pairing};
 use hyperspace_proto::secure::Key;
 use hyperspace_proto::{log, rendezvous};
@@ -126,6 +126,38 @@ impl PortMapping {
     }
 }
 
+/// Send a packet to our own public address and see whether it comes back in.
+/// Most routers loop such traffic back ("NAT hairpinning"); when it arrives it
+/// has passed the router's port forward and this PC's firewall, exactly like
+/// a client's packet would. `false` only means "could not be confirmed".
+fn probe(endpoint: SocketAddr) -> bool {
+    let token = u64::from_le_bytes(Key::generate().bytes()[..8].try_into().unwrap()) | 1;
+    PROBE_SEEN.store(false, Ordering::Relaxed);
+    PROBE_TOKEN.store(token, Ordering::Relaxed);
+    // Tests stand in for a router that loops traffic back.
+    let endpoint = match std::env::var("HYPERSPACE_PROBE_VIA").ok().and_then(|v| v.parse().ok()) {
+        Some(ip) => SocketAddr::new(ip, endpoint.port()),
+        None => endpoint,
+    };
+    let mut packet = vec![PT_PROBE];
+    packet.extend_from_slice(&token.to_le_bytes());
+    let mut seen = false;
+    if let Ok(sock) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
+        'outer: for _ in 0..4 {
+            let _ = sock.send_to(&packet, endpoint);
+            for _ in 0..20 {
+                std::thread::sleep(Duration::from_millis(20));
+                if PROBE_SEEN.load(Ordering::Relaxed) {
+                    seen = true;
+                    break 'outer;
+                }
+            }
+        }
+    }
+    PROBE_TOKEN.store(0, Ordering::Relaxed);
+    seen
+}
+
 /// Everything the background thread knows about how to reach this host.
 struct Reach {
     opts: Options,
@@ -152,17 +184,9 @@ impl Reach {
                 push(format!("{h}/{p}"));
             }
         }
-        match self.mapping.as_ref().and_then(|m| m.public_endpoint()) {
-            Some(ep) => push(format_addr(&ep)),
-            None => {
-                // No mapping: the port may still be forwarded by hand, so offer
-                // the public address the DHT sees us at.
-                if let Some(ip) = self.dht.as_ref().and_then(rendezvous::public_ipv4) {
-                    if !is_behind_nat(ip.into()) {
-                        push(format_addr(&SocketAddr::new(ip.into(), port)));
-                    }
-                }
-            }
+        // Offered even when the router did not confirm it: the port may be forwarded by hand.
+        if let Some((ep, _)) = self.public_endpoint() {
+            push(format_addr(&ep));
         }
         for ip in &v6 {
             push(format_addr(&SocketAddr::new((*ip).into(), port)));
@@ -181,11 +205,13 @@ impl Reach {
         }
         let pairing = self.pairing(&addrs);
         let path = self.opts.config_dir.join("pairing.txt");
+        if first {
+            self.explain();
+        }
         if let Err(e) = pairing.save(&path) {
             log!("cannot write {}: {e}", path.display());
         }
         if first {
-            self.explain();
             log!("pair a client once with:");
             eprintln!("\n    hyperspace-client pair {}\n", pairing.encode());
             log!("(also saved to {})", path.display());
@@ -195,22 +221,64 @@ impl Reach {
         self.last_addrs = addrs;
     }
 
+    /// The public IPv4 endpoint clients would use, and whether the router
+    /// confirmed forwarding it to us.
+    fn public_endpoint(&self) -> Option<(SocketAddr, bool)> {
+        if let Some(ep) = self.mapping.as_ref().and_then(|m| m.public_endpoint()) {
+            return Some((ep, true));
+        }
+        let ip = self.dht.as_ref().and_then(rendezvous::public_ipv4).filter(|ip| !is_behind_nat((*ip).into()))?;
+        Some((SocketAddr::new(ip.into(), self.opts.port), false))
+    }
+
     /// Tell the user, in plain words, whether outside access will work.
     fn explain(&self) {
         let (_, v6) = local_addresses();
-        match &self.mapping {
-            Some(m) => match m.public_endpoint() {
-                Some(ep) => log!("reachable from the internet at {ep} (port forwarded automatically by the router)"),
-                None => log!(
-                    "the router forwarded a port, but its own address ({}) is not public: your provider uses \
-                     carrier-grade NAT (or there is a second router), so IPv4 connections from outside cannot get in",
-                    m.external_ip.map(|i| i.to_string()).unwrap_or_else(|| "unknown".into())
-                ),
-            },
-            None if self.opts.upnp => log!(
-                "automatic port forwarding is unavailable: to connect from outside, forward UDP port {} to this PC \
-                 in your router (or enable UPnP there)",
-                self.opts.port
+        let port = self.opts.port;
+        let firewall_hint = format!(
+            "if clients get no answer, allow the port in Windows Firewall (administrator prompt): \
+             netsh advfirewall firewall add rule name=hyperspace dir=in action=allow protocol=UDP localport={port}"
+        );
+        if let Some(m) = self.mapping.as_ref().filter(|m| m.public_endpoint().is_none()) {
+            log!(
+                "the router forwarded a port, but its own address ({}) is not public: your provider uses \
+                 carrier-grade NAT (or there is a second router), so IPv4 connections from outside cannot get in",
+                m.external_ip.map(|i| i.to_string()).unwrap_or_else(|| "unknown".into())
+            );
+        }
+        match self.public_endpoint() {
+            Some((ep, mapped)) => {
+                let verified = probe(ep);
+                match (mapped, verified) {
+                    (true, true) => log!(
+                        "reachable from the internet at {ep}: the router forwards the port and a test packet sent to \
+                         that address came back in (router and firewall both let clients through)"
+                    ),
+                    (false, true) => {
+                        log!("reachable from the internet at {ep}: a test packet sent to that address came back in")
+                    }
+                    (true, false) => {
+                        log!(
+                            "the router forwards {ep} to this PC, but a test packet sent to that address did not come \
+                             back in. Either the router cannot loop traffic back (common, harmless) or this PC's \
+                             firewall is dropping it"
+                        );
+                        log!("{firewall_hint}");
+                    }
+                    (false, false) => {
+                        if self.opts.upnp {
+                            log!(
+                                "automatic port forwarding is unavailable and UDP port {port} does not appear to be \
+                                 forwarded: to connect from outside, forward it to this PC in your router (or enable UPnP there)"
+                            );
+                        }
+                        log!("{firewall_hint}");
+                    }
+                }
+            }
+            None if self.opts.upnp && self.mapping.is_none() => log!(
+                "automatic port forwarding is unavailable: to connect from outside, forward UDP port {port} to this PC \
+                 in your router (or enable UPnP there)"
             ),
             None => {}
         }

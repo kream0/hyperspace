@@ -93,6 +93,13 @@ What can still stop it:
 | Provider uses carrier-grade NAT (no public IPv4) | "its own address is not public" | Connect over IPv6 (both ends need it), or ask the provider for a public IPv4 |
 | Windows Firewall blocks public networks | (client gets no answer) | Allow hyperspace-host for public networks |
 | Network you are on blocks UDP | (client gets no answer) | Use another network / tethering |
+| The Mac runs a VPN or security client (Zscaler, GlobalProtect, …) | client error names the tunnel interface | Those route all traffic through a tunnel that usually drops direct UDP. Use a device without it, or ask whoever manages it |
+
+On start the host also sends a test packet to its own public address. If it
+comes back in, the log says so and you know the router and Windows Firewall
+both let clients through; if not, the log gives the firewall command to run.
+When a connection fails, the client lists each address it tried with the
+most likely reason that one stayed silent.
 
 ## Security
 

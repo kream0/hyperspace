@@ -658,9 +658,10 @@ dependencies = [
 
 [[package]]
 name = "hyperspace-client"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hyperspace-proto",
+ "if-addrs",
  "objc2 0.6.5",
  "objc2-core-foundation",
  "objc2-core-graphics",
@@ -677,7 +678,7 @@ dependencies = [
 
 [[package]]
 name = "hyperspace-host"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hyperspace-proto",
  "if-addrs",
@@ -688,7 +689,7 @@ dependencies = [
 
 [[package]]
 name = "hyperspace-proto"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "blake2",
  "chacha20poly1305",

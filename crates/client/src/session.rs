@@ -80,6 +80,46 @@ fn make_socket(host: SocketAddr) -> std::io::Result<UdpSocket> {
     Ok(s.into())
 }
 
+/// Network interfaces whose names mark them as tunnels (VPNs, security clients).
+fn is_tunnel(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    ["utun", "tun", "tap", "ppp", "ipsec", "wg", "zt", "tailscale", "gpd"].iter().any(|p| n.starts_with(p))
+}
+
+/// Best explanation this machine can give for an address staying silent.
+fn why_unreachable(sock: &UdpSocket, addr: SocketAddr) -> String {
+    let ifaces = if_addrs::get_if_addrs().unwrap_or_default();
+    // Which of our interfaces would carry traffic to it.
+    let via = sock.local_addr().ok().and_then(|l| ifaces.iter().find(|i| i.ip() == l.ip()));
+    let tunnel = via.filter(|i| is_tunnel(&i.name));
+    if is_local(addr.ip()) {
+        let same_subnet = |i: &if_addrs::Interface| match (&i.addr, addr.ip()) {
+            (if_addrs::IfAddr::V4(a), std::net::IpAddr::V4(t)) => {
+                let mask = u32::from(a.netmask);
+                mask != 0 && u32::from(a.ip) & mask == u32::from(t) & mask && !a.ip.is_loopback()
+            }
+            _ => false,
+        };
+        if addr.ip().is_loopback() || ifaces.iter().any(same_subnet) {
+            "on this network, but silent - is the host running, and does its firewall allow hyperspace-host?".into()
+        } else {
+            "a private address, only reachable from the host's own network (expected when you are elsewhere)".into()
+        }
+    } else if let Some(t) = tunnel {
+        format!(
+            "traffic to this public address leaves through {} - a VPN or security client (e.g. Zscaler) - which \
+             commonly blocks direct UDP like this; try from a network or device without it, or ask whoever manages it",
+            t.name
+        )
+    } else {
+        format!(
+            "the host's public address - its router must forward UDP {} to the PC (the host log says whether it does), \
+             and this network must allow outgoing UDP",
+            addr.port()
+        )
+    }
+}
+
 /// Connect: authenticate with the pairing key over whichever address answers
 /// first, then wait for the host to start its stream.
 pub fn connect(opts: &Options) -> Result<Connection, String> {
@@ -121,14 +161,15 @@ pub fn connect(opts: &Options) -> Result<Connection, String> {
             let mut msg = if socks.is_empty() {
                 "the host's address is unknown and the lookup found nothing - is hyperspace-host running?".to_string()
             } else {
-                format!(
-                    "no answer from {}.\n  - is hyperspace-host running, and is this the pairing string it printed?\n  \
-                     - from outside its network the host's router must forward the UDP port (the host log says whether that worked)",
-                    list(&socks)
-                )
+                let mut m = "no answer from the host. Addresses tried:".to_string();
+                for (s, addr) in &socks {
+                    m += &format!("\n  {addr}: {}", why_unreachable(s, *addr));
+                }
+                m += "\nAlso check that hyperspace-host is running and that this is the pairing string it printed.";
+                m
             };
             if cfg!(target_os = "macos") {
-                msg += "\n  - on macOS: System Settings > Privacy & Security > Local Network must allow the terminal you launched this from";
+                msg += "\nOn macOS, System Settings > Privacy & Security > Local Network must allow the terminal you launched this from.";
             }
             return Err(msg);
         }
