@@ -67,10 +67,14 @@ const CLOSE_GRACE: Duration = Duration::from_secs(2);
 /// still queued for it and the close handshake. Past it, it is dropped.
 const CLOSE_DEADLINE: Duration = Duration::from_secs(5);
 /// Links a room let go of that may still be closing at once. When another
-/// one starts closing, the oldest is dropped at once: a host replaced over
-/// and over must not fill the relay with links that hold their slot for
-/// [`CLOSE_DEADLINE`].
+/// one starts closing, the room's oldest is dropped at once: a host
+/// replaced over and over must not fill the relay with links that hold
+/// their slot for [`CLOSE_DEADLINE`].
 const MAX_CLOSING: usize = 4;
+/// Links still closing in the whole relay, all rooms together. Past it the
+/// relay's oldest is dropped at once: rooms come and go, so the cap per
+/// room alone does not bound them.
+pub const MAX_CLOSING_ALL: usize = 16;
 /// Kernel send and receive buffer of every connection (SO_SNDBUF and
 /// SO_RCVBUF; Linux doubles the value, so 64 KiB each way). Left alone, the
 /// kernel grows a connection's send buffer up to 4 MiB (tcp_wmem) when the
@@ -78,9 +82,10 @@ const MAX_CLOSING: usize = 4;
 ///
 /// It still carries a room's 60 Mbit/s with ease: the other end is the
 /// proxy on loopback, a fraction of a millisecond away, and 60 Mbit/s is
-/// only 7.5 KB per millisecond. 64 KiB in flight keeps up even when the
-/// proxy answers 8 ms late, and the link's queue ([`DATA_BYTES`]) takes
-/// the bursts.
+/// only 7.5 KB per millisecond. The kernel counts its own overhead against
+/// the size, so somewhat less than 64 KiB is in flight: still several
+/// milliseconds' worth, and the link's queue ([`DATA_BYTES`]) takes the
+/// bursts.
 pub const SOCKET_BUFFER: u32 = 32 * 1024;
 
 /// Write one timestamped line to stderr. Never panics (eprintln! does when
@@ -183,16 +188,9 @@ pub struct Config {
     /// WebSocket connections still authenticating; more are answered HTTP 503.
     pub max_pending: usize,
     /// WebSocket connections in all, authenticated or not, including links
-    /// still closing; more are answered HTTP 503. This is what bounds the
-    /// relay's memory: a link can hold up to about 1 MiB, 0.77 MiB in the
-    /// relay (its queue, with the allocator's rounding, and its WebSocket
-    /// buffers) and 0.25 MiB in the kernel (its socket buffers, see
-    /// [`SOCKET_BUFFER`], plus one loopback packet over each). With the
-    /// defaults any link may be a full one: 16 rooms seat up to 80 links
-    /// and may have 64 more closing. A connection still authenticating
-    /// takes less (about 0.32 MiB).
-    /// Connections that never ask for the WebSocket are bounded by the
-    /// reverse proxy, which passes on only complete requests.
+    /// still closing; more are answered HTTP 503. Only a number below what
+    /// the other limits need ([`Config::links`]) changes anything: that is
+    /// for tests. The default leaves it to them.
     pub max_links: usize,
     /// Time a new connection has to answer the challenge.
     pub auth_timeout: Duration,
@@ -206,16 +204,41 @@ pub struct Config {
 }
 
 impl Config {
+    /// The most WebSocket connections at once: room for every one the other
+    /// limits allow at the same time, max_pending + max_rooms x (1 +
+    /// max_clients) + [`MAX_CLOSING_ALL`] (with the defaults 16 + 16 x 5 +
+    /// 16 = 112), or [`Config::max_links`] if that is lower. So neither
+    /// connections still authenticating nor links still closing can keep a
+    /// host or a client out of a room with a free seat (but for the moment
+    /// a dropped closing link takes to end).
+    ///
+    /// This bounds the relay's memory. A link that authenticated can hold
+    /// up to about 1.02 MiB: 0.77 MiB in the relay (its queue, with the
+    /// allocator's rounding, and its WebSocket buffers) and 0.25 MiB in the
+    /// kernel (its socket buffers, see [`SOCKET_BUFFER`], plus one loopback
+    /// packet over each). A connection still authenticating takes less,
+    /// about 0.32 MiB. With the defaults, 96 seated or closing links, 16
+    /// authenticating and about 10 MiB for the rest of the process come to
+    /// 98 + 5 + 10 = 113 MiB: under the service's 128 MiB memory cap.
+    /// Connections that never ask for the WebSocket are bounded by the
+    /// reverse proxy, which passes on only complete requests.
+    pub fn links(&self) -> usize {
+        let all = self
+            .max_rooms
+            .saturating_mul(self.max_clients.saturating_add(1))
+            .saturating_add(self.max_pending)
+            .saturating_add(MAX_CLOSING_ALL);
+        all.min(self.max_links)
+    }
+
     pub fn new(allow: Allow) -> Config {
         Config {
             allow,
             max_rooms: 16,
             max_clients: 4,
             rate: Rate::from_mbit(60),
-            max_pending: 64,
-            // 96 x 1.02 MiB, plus about 10 MiB for the rest of the process,
-            // is 108 MiB: under the service's 128 MiB memory cap.
-            max_links: 96,
+            max_pending: 16,
+            max_links: usize::MAX,
             auth_timeout: Duration::from_secs(5),
             ping_interval: Duration::from_secs(20),
             idle_timeout: Duration::from_secs(60),
@@ -269,7 +292,7 @@ struct LinkState {
     queued: AtomicUsize,
     /// Ends the connection at once (it could not take a control message).
     kill: Notify,
-    /// Ends the connection at once (newer links of its room are closing).
+    /// Ends the connection at once (too many newer links are closing).
     cut: Notify,
     /// Set just before the room drops the link...
     removed: OnceLock<Removed>,
@@ -417,24 +440,31 @@ struct Shared {
     next_link: AtomicU64,
     /// Permits for connections still authenticating ([`Config::max_pending`]).
     pending: Arc<Semaphore>,
-    /// Permits for all connections ([`Config::max_links`]).
+    /// Permits for all connections ([`Config::links`]).
     links: Arc<Semaphore>,
-    /// Per room, the links it let go of that are still closing, oldest
-    /// first ([`MAX_CLOSING`]). Kept apart from the rooms: a room that
-    /// empties is deleted, but its closing links still count. Taken after
-    /// the rooms lock when both are held.
-    closing: Mutex<HashMap<RoomId, VecDeque<(u64, Arc<LinkState>)>>>,
+    /// The links rooms let go of that are still closing, oldest first
+    /// ([`MAX_CLOSING`] per room, [`MAX_CLOSING_ALL`] in all). Kept apart
+    /// from the rooms: a room that empties is deleted, but its closing
+    /// links still count. Taken after the rooms lock when both are held.
+    closing: Mutex<VecDeque<Closing>>,
+}
+
+/// A link a room let go of, still closing.
+struct Closing {
+    room: RoomId,
+    id: u64,
+    state: Arc<LinkState>,
 }
 
 impl Shared {
     fn new(config: Config) -> Shared {
         Shared {
             pending: Arc::new(Semaphore::new(config.max_pending.min(Semaphore::MAX_PERMITS))),
-            links: Arc::new(Semaphore::new(config.max_links.min(Semaphore::MAX_PERMITS))),
+            links: Arc::new(Semaphore::new(config.links().min(Semaphore::MAX_PERMITS))),
             config,
             rooms: Mutex::new(HashMap::new()),
             next_link: AtomicU64::new(1),
-            closing: Mutex::new(HashMap::new()),
+            closing: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -442,37 +472,40 @@ impl Shared {
         self.rooms.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn closing(&self) -> MutexGuard<'_, HashMap<RoomId, VecDeque<(u64, Arc<LinkState>)>>> {
+    fn closing(&self) -> MutexGuard<'_, VecDeque<Closing>> {
         self.closing.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The room lets go of `link`, which then closes (see [`Link::remove`]).
-    /// Past [`MAX_CLOSING`] links closing in the room, the oldest is
-    /// dropped at once. Called under the rooms lock: the link is listed
-    /// before its connection, which takes that lock to leave, can look for
-    /// it in [`Shared::closed`].
+    /// Past [`MAX_CLOSING`] links closing in the room, the room's oldest is
+    /// dropped at once; past [`MAX_CLOSING_ALL`] in all, the relay's oldest.
+    /// Called under the rooms lock: the link is listed before its
+    /// connection, which takes that lock to leave, can look for it in
+    /// [`Shared::closed`].
     fn let_go(&self, room: RoomId, link: Link, why: Removed) {
         let mut closing = self.closing();
-        let list = closing.entry(room).or_default();
-        list.push_back((link.id, link.state.clone()));
-        if list.len() > MAX_CLOSING {
-            if let Some((_, oldest)) = list.pop_front() {
-                oldest.cut.notify_one();
-            }
+        closing.push_back(Closing { room, id: link.id, state: link.state.clone() });
+        // Both caps held before this one link was added, so at most one is
+        // passed now, by one; dropping the room's oldest also brings the
+        // total back under its cap.
+        let over = if closing.iter().filter(|c| c.room == room).count() > MAX_CLOSING {
+            closing.iter().position(|c| c.room == room)
+        } else if closing.len() > MAX_CLOSING_ALL {
+            Some(0)
+        } else {
+            None
+        };
+        if let Some(oldest) = over.and_then(|i| closing.remove(i)) {
+            oldest.state.cut.notify_one();
         }
         drop(closing);
         link.remove(why);
     }
 
-    /// A link the room let go of has ended: it no longer counts as closing.
-    fn closed(&self, room: RoomId, id: u64) {
-        let mut closing = self.closing();
-        if let Some(list) = closing.get_mut(&room) {
-            list.retain(|(link, _)| *link != id);
-            if list.is_empty() {
-                closing.remove(&room);
-            }
-        }
+    /// A link a room let go of has ended: it no longer counts as closing.
+    /// Link ids are unique in the whole relay.
+    fn closed(&self, id: u64) {
+        self.closing().retain(|c| c.id != id);
     }
 
     fn counts(&self) -> (usize, usize) {
@@ -735,7 +768,7 @@ struct Seated {
     id: u64,
     /// Why the connection ended, for the log.
     why: Option<String>,
-    /// Counts against [`Config::max_links`] until the seat is given back.
+    /// Counts against [`Config::links`] until the seat is given back.
     slot: Option<OwnedSemaphorePermit>,
 }
 
@@ -752,7 +785,7 @@ impl Drop for Seated {
         } else {
             // The room let go of it earlier (that was logged then); this is
             // how its close went.
-            self.shared.closed(self.room, self.id);
+            self.shared.closed(self.id);
             match self.seat {
                 Seat::Host => log!("replaced host of room {room} gone: {why}"),
                 Seat::Client(peer) => log!("closed client {peer} of room {room} gone: {why}"),
@@ -819,7 +852,9 @@ async fn connection(
         why = write(sink, outbox, first, &shared.config) => why,
         why = read(stream, &shared, room, seat, id) => why,
         _ = state.kill.notified() => "too slow (its queue was full)".to_string(),
-        _ = state.cut.notified() => format!("dropped at once ({MAX_CLOSING} newer links of its room are closing)"),
+        _ = state.cut.notified() => {
+            format!("dropped at once (newer links closing: {MAX_CLOSING} in its room or {MAX_CLOSING_ALL} in all)")
+        }
     };
     seated.why = Some(why);
 }
@@ -1061,16 +1096,58 @@ mod tests {
         assert_eq!(cut, [true, true, false, false, false, false]);
         assert!(elsewhere.cut.notified().now_or_never().is_none());
         assert!(states.iter().all(|s| s.removed.get() == Some(&Removed::Replaced)));
-        assert_eq!(shared.closing().get(&room).map(VecDeque::len), Some(MAX_CLOSING));
+        let ids = |shared: &Shared| shared.closing().iter().map(|c| c.id).collect::<Vec<_>>();
+        assert_eq!(ids(&shared), [3, 4, 5, 6, 7]);
 
         // Links that end stop counting (the dropped ones were no longer
-        // listed), and a room with none left is forgotten.
+        // listed).
         for id in 1..=6 {
-            shared.closed(room, id);
+            shared.closed(id);
         }
-        assert_eq!(shared.closing().len(), 1);
-        shared.closed(other, 7);
+        assert_eq!(ids(&shared), [7]);
+        shared.closed(7);
         assert!(shared.closing().is_empty());
+    }
+
+    #[test]
+    fn the_relay_keeps_at_most_sixteen_closing_links() {
+        let shared = Shared::new(Config::new(Allow::Open));
+        let rooms: Vec<RoomId> = (0..5u8).map(|i| RoomId::from_bytes([i; 32])).collect();
+        // 4 links in each of 5 rooms, the rooms taking turns: no room is
+        // over its cap, but the relay is, by 4.
+        let mut states = Vec::new();
+        let mut outboxes = Vec::new();
+        for id in 1..=20u64 {
+            let (link, outbox) = Link::new(id);
+            states.push(link.state.clone());
+            outboxes.push(outbox);
+            let room = rooms[(id as usize - 1) % rooms.len()];
+            shared.let_go(room, link, Removed::Replaced);
+        }
+
+        // The relay's 4 oldest are dropped at once, whatever their room.
+        let cut: Vec<u64> =
+            (1..).zip(&states).filter(|(_, s)| s.cut.notified().now_or_never().is_some()).map(|(id, _)| id).collect();
+        assert_eq!(cut, [1, 2, 3, 4]);
+        let closing = shared.closing();
+        assert_eq!(closing.len(), MAX_CLOSING_ALL);
+        assert_eq!(closing.front().map(|c| c.id), Some(5));
+        let in_room = |r: RoomId| closing.iter().filter(|c| c.room == r).count();
+        assert_eq!(rooms.iter().map(|&r| in_room(r)).collect::<Vec<_>>(), [3, 3, 3, 3, 4]);
+    }
+
+    #[test]
+    fn links_leave_room_for_every_seat() {
+        let mut config = Config::new(Allow::Open);
+        // 16 authenticating, 16 rooms of a host and 4 clients, 16 closing.
+        assert_eq!(config.links(), 112);
+        config.max_rooms = 2;
+        config.max_clients = 1;
+        assert_eq!(config.links(), 16 + 2 * 2 + MAX_CLOSING_ALL);
+        config.max_links = 3;
+        assert_eq!(config.links(), 3);
+        config.max_links = 1000;
+        assert_eq!(config.links(), 16 + 2 * 2 + MAX_CLOSING_ALL, "only a lower number counts");
     }
 
     #[test]

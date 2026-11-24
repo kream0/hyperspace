@@ -115,7 +115,9 @@ fn main() {
     let rate = config.rate.map_or("no rate limit".to_string(), |r| format!("{r} per room and direction"));
     let limits = format!(
         "at most {} rooms, {} clients per room, {} connections, {rate}",
-        config.max_rooms, config.max_clients, config.max_links
+        config.max_rooms,
+        config.max_clients,
+        config.links()
     );
 
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {

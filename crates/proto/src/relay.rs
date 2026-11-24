@@ -79,9 +79,9 @@
 //! Before 4001 or 1000 the relay writes what was already queued for the
 //! link. A link that does not take that and the close frame within 5
 //! seconds is dropped without a close frame. A room has at most 4 such
-//! links closing at once: when another one starts closing (a host replaced
-//! over and over, say), the oldest is dropped at once, with or without its
-//! close frame.
+//! links closing at once, and the relay 16 in all: when another one starts
+//! closing (a host replaced over and over, say), the oldest of the room, or
+//! of the relay, is dropped at once, with or without its close frame.
 //!
 //! Every other end is a dropped TCP connection, with no close frame (in
 //! particular no 1009 for a message too big):
