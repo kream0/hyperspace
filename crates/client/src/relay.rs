@@ -60,14 +60,14 @@ pub fn setting(arg: &RelayArg, path: &Path, pairing: Option<&str>) -> Option<Str
         RelayArg::Set(url) => {
             match save(&format!("{url}\n")) {
                 Ok(()) => log!("relay setting saved to {} (--relay off turns the relay off)", path.display()),
-                Err(e) => log!("cannot save the relay setting to {}: {}; using it for this run only", path.display(), plain_error(&e)),
+                Err(e) => log!("cannot save the relay setting to {}, using it for this run only: {}", path.display(), plain_error(&e)),
             }
             return Some(url.to_string());
         }
         RelayArg::Off => {
             match save("off\n") {
                 Ok(()) => log!("relay off (saved in {}; --relay URL turns it back on)", path.display()),
-                Err(e) => log!("relay off for this run (cannot save it to {}: {})", path.display(), plain_error(&e)),
+                Err(e) => log!("relay off for this run only, cannot save that to {}: {}", path.display(), plain_error(&e)),
             }
             return None;
         }
@@ -88,7 +88,7 @@ pub fn setting(arg: &RelayArg, path: &Path, pairing: Option<&str>) -> Option<Str
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => log!("cannot read {}: {}", path.display(), plain_error(&e)),
+        Err(e) => log!("cannot read the relay setting in {}, ignoring it: {}", path.display(), plain_error(&e)),
     }
     match RelayUrl::parse(pairing?) {
         Ok(url) => Some(url.to_string()),
@@ -207,7 +207,8 @@ impl Relay {
         let (bridge, addr) = match ClientBridge::start(&self.url, &self.key) {
             Ok(started) => started,
             Err(e) => {
-                log!("relay: cannot start the relay link: {e}");
+                // The bridge's errors say what could not start.
+                log!("relay: {e}");
                 self.start_error = Some(e);
                 return None;
             }
@@ -223,8 +224,8 @@ impl Relay {
             }
             Err(e) => {
                 // The link is of no use without it: it closes here.
-                let why = format!("no local socket for it ({})", plain_error(&e));
-                log!("relay: cannot use the relay: {why}");
+                let why = format!("cannot open the session's loopback socket for the relay link: {}", plain_error(&e));
+                log!("relay: {why}");
                 self.start_error = Some(why);
                 None
             }
@@ -297,7 +298,7 @@ impl Relay {
     pub fn diagnose(&self) -> String {
         let Some(status) = self.status() else {
             return match &self.start_error {
-                Some(e) => format!("the relay link could not start: {e}."),
+                Some(e) => format!("{}.", e.trim_end_matches('.')),
                 None => "not tried.".to_string(),
             };
         };
@@ -543,8 +544,8 @@ mod tests {
         assert_eq!(r.diagnose(), "not tried.");
         assert!(r.failed());
         assert_eq!(r.hosts_seen(), 0);
-        r.start_error = Some("no thread".into());
-        assert_eq!(r.diagnose(), "the relay link could not start: no thread.");
+        r.start_error = Some("cannot start the relay link: no thread".into());
+        assert_eq!(r.diagnose(), "cannot start the relay link: no thread.");
         assert_eq!(r.host, "relay.example");
     }
 }
