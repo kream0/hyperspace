@@ -31,6 +31,7 @@ pub struct Fragmenter {
 
 impl Fragmenter {
     /// Emit every fragment of `data`.
+    #[allow(clippy::too_many_arguments)]
     pub fn send_all(
         &mut self,
         kind: u8,
@@ -345,6 +346,7 @@ impl Reassembler {
     }
 
     /// Next decodable frame, if any. Call until it returns `None`.
+    #[allow(clippy::manual_pop_if)]
     pub fn pop(&mut self) -> Option<Frame> {
         loop {
             // In-order head.

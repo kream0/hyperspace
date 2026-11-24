@@ -4,6 +4,7 @@ use hyperspace_proto::cursor::CursorShape;
 use hyperspace_proto::Codec;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncoderPref {
@@ -39,6 +40,7 @@ pub struct Config {
 
 /// What the client asked for.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub struct StreamRequest {
     pub codecs: u8,
     pub fps: u32,
@@ -58,11 +60,13 @@ pub struct StreamInfo {
 
 /// Receives the pipeline's output. Called from pipeline threads.
 pub trait Sink: Send + Sync {
-    /// The pipeline is ready; called exactly once before any frame.
+    /// The pipeline is ready. Called before the first frame, and again if the
+    /// stream geometry changes mid-session (display mode switch).
     fn started(&self, info: &StreamInfo);
     /// One encoded access unit (Annex B). `ts_us` is `clock::now_us()` at capture.
     fn frame(&self, data: &[u8], keyframe: bool, ts_us: u64);
     /// Cursor changed. `shape` is `Some` when the image changed.
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn cursor(&self, shape: Option<&CursorShape>, visible: bool);
 }
 
@@ -75,6 +79,7 @@ pub struct Control {
 
 /// Default bitrate for a resolution / frame rate: generous, since this is
 /// meant for LANs, but sub-linear in fps because inter-frame deltas shrink.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn default_bitrate_kbps(width: u32, height: u32, fps: u32) -> u32 {
     let px = width as f64 * height as f64;
     let kbps = px * 8.5 * (fps.max(1) as f64 / 60.0).sqrt() / 1000.0;
@@ -82,9 +87,9 @@ pub fn default_bitrate_kbps(width: u32, height: u32, fps: u32) -> u32 {
 }
 
 /// Run the configured source until `ctl.stop` is set or it fails.
-pub fn run(cfg: &Config, req: StreamRequest, ctl: &Control, sink: &dyn Sink) -> Result<(), String> {
+pub fn run(cfg: &Config, req: StreamRequest, ctl: Arc<Control>, sink: Arc<dyn Sink>) -> Result<(), String> {
     match &cfg.source {
-        SourceKind::File(path) => crate::file_source::run(cfg, path, req, ctl, sink),
+        SourceKind::File(path) => crate::file_source::run(cfg, path, req, &ctl, &*sink),
         SourceKind::Desktop => {
             #[cfg(windows)]
             {

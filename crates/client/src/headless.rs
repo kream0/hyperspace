@@ -113,7 +113,7 @@ pub fn run(args: &Args) -> i32 {
         print_stats: args.stats,
         last: Stats::default(),
     };
-    let exit = session::receive_loop(&conn, &input, &stop, &mut h);
+    let exit = session::receive_loop(&conn, &input, &stop, &mut h, args.test_keyframes.then_some(150_000));
     log!(
         "{}: {} frames ({} invalid), {} dropped, {} nacks, {} keyframe requests, {} cursor shapes, input acked: {}",
         exit.describe(),

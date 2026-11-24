@@ -27,6 +27,7 @@ OPTIONS:
     --headless            No window: receive and validate the stream only
     --frames <N>          Exit after N frames (testing)
     --test-input          Headless: send a few synthetic input events
+    --test-keyframes      Headless: request a keyframe every 150 ms
     -h, --help            Show this help
     -V, --version         Show version
 
@@ -51,6 +52,7 @@ pub struct Args {
     pub headless: bool,
     pub frames: Option<u64>,
     pub test_input: bool,
+    pub test_keyframes: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -68,6 +70,7 @@ fn parse_args() -> Result<Args, String> {
         headless: !cfg!(target_os = "macos"),
         frames: None,
         test_input: false,
+        test_keyframes: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -114,6 +117,7 @@ fn parse_args() -> Result<Args, String> {
             "--headless" => a.headless = true,
             "--frames" => a.frames = Some(val("--frames")?.parse().map_err(|_| "invalid --frames")?),
             "--test-input" => a.test_input = true,
+            "--test-keyframes" => a.test_keyframes = true,
             s if s.starts_with('-') => return Err(format!("unknown option '{s}' (try --help)")),
             s => {
                 if host_name.is_some() {

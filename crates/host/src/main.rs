@@ -7,6 +7,8 @@ mod pipeline;
 mod server;
 #[cfg(windows)]
 mod win;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod yuv;
 
 use hyperspace_proto::{log, wire, Codec, DEFAULT_PORT};
 use pipeline::{Config, EncoderPref, SourceKind};
@@ -180,7 +182,7 @@ fn self_test(cfg: Config, frames: u32) -> Result<(), String> {
     use hyperspace_proto::annexb;
     use pipeline::{Control, Sink, StreamInfo, StreamRequest};
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
     struct TestSink {
@@ -228,14 +230,14 @@ fn self_test(cfg: Config, frames: u32) -> Result<(), String> {
 
     #[cfg(windows)]
     win::process_setup();
-    let sink = TestSink::default();
+    let sink = Arc::new(TestSink::default());
     if let Some(p) = &cfg.dump {
         *sink.dump.lock().unwrap() = Some(std::fs::File::create(p).map_err(|e| format!("{}: {e}", p.display()))?);
     }
-    let ctl = Control::default();
+    let ctl = Arc::new(Control::default());
     let req = StreamRequest { codecs: wire::CODEC_MASK_ALL, fps: 60, bitrate_kbps: 0 };
     let result = std::thread::scope(|scope| {
-        let worker = scope.spawn(|| pipeline::run(&cfg, req, &ctl, &sink));
+        let worker = scope.spawn(|| pipeline::run(&cfg, req, ctl.clone(), sink.clone()));
         let start = std::time::Instant::now();
         let mut last_kf = start;
         while !worker.is_finished() {

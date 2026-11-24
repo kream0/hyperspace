@@ -222,7 +222,7 @@ struct Session {
     last_bytes: u64,
     input_rx: InputReceiver,
     injector: Box<dyn Injector>,
-    rect_set: bool,
+    applied_rect: Option<(i32, i32, i32, i32)>,
     client_cursor_serial: u32,
 }
 
@@ -308,11 +308,13 @@ impl Server {
         s.last_rx = Instant::now();
         match pkt {
             Packet::Input(evs) => {
-                if !s.rect_set {
-                    if let Some(rect) = s.shared.info.lock().unwrap().and_then(|i| i.desktop_rect) {
-                        s.injector.set_desktop_rect(rect);
-                        s.rect_set = true;
+                // Cheap, and follows display mode changes mid-session.
+                let rect = s.shared.info.lock().unwrap().and_then(|i| i.desktop_rect);
+                if rect != s.applied_rect {
+                    if let Some(r) = rect {
+                        s.injector.set_desktop_rect(r);
                     }
+                    s.applied_rect = rect;
                 }
                 for (seq, ev) in evs.iter() {
                     if s.input_rx.accept(seq) {
@@ -389,7 +391,7 @@ impl Server {
             let (cfg, ctl, shared) = (self.cfg.clone(), ctl.clone(), shared.clone());
             std::thread::Builder::new()
                 .name("pipeline".into())
-                .spawn(move || pipeline::run(&cfg, req, &ctl, &*shared))
+                .spawn(move || pipeline::run(&cfg, req, ctl, shared))
                 .expect("spawn pipeline thread")
         };
         let now = Instant::now();
@@ -405,7 +407,7 @@ impl Server {
             last_bytes: 0,
             input_rx: InputReceiver::default(),
             injector: new_injector(self.cfg.view_only),
-            rect_set: false,
+            applied_rect: None,
             client_cursor_serial: 0,
         });
     }

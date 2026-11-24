@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Tests + transport e2e (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+      - run: cargo build --release --workspace
+      - run: bash scripts/e2e.sh target/release
+
+  windows:
+    name: Host (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+      - run: cargo build --release --workspace
+      - name: List displays and encoders
+        run: target\release\hyperspace-host.exe --list
+      - name: Capture + encode self-test
+        run: target\release\hyperspace-host.exe --self-test 30 --dump selftest.bin
+      - name: Desktop streaming over loopback
+        shell: bash
+        run: |
+          target/release/hyperspace-host.exe --once --port 45811 --dump desktop.bin > host.log 2>&1 &
+          sleep 1
+          status=0
+          target/release/hyperspace-client.exe 127.0.0.1:45811 --headless --frames 30 --test-input --test-keyframes --stats || status=$?
+          sleep 2
+          echo "--- host log"; cat host.log
+          exit $status
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-capture-dumps
+          path: |
+            selftest.bin
+            desktop.bin
+          if-no-files-found: ignore
+
+  macos:
+    name: Client (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+      - run: cargo build --release --workspace
+      - name: Window + VideoToolbox + Metal over loopback
+        run: |
+          for codec in h264 h265; do
+            target/release/hyperspace-host --file testdata/testsrc_720p.$codec --once --port 45812 > host-$codec.log 2>&1 &
+            sleep 1
+            (sleep 3; screencapture -x shot-$codec.png || true) &
+            status=0
+            target/release/hyperspace-client 127.0.0.1:45812 --frames 360 --stats > client-$codec.log 2>&1 || status=$?
+            cat client-$codec.log
+            echo "--- host log"; cat host-$codec.log
+            grep -q "CLIENT OK" client-$codec.log || status=1
+            wait
+            if [ $status -ne 0 ]; then exit $status; fi
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-client-screenshots
+          path: shot-*.png
+          if-no-files-found: ignore

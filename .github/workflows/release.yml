@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Tag to create and release, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p hyperspace-host -p hyperspace-client
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target\release\hyperspace-host.exe, README.md dist\
+          Compress-Archive -Path dist\* -DestinationPath "hyperspace-host-$env:TAG-windows-x64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: hyperspace-host-*.zip
+
+  macos:
+    name: macOS universal
+    runs-on: macos-latest
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - run: cargo build --release -p hyperspace-client --target aarch64-apple-darwin
+      - run: cargo build --release -p hyperspace-client --target x86_64-apple-darwin
+      - name: Package
+        run: |
+          mkdir dist
+          lipo -create -output dist/hyperspace-client \
+            target/aarch64-apple-darwin/release/hyperspace-client \
+            target/x86_64-apple-darwin/release/hyperspace-client
+          codesign --force --sign - dist/hyperspace-client
+          cp README.md dist/
+          tar -czf "hyperspace-client-$TAG-macos-universal.tar.gz" -C dist .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: hyperspace-client-*.tar.gz
+
+  publish:
+    name: Publish GitHub release
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: assets
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la assets
+          cat > notes.md <<NOTES
+          ## Install
+
+          **Windows host** (the machine you want to control): unzip \`hyperspace-host-$TAG-windows-x64.zip\` and run \`hyperspace-host.exe\`. Allow it through the firewall on private networks when Windows asks.
+
+          **macOS client** (the machine you sit at):
+
+          \`\`\`bash
+          curl -L https://github.com/${{ github.repository }}/releases/download/$TAG/hyperspace-client-$TAG-macos-universal.tar.gz | tar -xz
+          ./hyperspace-client <windows-ip>
+          \`\`\`
+
+          See the README for options, shortcuts and limitations.
+          NOTES
+          sed -i 's/^          //' notes.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" assets/* --clobber
+          else
+            gh release create "$TAG" assets/* --target "$GITHUB_SHA" --title "hyperspace $TAG" --notes-file notes.md
+          fi

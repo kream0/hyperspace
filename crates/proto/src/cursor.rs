@@ -108,6 +108,50 @@ impl CursorShape {
         Some(Self::finish(w, h, hot, rgba))
     }
 
+    /// Resample by `factor` (bilinear on premultiplied alpha). Used by clients
+    /// to match the cursor to the on-screen scale of the video.
+    pub fn scaled(&self, factor: f64) -> CursorShape {
+        let (w, h) = (self.width as usize, self.height as usize);
+        let nw = ((w as f64 * factor).round() as usize).clamp(1, MAX_CURSOR_DIM as usize);
+        let nh = ((h as f64 * factor).round() as usize).clamp(1, MAX_CURSOR_DIM as usize);
+        if nw == w && nh == h {
+            return self.clone();
+        }
+        let px = |x: usize, y: usize| -> [f64; 4] {
+            let i = (y * w + x) * 4;
+            let a = self.rgba[i + 3] as f64 / 255.0;
+            [self.rgba[i] as f64 * a, self.rgba[i + 1] as f64 * a, self.rgba[i + 2] as f64 * a, a]
+        };
+        let mut rgba = Vec::with_capacity(nw * nh * 4);
+        for y in 0..nh {
+            let fy = ((y as f64 + 0.5) * h as f64 / nh as f64 - 0.5).clamp(0.0, (h - 1) as f64);
+            let (y0, ty) = (fy.floor() as usize, fy.fract());
+            let y1 = (y0 + 1).min(h - 1);
+            for x in 0..nw {
+                let fx = ((x as f64 + 0.5) * w as f64 / nw as f64 - 0.5).clamp(0.0, (w - 1) as f64);
+                let (x0, tx) = (fx.floor() as usize, fx.fract());
+                let x1 = (x0 + 1).min(w - 1);
+                let (p00, p10, p01, p11) = (px(x0, y0), px(x1, y0), px(x0, y1), px(x1, y1));
+                let mut c = [0.0; 4];
+                for (i, c) in c.iter_mut().enumerate() {
+                    let top = p00[i] * (1.0 - tx) + p10[i] * tx;
+                    let bot = p01[i] * (1.0 - tx) + p11[i] * tx;
+                    *c = top * (1.0 - ty) + bot * ty;
+                }
+                let a = c[3];
+                let un = |v: f64| if a > 1e-6 { (v / a).round().clamp(0.0, 255.0) as u8 } else { 0 };
+                rgba.extend_from_slice(&[un(c[0]), un(c[1]), un(c[2]), (a * 255.0).round().clamp(0.0, 255.0) as u8]);
+            }
+        }
+        CursorShape {
+            width: nw as u16,
+            height: nh as u16,
+            hot_x: ((self.hot_x as f64 * nw as f64 / w as f64).round() as usize).min(nw - 1) as u16,
+            hot_y: ((self.hot_y as f64 * nh as f64 / h as f64).round() as usize).min(nh - 1) as u16,
+            rgba,
+        }
+    }
+
     fn finish(w: usize, h: usize, hot: (u32, u32), rgba: Vec<u8>) -> CursorShape {
         CursorShape {
             width: w as u16,
@@ -184,6 +228,24 @@ mod tests {
         assert_eq!(px(2), [255, 255, 255, 255]); // transparent neighbour of inverted -> white rim
         assert_eq!(px(4), [255, 255, 255, 255]);
         assert_eq!(px(5), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn scaling_preserves_solid_colour_and_hotspot() {
+        let c = CursorShape { width: 4, height: 4, hot_x: 2, hot_y: 3, rgba: [10, 20, 30, 255].repeat(16) };
+        let half = c.scaled(0.5);
+        assert_eq!((half.width, half.height, half.hot_x, half.hot_y), (2, 2, 1, 1));
+        assert_eq!(half.rgba, [10, 20, 30, 255].repeat(4));
+        let double = c.scaled(2.0);
+        assert_eq!((double.width, double.height, double.hot_x, double.hot_y), (8, 8, 4, 6));
+        assert_eq!(double.rgba, [10, 20, 30, 255].repeat(64));
+        assert_eq!(c.scaled(1.0), c);
+        // transparent pixels must not darken opaque neighbours
+        let mut edge = c.clone();
+        edge.rgba[0..4].copy_from_slice(&[0, 0, 0, 0]);
+        let s = edge.scaled(0.5);
+        assert_eq!(&s.rgba[0..3], [10, 20, 30]);
+        assert!(s.rgba[3] < 255 && s.rgba[3] > 100);
     }
 
     #[test]

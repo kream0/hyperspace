@@ -14,11 +14,13 @@ pub trait Injector {
 
 /// Tracks which keys / buttons are down so they can be released on disconnect.
 #[derive(Default)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub struct HeldState {
     keys: Vec<u16>,
     buttons: u8,
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 impl HeldState {
     pub fn track(&mut self, ev: &InputEvent) {
         match *ev {

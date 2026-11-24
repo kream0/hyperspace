@@ -29,7 +29,6 @@ pub struct Options {
 pub struct Connection {
     pub sock: Arc<UdpSocket>,
     pub welcome: Welcome,
-    pub host: SocketAddr,
 }
 
 fn make_socket(host: SocketAddr) -> std::io::Result<UdpSocket> {
@@ -84,7 +83,7 @@ pub fn connect(opts: &Options) -> Result<Connection, String> {
                 if (w.chunk as usize) < 64 || w.width == 0 || w.height == 0 {
                     return Err("host sent an invalid WELCOME".into());
                 }
-                return Ok(Connection { sock: Arc::new(sock), welcome: w, host: opts.host });
+                return Ok(Connection { sock: Arc::new(sock), welcome: w });
             }
             Some(Packet::Bye(reason)) if reason != bye::UNKNOWN_SESSION => {
                 return Err(format!("host refused the connection: {}", bye::describe(reason)));
@@ -113,22 +112,21 @@ struct InputState {
     q: InputQueue,
     buf: Vec<u8>,
     last_send_us: u64,
-    sent: u64,
 }
 
 impl InputTx {
     pub fn new(sock: Arc<UdpSocket>) -> InputTx {
         InputTx {
             sock,
-            state: Mutex::new(InputState { q: InputQueue::default(), buf: Vec::with_capacity(1500), last_send_us: 0, sent: 0 }),
+            state: Mutex::new(InputState { q: InputQueue::default(), buf: Vec::with_capacity(1500), last_send_us: 0 }),
         }
     }
 
     /// Queue an event and put it on the wire immediately.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn send(&self, ev: InputEvent) {
         let mut s = self.state.lock().unwrap();
         s.q.push(ev);
-        s.sent += 1;
         Self::flush(&self.sock, &mut s);
     }
 
@@ -140,7 +138,6 @@ impl InputTx {
         let mut s = self.state.lock().unwrap();
         for ev in evs {
             s.q.push(*ev);
-            s.sent += 1;
         }
         Self::flush(&self.sock, &mut s);
     }
@@ -169,9 +166,6 @@ impl InputTx {
         self.state.lock().unwrap().q.has_unacked()
     }
 
-    pub fn total_sent(&self) -> u64 {
-        self.state.lock().unwrap().sent
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -180,11 +174,9 @@ pub struct Stats {
     pub mbps: f64,
     /// Host capture -> frame handed back by the handler (decoded + presented), ms.
     pub latency_ms: Option<f64>,
-    pub latency_max_ms: Option<f64>,
     /// Time spent inside the handler (decode + render), ms.
     pub handler_ms: f64,
     pub rtt_ms: Option<f64>,
-    pub frames_total: u64,
     pub frames_dropped: u64,
     pub nacks: u64,
     pub keyframe_requests: u64,
@@ -238,8 +230,15 @@ impl Exit {
 }
 
 /// Run until `stop` is set, the host goes away, or the socket fails. Sends BYE
-/// on the way out when the exit is ours.
-pub fn receive_loop(conn: &Connection, input: &InputTx, stop: &AtomicBool, handler: &mut dyn Handler) -> Exit {
+/// on the way out when the exit is ours. `keyframe_every_us` periodically asks
+/// the host for a keyframe (testing only).
+pub fn receive_loop(
+    conn: &Connection,
+    input: &InputTx,
+    stop: &AtomicBool,
+    handler: &mut dyn Handler,
+    keyframe_every_us: Option<u64>,
+) -> Exit {
     let sock = &*conn.sock;
     let chunk = conn.welcome.chunk as usize;
     let start = now_us();
@@ -252,6 +251,7 @@ pub fn receive_loop(conn: &Connection, input: &InputTx, stop: &AtomicBool, handl
     let mut out = Vec::with_capacity(1500);
     let mut ping_id = 0u32;
     let mut last_ping = 0u64;
+    let mut last_forced_kf = start;
     let mut last_rx = Instant::now();
     let mut timeout_ms = 0u64;
 
@@ -260,10 +260,8 @@ pub fn receive_loop(conn: &Connection, input: &InputTx, stop: &AtomicBool, handl
     let mut st_frames = 0u64;
     let mut st_bytes = 0u64;
     let mut st_lat_sum = 0u64;
-    let mut st_lat_max = 0u64;
     let mut st_lat_n = 0u64;
     let mut st_handler_sum = 0u64;
-    let mut frames_total = 0u64;
 
     let exit = loop {
         if stop.load(Ordering::Relaxed) {
@@ -285,14 +283,12 @@ pub fn receive_loop(conn: &Connection, input: &InputTx, stop: &AtomicBool, handl
                             let t0 = now_us();
                             let ok = handler.video_frame(&frame);
                             let t1 = now_us();
-                            frames_total += 1;
                             st_frames += 1;
                             st_bytes += frame.data.len() as u64;
                             st_handler_sum += t1 - t0;
                             if let Some(cap_local) = clock.peer_to_local(frame.ts_us) {
                                 let lat = t1.saturating_sub(cap_local);
                                 st_lat_sum += lat;
-                                st_lat_max = st_lat_max.max(lat);
                                 st_lat_n += 1;
                             }
                             video.recycle(frame.data);
@@ -371,6 +367,15 @@ pub fn receive_loop(conn: &Connection, input: &InputTx, stop: &AtomicBool, handl
             let _ = sock.send(&wire::ping(ping_id, now, cursor_serial));
         }
 
+        // Test hook: a static desktop produces no frames; periodic keyframe
+        // requests keep the stream flowing and exercise the IDR path.
+        if let Some(every) = keyframe_every_us {
+            if now - last_forced_kf >= every {
+                last_forced_kf = now;
+                let _ = sock.send(&wire::req_keyframe());
+            }
+        }
+
         if last_rx.elapsed() > HOST_TIMEOUT {
             break Exit::HostTimeout;
         }
@@ -382,10 +387,8 @@ pub fn receive_loop(conn: &Connection, input: &InputTx, stop: &AtomicBool, handl
                 fps: st_frames as f64 / dt,
                 mbps: st_bytes as f64 * 8.0 / dt / 1e6,
                 latency_ms: (st_lat_n > 0).then(|| ms(st_lat_sum, st_lat_n)),
-                latency_max_ms: (st_lat_n > 0).then(|| st_lat_max as f64 / 1000.0),
                 handler_ms: if st_frames > 0 { ms(st_handler_sum, st_frames) } else { 0.0 },
                 rtt_ms: clock.rtt_us().map(|r| r as f64 / 1000.0),
-                frames_total,
                 frames_dropped: video.stats.frames_dropped,
                 nacks: video.stats.nacks_sent,
                 keyframe_requests: video.stats.keyframe_requests,
@@ -394,7 +397,6 @@ pub fn receive_loop(conn: &Connection, input: &InputTx, stop: &AtomicBool, handl
             st_frames = 0;
             st_bytes = 0;
             st_lat_sum = 0;
-            st_lat_max = 0;
             st_lat_n = 0;
             st_handler_sum = 0;
         }

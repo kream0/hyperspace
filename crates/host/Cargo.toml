@@ -2,7 +2,6 @@
 name = "hyperspace-host"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
 description = "hyperspace host: captures and streams the desktop, injects remote input"
 
 [[bin]]
@@ -27,6 +26,7 @@ features = [
     "Win32_Security",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
+    "Win32_System_Ole",
     "Win32_System_Power",
     "Win32_System_Threading",
     "Win32_System_Variant",
