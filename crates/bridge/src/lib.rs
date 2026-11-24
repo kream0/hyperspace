@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use hyperspace_proto::relay;
 
-pub use client::{ClientBridge, Status};
+pub use client::{ClientBridge, LinkStats, Status};
 pub use host::HostBridge;
 pub use url::RelayUrl;
 
@@ -86,7 +86,11 @@ pub fn check(url: &str) -> Result<String, String> {
         .build()
         .map_err(|e| format!("cannot start the network runtime: {e}"))?;
     let result = rt.block_on(async {
-        let mut ws = link::open(&url).await?;
+        let mut ws = link::open(&url).await.map_err(|e| match e {
+            link::Failure::Busy => format!("the relay at {url} is busy (HTTP 503): it has as many connections as it takes"),
+            link::Failure::Unreachable(why) => why,
+            link::Failure::Refused(reason) => relay::refused::describe(reason).to_string(),
+        })?;
         let answer = match tokio::time::timeout(link::AUTH_TIMEOUT, link::challenge(&mut ws)).await {
             Ok(Ok(_nonce)) => Ok(()),
             Ok(Err(e)) => Err(e),

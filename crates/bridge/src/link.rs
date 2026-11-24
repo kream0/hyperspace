@@ -1,5 +1,5 @@
 //! One WebSocket link to the relay: connect (DNS, TCP, TLS, upgrade),
-//! authenticate, and the writer that empties the outgoing queue.
+//! authenticate, and the writer that empties the outgoing queue and pings.
 
 use std::time::Duration;
 
@@ -7,7 +7,8 @@ use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use hyperspace_proto::relay::{self, refused, Msg, Role, RoomKey};
 use tokio::net::TcpStream;
-use tokio::time::timeout;
+use tokio::time::{timeout, MissedTickBehavior};
+use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{self, Bytes, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -37,22 +38,53 @@ pub struct Timing {
     /// After a refusal that will not go away by itself, or after another host
     /// took the room.
     pub refused_wait: Duration,
-    /// The relay pings an idle link every 20 s: a link silent for this long
-    /// is dead.
+    /// The bridge pings the relay this often, whatever else it sends, so that
+    /// every proxy on the way sees traffic both ways.
+    pub ping_interval: Duration,
+    /// Nothing at all from the relay (data, ping or pong) for this long: the
+    /// link is dead, even if TCP has not noticed. The relay answers each ping
+    /// and pings every 20 s itself.
     pub idle_timeout: Duration,
     /// A link that stayed up this long resets the backoff.
     pub stable: Duration,
 }
 
-impl Default for Timing {
-    fn default() -> Timing {
+impl Timing {
+    /// The host keeps one link up for days: no hurry, and no storm of
+    /// reconnects from many hosts after a relay restart.
+    pub fn host() -> Timing {
         Timing {
             backoff_min: Duration::from_secs(1),
             backoff_max: Duration::from_secs(30),
             refused_wait: Duration::from_secs(60),
-            idle_timeout: Duration::from_secs(60),
+            ping_interval: Duration::from_secs(15),
+            idle_timeout: Duration::from_secs(35),
             stable: Duration::from_secs(30),
         }
+    }
+
+    /// The client has a live session waiting on the link: 0.25 s, 0.5 s,
+    /// 1 s, 2 s, 4 s, then every 5 s.
+    pub fn client() -> Timing {
+        Timing {
+            backoff_min: Duration::from_millis(250),
+            backoff_max: Duration::from_secs(5),
+            refused_wait: Duration::from_secs(60),
+            ping_interval: Duration::from_secs(15),
+            idle_timeout: Duration::from_secs(35),
+            stable: Duration::from_secs(10),
+        }
+    }
+}
+
+/// `35 s`, `742 s`, `0.6 s`: for log lines and close reasons.
+pub fn secs(d: Duration) -> String {
+    let s = d.as_secs_f64();
+    if s >= 10.0 {
+        format!("{s:.0} s")
+    } else {
+        let text = format!("{s:.1}");
+        format!("{} s", text.strip_suffix(".0").unwrap_or(&text))
     }
 }
 
@@ -94,22 +126,32 @@ pub fn jitter(d: Duration) -> Duration {
 pub enum Failure {
     /// DNS, TCP, TLS, HTTP or the relay protocol: one line saying which.
     Unreachable(String),
+    /// The relay answered the upgrade with HTTP 503: it has as many links as
+    /// it takes. Retried with backoff.
+    Busy,
     /// The relay answered REFUSED with this reason.
     Refused(u8),
 }
 
+impl From<String> for Failure {
+    fn from(why: String) -> Failure {
+        Failure::Unreachable(why)
+    }
+}
+
 /// DNS, TCP (each address in turn), TLS for wss://, then the WebSocket
-/// upgrade. Each step has its own timeout and its own error text.
-pub async fn open(url: &RelayUrl) -> Result<Ws, String> {
+/// upgrade. Each step has its own timeout and its own error text. Never
+/// [`Failure::Refused`].
+pub async fn open(url: &RelayUrl) -> Result<Ws, Failure> {
     let host = url.host();
     let port = url.port();
     let addrs: Vec<_> = match timeout(CONNECT_TIMEOUT, tokio::net::lookup_host((host, port))).await {
         Ok(Ok(a)) => a.collect(),
-        Ok(Err(e)) => return Err(format!("cannot resolve {host}: {e}")),
-        Err(_) => return Err(format!("cannot resolve {host}: no answer within {} s", CONNECT_TIMEOUT.as_secs())),
+        Ok(Err(e)) => return Err(format!("cannot resolve {host}: {e}").into()),
+        Err(_) => return Err(format!("cannot resolve {host}: no answer within {} s", CONNECT_TIMEOUT.as_secs()).into()),
     };
     if addrs.is_empty() {
-        return Err(format!("cannot resolve {host}: no address found"));
+        return Err(format!("cannot resolve {host}: no address found").into());
     }
     let mut last = String::new();
     let mut tcp = None;
@@ -123,7 +165,7 @@ pub async fn open(url: &RelayUrl) -> Result<Ws, String> {
             Err(_) => last = format!("cannot connect to {host} port {port} ({}): timed out", addr.ip()),
         }
     }
-    let Some(tcp) = tcp else { return Err(last) };
+    let Some(tcp) = tcp else { return Err(last.into()) };
     let _ = tcp.set_nodelay(true);
 
     let stream = if url.tls() {
@@ -132,8 +174,8 @@ pub async fn open(url: &RelayUrl) -> Result<Ws, String> {
         let connector = tokio_native_tls::TlsConnector::from(connector);
         match timeout(CONNECT_TIMEOUT, connector.connect(host, tcp)).await {
             Ok(Ok(tls)) => MaybeTlsStream::NativeTls(tls),
-            Ok(Err(e)) => return Err(format!("TLS handshake with {host} failed: {e}")),
-            Err(_) => return Err(format!("TLS handshake with {host} timed out")),
+            Ok(Err(e)) => return Err(format!("TLS handshake with {host} failed: {e}").into()),
+            Err(_) => return Err(format!("TLS handshake with {host} timed out").into()),
         }
     } else {
         MaybeTlsStream::Plain(tcp)
@@ -142,11 +184,28 @@ pub async fn open(url: &RelayUrl) -> Result<Ws, String> {
     let config = WebSocketConfig::default().max_message_size(Some(MAX_WS_MESSAGE)).max_frame_size(Some(MAX_WS_MESSAGE));
     match timeout(CONNECT_TIMEOUT, tokio_tungstenite::client_async_with_config(url.to_string(), stream, Some(config))).await {
         Ok(Ok((ws, _))) => Ok(ws),
-        Ok(Err(tungstenite::Error::Http(response))) => {
-            Err(format!("the server at {url} answered HTTP {} instead of opening a WebSocket", response.status()))
+        Ok(Err(tungstenite::Error::Http(response))) if response.status().as_u16() == 503 => Err(Failure::Busy),
+        Ok(Err(tungstenite::Error::Http(response))) => Err(format!(
+            "the server at {url} answered HTTP {} instead of opening a WebSocket",
+            response.status()
+        )
+        .into()),
+        Ok(Err(e)) => Err(format!("WebSocket upgrade with {host} failed: {e}").into()),
+        Err(_) => Err(format!("WebSocket upgrade with {host} timed out").into()),
+    }
+}
+
+/// A read error, in a line a user can act on.
+pub fn read_error(e: &tungstenite::Error) -> String {
+    match e {
+        tungstenite::Error::Protocol(ProtocolError::ResetWithoutClosingHandshake) => {
+            "the connection was cut without a close frame".into()
         }
-        Ok(Err(e)) => Err(format!("WebSocket upgrade with {host} failed: {e}")),
-        Err(_) => Err(format!("WebSocket upgrade with {host} timed out")),
+        tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => {
+            "the relay closed the connection".into()
+        }
+        tungstenite::Error::Io(e) => format!("network error: {e}"),
+        e => format!("connection to the relay failed: {e}"),
     }
 }
 
@@ -157,7 +216,7 @@ pub async fn next_binary(ws: &mut Ws) -> Result<Bytes, String> {
             Some(Ok(Message::Binary(b))) => return Ok(b),
             Some(Ok(Message::Close(frame))) => return Err(format!("the relay closed the connection{}", close_text(&frame))),
             Some(Ok(_)) => {}
-            Some(Err(e)) => return Err(format!("connection to the relay failed: {e}")),
+            Some(Err(e)) => return Err(read_error(&e)),
             None => return Err("the relay closed the connection".into()),
         }
     }
@@ -177,7 +236,7 @@ pub async fn challenge(ws: &mut Ws) -> Result<[u8; relay::NONCE_LEN], String> {
 
 /// Opens a link and authenticates as `role` in the room of `room`.
 pub async fn connect(url: &RelayUrl, room: &RoomKey, role: Role) -> Result<Ws, Failure> {
-    let mut ws = open(url).await.map_err(Failure::Unreachable)?;
+    let mut ws = open(url).await?;
     let auth = async {
         let nonce = challenge(&mut ws).await.map_err(Failure::Unreachable)?;
         let hello = Msg::Hello(room.hello(role, &nonce)).encode();
@@ -199,12 +258,21 @@ pub async fn connect(url: &RelayUrl, room: &RoomKey, role: Role) -> Result<Ws, F
     }
 }
 
-/// Writes queued messages in batches until a write fails or stalls; returns
-/// why it stopped.
-pub async fn writer(mut sink: SplitSink<Ws, Message>, rx: Rx) -> String {
+/// Writes queued messages in batches, and a ping every `ping`, until a
+/// write fails or stalls; returns why it stopped.
+pub async fn writer(mut sink: SplitSink<Ws, Message>, rx: Rx, ping: Duration) -> String {
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + ping, ping);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
-        let first = rx.recv().await;
+        // Only the waits race; whatever was taken off the queue is written.
+        let first = tokio::select! {
+            msg = rx.recv() => Some(msg),
+            _ = tick.tick() => None,
+        };
         let batch = async {
+            let Some(first) = first else {
+                return sink.send(Message::Ping(Bytes::new())).await;
+            };
             sink.feed(Message::binary(first)).await?;
             for _ in 1..BATCH {
                 match rx.try_recv() {
@@ -240,6 +308,12 @@ pub fn sanitize(s: &str) -> String {
 /// True if the close frame says another host took the room.
 pub fn is_replaced(frame: &Option<CloseFrame>) -> bool {
     matches!(frame, Some(f) if u16::from(f.code) == relay::close::REPLACED)
+}
+
+/// True if the close frame says the host let this client go (1000, sent to
+/// clients only).
+pub fn is_closed_by_host(frame: &Option<CloseFrame>) -> bool {
+    matches!(frame, Some(f) if u16::from(f.code) == relay::close::CLOSED_BY_HOST)
 }
 
 /// Errors on a UDP socket that do not mean the socket is broken: an ICMP

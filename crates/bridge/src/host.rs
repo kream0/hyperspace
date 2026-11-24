@@ -17,7 +17,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::{self, Bytes, Message};
 
-use crate::link::{self, Backoff, Failure, Quiet, Timing, Ws};
+use crate::link::{self, secs, Backoff, Failure, Quiet, Timing, Ws};
 use crate::queue::{self, Tx};
 use crate::{RelayUrl, RelayedPeers};
 
@@ -40,7 +40,7 @@ impl HostBridge {
     /// open. Fails only if the URL is invalid or the thread cannot start; the
     /// relay being down is retried for as long as the bridge lives.
     pub fn start(url: &str, key: &Key, target: SocketAddr, peers: RelayedPeers) -> Result<HostBridge, String> {
-        HostBridge::start_with(RelayUrl::parse(url)?, key, target, peers, Timing::default())
+        HostBridge::start_with(RelayUrl::parse(url)?, key, target, peers, Timing::host())
     }
 
     pub(crate) fn start_with(
@@ -88,6 +88,15 @@ enum End {
     Lost(String),
 }
 
+impl End {
+    fn why(&self) -> &str {
+        match self {
+            End::Replaced => "another host with this pairing key took the room",
+            End::Lost(why) => why,
+        }
+    }
+}
+
 async fn run(url: RelayUrl, room: RoomKey, target: SocketAddr, peers: RelayedPeers, t: Timing) {
     let mut backoff = Backoff::new(&t);
     let mut quiet = Quiet::default();
@@ -99,20 +108,18 @@ async fn run(url: RelayUrl, room: RoomKey, target: SocketAddr, peers: RelayedPee
                 quiet.clear();
                 let began = Instant::now();
                 let end = session(ws, target, &peers, &t).await;
-                if began.elapsed() >= t.stable {
+                let lived = began.elapsed();
+                if lived >= t.stable {
                     backoff.reset();
                 }
-                match end {
-                    End::Replaced => {
-                        log!("relay: another host with this pairing key is connected to the relay; retrying in {wait_secs} s");
-                        t.refused_wait
-                    }
-                    End::Lost(why) => {
-                        let wait = backoff.next();
-                        log!("relay: link lost ({why}); reconnecting in {:.1} s", wait.as_secs_f32());
-                        wait
-                    }
-                }
+                // Backs off at length when replaced, so that two hosts with
+                // one key do not take the room from each other forever.
+                let wait = match end {
+                    End::Replaced => t.refused_wait,
+                    End::Lost(_) => backoff.next(),
+                };
+                log!("relay link closed after {}: {}; reconnecting in {}", secs(lived), end.why(), secs(wait));
+                wait
             }
             Err(Failure::Refused(refused::NOT_ALLOWED)) => {
                 if quiet.changed("not allowed") {
@@ -136,6 +143,13 @@ async fn run(url: RelayUrl, room: RoomKey, target: SocketAddr, peers: RelayedPee
                 }
                 t.refused_wait
             }
+            Err(Failure::Busy) => {
+                let wait = backoff.next();
+                if quiet.changed("busy") {
+                    log!("relay: the relay at {url} is busy (HTTP 503); retrying");
+                }
+                wait
+            }
             Err(Failure::Unreachable(e)) => {
                 let wait = backoff.next();
                 if quiet.changed(&e) {
@@ -158,7 +172,7 @@ enum Event {
 async fn session(ws: Ws, target: SocketAddr, peers: &RelayedPeers, t: &Timing) -> End {
     let (sink, mut stream) = ws.split();
     let (tx, rx) = queue::queue(queue::MAX_COUNT, queue::MAX_BYTES);
-    let writer = link::writer(sink, rx);
+    let writer = link::writer(sink, rx, t.ping_interval);
     tokio::pin!(writer);
     let idle = tokio::time::sleep(t.idle_timeout);
     tokio::pin!(idle);
@@ -174,7 +188,7 @@ async fn session(ws: Ws, target: SocketAddr, peers: &RelayedPeers, t: &Timing) -
         };
         let data: Bytes = match event {
             Event::WriterDone(why) => return End::Lost(why),
-            Event::Idle => return End::Lost(format!("nothing from the relay for {} s", t.idle_timeout.as_secs())),
+            Event::Idle => return End::Lost(format!("no traffic for {}", secs(t.idle_timeout))),
             Event::Relay(Some(Ok(Message::Binary(b)))) => b,
             Event::Relay(Some(Ok(Message::Close(frame)))) => {
                 if link::is_replaced(&frame) {
@@ -186,7 +200,7 @@ async fn session(ws: Ws, target: SocketAddr, peers: &RelayedPeers, t: &Timing) -
                 idle.as_mut().reset(tokio::time::Instant::now() + t.idle_timeout);
                 continue;
             }
-            Event::Relay(Some(Err(e))) => return End::Lost(e.to_string()),
+            Event::Relay(Some(Err(e))) => return End::Lost(link::read_error(&e)),
             Event::Relay(None) => return End::Lost("the relay closed the connection".into()),
         };
         idle.as_mut().reset(tokio::time::Instant::now() + t.idle_timeout);

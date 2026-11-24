@@ -7,15 +7,18 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use hyperspace_proto::relay::{refused, RoomKey};
+use futures_util::SinkExt;
+use hyperspace_proto::relay::{self, refused, Msg, Role, RoomKey};
 use hyperspace_proto::secure::Key;
 use hyperspace_relay::{Allow, Config};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::MaybeTlsStream;
 
-use crate::link::{self, Backoff, Timing};
+use crate::link::{self, secs, Backoff, Timing};
 use crate::queue;
-use crate::{check, ClientBridge, HostBridge, RelayUrl, RelayedPeers, Status};
+use crate::{check, ClientBridge, HostBridge, LinkStats, RelayUrl, RelayedPeers, Status};
 
 /// Upper bound for anything a test waits for.
 const WAIT: Duration = Duration::from_secs(10);
@@ -28,9 +31,16 @@ fn fast() -> Timing {
         backoff_min: Duration::from_millis(50),
         backoff_max: Duration::from_millis(200),
         refused_wait: Duration::from_millis(200),
+        ping_interval: Duration::from_millis(200),
         idle_timeout: Duration::from_secs(10),
         stable: Duration::from_secs(1),
     }
+}
+
+/// Pings and a dead-link limit far shorter than the defaults (and than the
+/// relay's own 20 s pings), so a test sees whether pings keep a link up.
+fn short_idle() -> Timing {
+    Timing { ping_interval: Duration::from_millis(100), idle_timeout: Duration::from_millis(600), ..fast() }
 }
 
 /// A relay on its own runtime, so stopping it closes every link at once.
@@ -45,6 +55,10 @@ impl Relay {
     }
 
     fn start_on(addr: SocketAddr, allow: Allow) -> Relay {
+        Relay::start_with(addr, allow, |_| {})
+    }
+
+    fn start_with(addr: SocketAddr, allow: Allow, tweak: impl FnOnce(&mut Config)) -> Relay {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
         let deadline = Instant::now() + WAIT;
         // The port of a relay just stopped can take a moment to free up.
@@ -59,6 +73,7 @@ impl Relay {
         let mut config = Config::new(allow);
         config.rate = None;
         config.auth_timeout = Duration::from_secs(2);
+        tweak(&mut config);
         rt.spawn(async move {
             let _ = hyperspace_relay::serve(listener, config).await;
         });
@@ -77,6 +92,76 @@ impl Relay {
 }
 
 impl Drop for Relay {
+    fn drop(&mut self) {
+        if let Some(rt) = self.rt.take() {
+            rt.shutdown_background();
+        }
+    }
+}
+
+/// A relay that lets every link in, then goes silent: it stops reading (so
+/// pings go unanswered) and sends nothing, with TCP left open, as a relay or
+/// a proxy that hangs would. Notes when each link was let in.
+struct Silent {
+    rt: Option<tokio::runtime::Runtime>,
+    addr: SocketAddr,
+    joined: Arc<Mutex<Vec<Instant>>>,
+}
+
+impl Silent {
+    fn start() -> Silent {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let joined = Arc::new(Mutex::new(Vec::new()));
+        let log = joined.clone();
+        rt.spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(MaybeTlsStream::Plain(tcp)).await else { return };
+                    let challenge = Msg::Challenge { version: relay::VERSION, nonce: [7; relay::NONCE_LEN] };
+                    if ws.send(Message::binary(challenge.encode())).await.is_err() {
+                        return;
+                    }
+                    // The HELLO, unchecked.
+                    if link::next_binary(&mut ws).await.is_err() {
+                        return;
+                    }
+                    for msg in [Msg::Ok, Msg::Status { host_online: true }] {
+                        if ws.send(Message::binary(msg.encode())).await.is_err() {
+                            return;
+                        }
+                    }
+                    log.lock().unwrap().push(Instant::now());
+                    std::future::pending::<()>().await;
+                    drop(ws);
+                });
+            }
+        });
+        Silent { rt: Some(rt), addr, joined }
+    }
+
+    fn url(&self) -> RelayUrl {
+        RelayUrl::parse(&format!("ws://{}", self.addr)).unwrap()
+    }
+
+    fn joined(&self) -> Vec<Instant> {
+        self.joined.lock().unwrap().clone()
+    }
+
+    /// Waits for a second link, and checks it came after the first was
+    /// found dead: no sooner than the dead-link limit, and not long after.
+    fn wait_for_a_reconnect(&self, idle: Duration) {
+        wait_for("a second link", || self.joined().len() >= 2);
+        let joined = self.joined();
+        let gap = joined[1] - joined[0];
+        assert!(gap >= idle - Duration::from_millis(100), "reconnected after only {gap:?}");
+        assert!(gap < idle + Duration::from_millis(2500), "reconnected only after {gap:?}");
+    }
+}
+
+impl Drop for Silent {
     fn drop(&mut self) {
         if let Some(rt) = self.rt.take() {
             rt.shutdown_background();
@@ -203,6 +288,14 @@ fn datagrams_flow_and_peers_come_and_go() {
     echo_through(&app, s.local, b"hello");
     echo_through(&app, s.local, &[0u8; 1200]);
 
+    let stats = s.client().stats();
+    assert!(stats.connected_since.is_some_and(|t| t <= Instant::now()), "{stats:?}");
+    assert!(stats.datagrams_out >= 2 && stats.bytes_out >= 1205, "{stats:?}");
+    assert!(stats.datagrams_in >= 2 && stats.bytes_in >= 1205, "{stats:?}");
+    assert!(stats.datagrams_in <= stats.datagrams_out, "{stats:?}");
+    assert_eq!((stats.reconnects, stats.dropped, stats.discarded_while_down), (0, 0, 0), "{stats:?}");
+    assert_eq!(stats.last_close, None);
+
     // The echo saw one sender: the host bridge's loopback socket, registered
     // as a relayed peer.
     let senders = s.echo.senders();
@@ -246,7 +339,11 @@ fn oversize_datagrams_are_dropped_and_the_link_survives() {
 
     assert!(s.echo.largest() < BIG_ANSWER, "the oversize datagram reached the host");
     // Had either bridge sent it, the relay would have closed that link: the
-    // client would have seen the host go and come back (or reconnected).
+    // client would have reconnected, or seen the host go and come back.
+    let stats = s.client().stats();
+    assert_eq!(stats.reconnects, 0, "{stats:?}");
+    assert_eq!(stats.last_close, None, "{stats:?}");
+    assert!(stats.dropped >= 1, "the client's oversize datagram was not counted: {stats:?}");
     assert_eq!(s.client().hosts_seen(), hosts);
     assert_eq!(s.client().status(), Status::HostOnline);
 }
@@ -261,18 +358,150 @@ fn both_ends_reconnect_after_a_relay_restart() {
 
     relay.stop();
     wait_for("the client to notice", || matches!(s.client().status(), Status::CannotReach(_)));
+    let down = s.client().stats();
+    assert_eq!(down.connected_since, None, "{down:?}");
+    assert!(down.last_close.is_some(), "{down:?}");
+    // Sent while the link is down: discarded, and counted as such.
+    app.send_to(b"into the void", s.local).unwrap();
+    wait_for("the discarded datagram to be counted", || s.client().stats().discarded_while_down >= 1);
+
     let relay = Relay::start_on(addr, Allow::Open);
     wait_for("the host to come back", || s.client().status() == Status::HostOnline);
     echo_through(&app, s.local, b"second");
     // The new link's peer replaced the old one.
     wait_for("one peer", || s.peers.len() == 1);
+    let up = s.client().stats();
+    assert_eq!(up.reconnects, 1, "{up:?}");
+    assert!(up.connected_since.is_some(), "{up:?}");
+    // Through the same local address: a session going through it carries on.
+    assert_eq!(s.client().local_addr(), s.local);
     drop(relay);
+}
+
+#[test]
+fn pings_keep_a_quiet_link_up() {
+    // The relay pings every 20 s and drops a link after 60 s of silence;
+    // here the bridges give up after 0.6 s without traffic, so only their
+    // own pings (answered by the relay) keep the links up.
+    let relay = Relay::start(Allow::Open);
+    let key = Key::generate();
+    let echo = Echo::start();
+    let host = HostBridge::start_with(relay.url(), &key, echo.addr, RelayedPeers::new(), short_idle()).unwrap();
+    let (client, local) = ClientBridge::start_with(relay.url(), &key, short_idle()).unwrap();
+    wait_for("the client to see the host online", || client.status() == Status::HostOnline);
+    std::thread::sleep(Duration::from_secs(2));
+    let stats = client.stats();
+    assert_eq!(stats.reconnects, 0, "{stats:?}");
+    assert_eq!(stats.last_close, None, "{stats:?}");
+    // The host's link stayed up too: had it dropped, the client would have
+    // seen the host go and come back.
+    assert_eq!(client.hosts_seen(), 1);
+    assert_eq!(client.status(), Status::HostOnline);
+    echo_through(&app(), local, b"still there");
+    drop(client);
+    drop(host);
+}
+
+#[test]
+fn a_client_finds_a_silent_link_dead_and_reconnects() {
+    let relay = Silent::start();
+    let t = short_idle();
+    let (client, local) = ClientBridge::start_with(relay.url(), &Key::generate(), t).unwrap();
+    relay.wait_for_a_reconnect(t.idle_timeout);
+    wait_for("the reconnect to be counted", || client.stats().reconnects >= 1);
+    let stats = client.stats();
+    assert_eq!(stats.last_close.as_deref(), Some("no traffic for 0.6 s"), "{stats:?}");
+    // The link came back to a host that was online before the cut: the
+    // session carries on, no new handshake.
+    assert_eq!(client.hosts_seen(), 1);
+    assert_eq!(client.local_addr(), local);
+}
+
+#[test]
+fn a_host_finds_a_silent_link_dead_and_reconnects() {
+    let relay = Silent::start();
+    let t = short_idle();
+    let echo = Echo::start();
+    let host = HostBridge::start_with(relay.url(), &Key::generate(), echo.addr, RelayedPeers::new(), t).unwrap();
+    relay.wait_for_a_reconnect(t.idle_timeout);
+    drop(host);
+}
+
+#[test]
+fn a_client_the_host_closed_waits_to_be_asked() {
+    let relay = Relay::start(Allow::Open);
+    let key = Key::generate();
+    let room = RoomKey::derive(&key);
+    let url = relay.url();
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    // The host side, by hand, so the test can close the client's connection.
+    let mut host = rt.block_on(link::connect(&url, &room, Role::Host)).unwrap();
+    let peer_open = |host: &mut link::Ws| -> u32 {
+        rt.block_on(async {
+            tokio::time::timeout(WAIT, async {
+                loop {
+                    let b = link::next_binary(host).await.unwrap();
+                    if let Some(Msg::PeerOpen(id)) = Msg::decode(&b) {
+                        return id;
+                    }
+                }
+            })
+            .await
+            .expect("no PEER_OPEN from the relay")
+        })
+    };
+
+    let (client, local) = ClientBridge::start_with(url, &key, fast()).unwrap();
+    let peer = peer_open(&mut host);
+    wait_for("the client to see the host online", || client.status() == Status::HostOnline);
+    assert_eq!(client.hosts_seen(), 1);
+
+    rt.block_on(host.send(Message::binary(Msg::PeerClose(peer).encode()))).unwrap();
+    wait_for("the client to see it closed", || client.status() == Status::ClosedByHost);
+    assert!(client.status().to_string().contains("host closed"), "{}", client.status());
+    let stats = client.stats();
+    assert!(
+        stats.last_close.as_deref().is_some_and(|w| w.starts_with("the host closed this connection")),
+        "{stats:?}"
+    );
+    assert_eq!(stats.connected_since, None);
+
+    // It stays closed: no reconnect until asked.
+    let app = app();
+    app.send_to(b"hello?", local).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(client.status(), Status::ClosedByHost);
+    let stats = client.stats();
+    assert_eq!(stats.reconnects, 0, "{stats:?}");
+    assert!(stats.discarded_while_down >= 1, "{stats:?}");
+
+    client.reconnect();
+    let again = peer_open(&mut host);
+    assert_ne!(again, peer);
+    wait_for("the client to see the host again", || client.status() == Status::HostOnline);
+    assert_eq!(client.stats().reconnects, 1);
+    // The host ended the old session: this one needs a new handshake.
+    assert_eq!(client.hosts_seen(), 2);
+    drop(client);
+    drop(host);
+}
+
+#[test]
+fn a_busy_relay_is_reported_and_retried() {
+    let relay = Relay::start_with("127.0.0.1:0".parse().unwrap(), Allow::Open, |c| c.max_links = 0);
+    let (client, _) = ClientBridge::start_with(relay.url(), &Key::generate(), fast()).unwrap();
+    wait_for("the client to see the relay busy", || client.status() == Status::RelayBusy);
+    assert!(client.status().to_string().contains("busy"), "{}", client.status());
+    let err = check(&format!("ws://{}", relay.addr)).unwrap_err();
+    assert!(err.contains("busy (HTTP 503)"), "{err}");
+    assert_eq!(client.stats(), LinkStats::default());
 }
 
 #[test]
 fn a_client_whose_host_is_away_sees_it_offline() {
     let relay = Relay::start(Allow::Open);
-    let (client, local) = ClientBridge::start_with(relay.url(), &Key::generate(), fast()).unwrap();
+    let key = Key::generate();
+    let (client, local) = ClientBridge::start_with(relay.url(), &key, fast()).unwrap();
     wait_for("the host to be reported offline", || client.status() == Status::HostOffline);
     assert!(client.status().to_string().contains("offline"), "{}", client.status());
     // What the client sends meanwhile goes nowhere and breaks nothing.
@@ -281,6 +510,14 @@ fn a_client_whose_host_is_away_sees_it_offline() {
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(client.status(), Status::HostOffline);
     assert_eq!(client.hosts_seen(), 0);
+
+    // The host coming online is a host the client has no session with yet.
+    let echo = Echo::start();
+    let host = HostBridge::start_with(relay.url(), &key, echo.addr, RelayedPeers::new(), fast()).unwrap();
+    wait_for("the host to come online", || client.status() == Status::HostOnline);
+    assert_eq!(client.hosts_seen(), 1);
+    echo_through(&app, local, b"there you are");
+    drop(host);
 }
 
 #[test]
@@ -321,6 +558,10 @@ fn close_frames_are_told_apart() {
     assert!(link::is_replaced(&frame(hyperspace_proto::relay::close::REPLACED, "replaced")));
     assert!(!link::is_replaced(&frame(1000, "")));
     assert!(!link::is_replaced(&None));
+    assert!(link::is_closed_by_host(&frame(1000, "closed by the host")));
+    assert!(!link::is_closed_by_host(&frame(hyperspace_proto::relay::close::REPLACED, "replaced")));
+    assert!(!link::is_closed_by_host(&frame(1008, "refused")));
+    assert!(!link::is_closed_by_host(&None));
     assert_eq!(link::close_text(&frame(1008, "")), " (code 1008)");
     assert_eq!(link::close_text(&frame(1008, "bad\nline")), " (code 1008: bad?line)");
     assert_eq!(link::close_text(&None), "");
@@ -439,17 +680,49 @@ fn relayed_peers_compare_canonical_addresses() {
     assert!(peers.is_empty());
 }
 
+/// Within 20 % of `ms` milliseconds.
+fn about(d: Duration, ms: u64) -> bool {
+    let ms = ms as f64;
+    let got = d.as_secs_f64() * 1000.0;
+    got >= ms * 0.8 - 0.001 && got <= ms * 1.2 + 0.001
+}
+
 #[test]
-fn backoff_grows_to_its_cap_with_jitter() {
-    let t = Timing::default();
+fn the_host_backs_off_from_1_s_to_30_s() {
+    let t = Timing::host();
+    assert_eq!((t.ping_interval, t.idle_timeout), (Duration::from_secs(15), Duration::from_secs(35)));
+    assert_eq!(t.refused_wait, Duration::from_secs(60));
     let mut b = Backoff::new(&t);
-    let first = b.next();
-    assert!(first >= Duration::from_millis(800) && first <= Duration::from_millis(1200), "{first:?}");
-    for _ in 0..10 {
-        b.next();
+    for ms in [1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000] {
+        let d = b.next();
+        assert!(about(d, ms), "{d:?} is not about {ms} ms");
     }
-    let capped = b.next();
-    assert!(capped >= Duration::from_secs(24) && capped <= Duration::from_secs(36), "{capped:?}");
     b.reset();
-    assert!(b.next() <= Duration::from_millis(1200));
+    let d = b.next();
+    assert!(about(d, 1000), "{d:?}");
+}
+
+#[test]
+fn the_client_reconnects_fast_then_every_5_s() {
+    let t = Timing::client();
+    assert_eq!((t.ping_interval, t.idle_timeout), (Duration::from_secs(15), Duration::from_secs(35)));
+    let mut b = Backoff::new(&t);
+    for ms in [250, 500, 1000, 2000, 4000, 5000, 5000, 5000] {
+        let d = b.next();
+        assert!(about(d, ms), "{d:?} is not about {ms} ms");
+    }
+    b.reset();
+    let d = b.next();
+    assert!(about(d, 250), "{d:?}");
+}
+
+#[test]
+fn durations_read_well() {
+    assert_eq!(secs(Duration::from_secs(35)), "35 s");
+    assert_eq!(secs(Duration::from_secs(742)), "742 s");
+    assert_eq!(secs(Duration::from_millis(10_400)), "10 s");
+    assert_eq!(secs(Duration::from_secs(1)), "1 s");
+    assert_eq!(secs(Duration::from_millis(600)), "0.6 s");
+    assert_eq!(secs(Duration::from_millis(1500)), "1.5 s");
+    assert_eq!(secs(Duration::ZERO), "0 s");
 }
