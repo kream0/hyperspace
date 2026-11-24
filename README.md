@@ -93,7 +93,7 @@ What can still stop it:
 | Situation | What the host log says | What to do |
 | --- | --- | --- |
 | Router has UPnP switched off | "automatic port forwarding is unavailable" | Enable UPnP, or forward UDP 45800 to the PC by hand |
-| Provider uses carrier-grade NAT (no public IPv4) | "its own address is not public" | Connect over IPv6 (both ends need it), or ask the provider for a public IPv4 |
+| Provider uses carrier-grade NAT (no public IPv4) | "its own address is not public" | Connect over IPv6 (both ends need it), use a [relay](#through-a-relay), or ask the provider for a public IPv4 |
 | Windows Firewall blocks public networks | (client gets no answer) | Allow hyperspace-host for public networks |
 | Network you are on blocks UDP | (client gets no answer) | Use a [relay](#through-a-relay), or another network / tethering |
 | The Mac runs a VPN or security client (Zscaler, GlobalProtect, …) | client error names the tunnel interface | Those route all traffic through a tunnel that usually drops direct UDP. Use a device without it, or ask whoever manages it |
@@ -118,9 +118,9 @@ as on a direct path (see [Security](#security)).
 
 Direct stays first. The client tries the host's own addresses, and if none
 answers within 0.6 s the relay joins the race: whichever path answers first
-carries the session. After a session that went through the relay, the next
-connect uses the relay from the start. A relayed session takes a longer path,
-over TCP, so use a relay only when direct does not work.
+carries the session. When a relayed session is lost, the client reconnects on
+its own and tries the relay from the start. A relayed session takes a longer
+path, over TCP, so use a relay only when direct does not work.
 
 To pair through a relay:
 
@@ -210,6 +210,9 @@ A minimal systemd unit:
 ExecStart=/usr/local/bin/hyperspace-relay --allow /etc/hyperspace-relay/allow
 DynamicUser=yes
 Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
 ```
 
 Limits and timers:
