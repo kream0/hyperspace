@@ -41,7 +41,9 @@
 //! | 9    | CLIENT_DATA | client ↔ relay        | datagram                                       |
 //!
 //! Role bytes: 1 = host, 2 = client. A datagram is at most [`MAX_PAYLOAD`]
-//! bytes; anything longer does not decode.
+//! bytes; anything longer does not decode, and the relay closes a link that
+//! sends a message it cannot decode. A bridge must therefore drop an oversize
+//! datagram itself instead of sending it.
 //!
 //! # Conversation
 //!
@@ -49,8 +51,10 @@
 //!    [`RoomKey::hello`].
 //! 2. relay → peer: OK, or REFUSED and the connection closes.
 //! 3. Client: the relay sends STATUS right after OK, and again whenever the
-//!    host comes or goes. CLIENT_DATA flows both ways; datagrams sent while no
-//!    host is online are dropped.
+//!    host comes or goes. STATUS with host_online = 1 can arrive while the
+//!    host is already online: a new host replaced the old one (the client
+//!    should treat it as a new host and start a new handshake). CLIENT_DATA
+//!    flows both ways; datagrams sent while no host is online are dropped.
 //! 4. Host: the relay sends PEER_OPEN for every client already waiting and for
 //!    each one that joins later, and PEER_CLOSE when a client leaves. The host
 //!    sends HOST_DATA addressed to a peer, and PEER_CLOSE to drop a client.
@@ -60,6 +64,15 @@
 //! The relay drops datagrams when a link falls behind or a room exceeds its
 //! rate, exactly as a congested UDP path would; it never drops control
 //! messages (a link that cannot take one is closed instead).
+//!
+//! # Closing
+//!
+//! When the relay closes a link it sends a WebSocket close frame. Its code
+//! says why when it matters ([`close`]): a host closed with
+//! [`close::REPLACED`] lost its room to a newer host with the same pairing
+//! key. It must not reconnect at once (the two would take the room from each
+//! other in a loop) but back off, or stop and say so. Any other close, or a
+//! lost connection, may be followed by a reconnect.
 
 use crate::rendezvous::derive;
 use crate::secure::Key;
@@ -91,6 +104,15 @@ pub mod mt {
     pub const PEER_CLOSE: u8 = 7;
     pub const HOST_DATA: u8 = 8;
     pub const CLIENT_DATA: u8 = 9;
+}
+
+/// WebSocket close codes the relay uses beyond the standard ones (1000
+/// normal, 1008 policy after REFUSED, 1009 message too big, ...).
+pub mod close {
+    /// A newer host joined the room; reason text `"replaced"`. Back off
+    /// before reconnecting instead of taking the room back at once.
+    pub const REPLACED: u16 = 4001;
+    pub const REPLACED_REASON: &str = "replaced";
 }
 
 /// Why the relay refused a connection (the byte carried by REFUSED).
@@ -551,10 +573,25 @@ mod tests {
         let (a, b) = (Key::generate(), Key::generate());
         assert_eq!(RoomKey::derive(&a).id(), RoomKey::derive(&a).id());
         assert_ne!(RoomKey::derive(&a).id(), RoomKey::derive(&b).id());
-        // fixed vector: changing the derivation would strand every allow list
-        let fixed = RoomKey::derive(&Key::from_bytes([0; 32])).id();
-        assert_eq!(fixed, RoomKey::derive(&Key::from_bytes([0; 32])).id());
-        assert_ne!(fixed.bytes(), &[0; 32]);
+    }
+
+    /// Known answers, computed outside this code (BLAKE2s-256 of the label and
+    /// key as the Ed25519 seed, RFC 8032 public key). Changing the derivation
+    /// would strand every allow list, so these must never change.
+    #[test]
+    fn room_id_known_answers() {
+        assert_eq!(
+            RoomKey::derive(&Key::from_bytes([0; 32])).id().hex(),
+            "f7558a583c0dee0f56cf8bcfef1dc698f4790c3c06f4027fdb9610dda58b5827"
+        );
+        let mut counting = [0u8; 32];
+        for (i, b) in counting.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        assert_eq!(
+            RoomKey::derive(&Key::from_bytes(counting)).id().hex(),
+            "33eb4770427788769c5b3ada16afda4bf2d5be265a266a0bd920ac20495ad4c9"
+        );
     }
 
     #[test]

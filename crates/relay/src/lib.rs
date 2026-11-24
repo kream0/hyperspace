@@ -11,11 +11,12 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
-use std::io;
+use std::future::Future;
+use std::io::{self, Write as _};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
@@ -30,7 +31,7 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use hyperspace_proto::relay::{self as proto, mt, refused, Hello, Msg, Role, RoomId};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 
 /// Where the relay listens unless told otherwise (loopback: a reverse proxy
 /// in front of it terminates TLS).
@@ -40,8 +41,16 @@ pub const DEFAULT_LISTEN: &str = "127.0.0.1:47800";
 /// [`proto::MAX_MESSAGE`] bytes; anything bigger closes the link.
 pub const MAX_WS_MESSAGE: usize = 16 * 1024;
 
-/// Datagrams queued per link before new ones are dropped.
+/// WebSocket read buffer per connection (the library default is 128 KiB).
+const READ_BUFFER: usize = 32 * 1024;
+/// Bytes the WebSocket layer gathers before writing to the socket...
+const WRITE_BUFFER: usize = 8 * 1024;
+/// ...and the most it may hold: that plus a message, with room to spare.
+const MAX_WRITE_BUFFER: usize = WRITE_BUFFER + 2 * MAX_WS_MESSAGE;
+/// Datagrams queued per link before new ones are dropped...
 const DATA_QUEUE: usize = 256;
+/// ...and bytes queued per link before new datagrams are dropped.
+const DATA_BYTES: usize = 512 * 1024;
 /// Queue slots only control messages may use, so a link full of datagrams
 /// still gets its PEER_OPEN/PEER_CLOSE/STATUS in order.
 const CTRL_RESERVE: usize = 64;
@@ -50,9 +59,10 @@ const WRITE_BATCH: usize = 64;
 /// How long a closing link waits for the peer's half of the close handshake.
 const CLOSE_GRACE: Duration = Duration::from_secs(2);
 
-/// Write one timestamped line to stderr.
+/// Write one timestamped line to stderr. Never panics (eprintln! does when
+/// stderr is gone).
 pub fn log(args: fmt::Arguments) {
-    eprintln!("{} {}", utc(now_secs()), args);
+    let _ = writeln!(io::stderr(), "{} {}", utc(now_secs()), args);
 }
 
 macro_rules! log {
@@ -89,10 +99,11 @@ pub enum Allow {
 }
 
 /// Read an allow file: one room id (64 hex digits) per line, `#` starts a
-/// comment, blank lines are skipped. Returns the ids and the number of lines
-/// that held something else.
+/// comment, blank lines are skipped, a leading UTF-8 byte order mark is
+/// ignored. Returns the ids and the number of lines that held something else.
 pub fn read_allow_file(path: &Path) -> io::Result<(HashSet<RoomId>, usize)> {
     let text = std::fs::read_to_string(path)?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     let mut ids = HashSet::new();
     let mut bad = 0;
     for line in text.lines() {
@@ -145,12 +156,20 @@ pub struct Config {
     pub max_clients: usize,
     /// Limit for each direction of each room; None for no limit.
     pub rate: Option<Rate>,
+    /// WebSocket connections still authenticating; more are answered HTTP 503.
+    pub max_pending: usize,
+    /// WebSocket connections in all, authenticated or not; more are
+    /// answered HTTP 503.
+    pub max_links: usize,
     /// Time a new connection has to answer the challenge.
     pub auth_timeout: Duration,
     /// Interval between pings the relay sends on an idle link.
     pub ping_interval: Duration,
     /// A link that sends nothing (not even a pong) for this long is closed.
     pub idle_timeout: Duration,
+    /// A link whose peer takes longer than this to take a write (it stopped
+    /// reading) is closed.
+    pub write_timeout: Duration,
 }
 
 impl Config {
@@ -160,9 +179,12 @@ impl Config {
             max_rooms: 16,
             max_clients: 4,
             rate: Rate::from_mbit(60),
+            max_pending: 64,
+            max_links: 256,
             auth_timeout: Duration::from_secs(5),
             ping_interval: Duration::from_secs(20),
             idle_timeout: Duration::from_secs(60),
+            write_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -196,29 +218,96 @@ impl Bucket {
     }
 }
 
-/// The relay's handle on one authenticated connection.
+/// Why a room let go of a link.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Removed {
+    /// A newer host took the room.
+    Replaced,
+    /// The host closed this client.
+    ByHost,
+}
+
+/// What a link's room and its connection task share.
+#[derive(Debug, Default)]
+struct LinkState {
+    /// Bytes waiting in the queue.
+    queued: AtomicUsize,
+    /// Ends the connection at once (it could not take a control message).
+    kill: Notify,
+    /// Set just before the room drops the link.
+    removed: OnceLock<Removed>,
+}
+
+/// The room's handle on one authenticated connection.
 struct Link {
     id: u64,
     /// The only sender: dropping the Link ends the connection's writer,
     /// which closes the WebSocket.
     tx: mpsc::Sender<Bytes>,
-    /// Closes the connection at once (it could not take a control message).
-    kill: Arc<Notify>,
+    state: Arc<LinkState>,
 }
 
-/// Queue a control message. A link that cannot take one is closed rather
-/// than left with a gap in its PEER_OPEN/PEER_CLOSE/STATUS sequence.
-fn send_ctrl(link: &Link, msg: Msg) {
-    if link.tx.try_send(encode(msg)).is_err() {
-        link.kill.notify_one();
+/// The connection's end of its queue.
+struct Outbox {
+    rx: mpsc::Receiver<Bytes>,
+    state: Arc<LinkState>,
+}
+
+impl Link {
+    fn new(id: u64) -> (Link, Outbox) {
+        let (tx, rx) = mpsc::channel(DATA_QUEUE + CTRL_RESERVE);
+        let state = Arc::new(LinkState::default());
+        (Link { id, tx, state: state.clone() }, Outbox { rx, state })
+    }
+
+    /// Whether a datagram of `len` bytes would be queued: the queue is under
+    /// [`DATA_BYTES`] and its last [`CTRL_RESERVE`] slots stay free for
+    /// control messages.
+    fn fits(&self, len: usize) -> bool {
+        self.tx.capacity() > CTRL_RESERVE && self.state.queued.load(Ordering::Relaxed) + len <= DATA_BYTES
+    }
+
+    /// Queue a datagram, or drop it if the link is behind (as a congested UDP
+    /// path would). Returns whether it was queued.
+    fn send_data(&self, bytes: Bytes) -> bool {
+        self.fits(bytes.len()) && self.queue(bytes)
+    }
+
+    /// Queue a control message. A link that cannot take one is closed rather
+    /// than left with a gap in its PEER_OPEN/PEER_CLOSE/STATUS sequence.
+    fn send_ctrl(&self, msg: Msg) {
+        if !self.queue(encode(msg)) {
+            self.state.kill.notify_one();
+        }
+    }
+
+    fn queue(&self, bytes: Bytes) -> bool {
+        let len = bytes.len();
+        self.state.queued.fetch_add(len, Ordering::Relaxed);
+        if self.tx.try_send(bytes).is_ok() {
+            return true;
+        }
+        self.state.queued.fetch_sub(len, Ordering::Relaxed);
+        false
+    }
+
+    /// Let go of the link: its connection closes, telling the peer why.
+    fn remove(self, why: Removed) {
+        let _ = self.state.removed.set(why);
     }
 }
 
-/// Queue a datagram, or drop it if the link is behind (as a congested UDP
-/// path would). The last [`CTRL_RESERVE`] slots are kept for control messages.
-fn send_data(link: &Link, bytes: Bytes) {
-    if link.tx.capacity() > CTRL_RESERVE {
-        let _ = link.tx.try_send(bytes);
+impl Outbox {
+    async fn recv(&mut self) -> Option<Bytes> {
+        let b = self.rx.recv().await?;
+        self.state.queued.fetch_sub(b.len(), Ordering::Relaxed);
+        Some(b)
+    }
+
+    fn try_recv(&mut self) -> Option<Bytes> {
+        let b = self.rx.try_recv().ok()?;
+        self.state.queued.fetch_sub(b.len(), Ordering::Relaxed);
+        Some(b)
     }
 }
 
@@ -278,9 +367,23 @@ struct Shared {
     /// All rooms. Held only for short, non-async sections.
     rooms: Mutex<HashMap<RoomId, Room>>,
     next_link: AtomicU64,
+    /// Permits for connections still authenticating ([`Config::max_pending`]).
+    pending: Arc<Semaphore>,
+    /// Permits for all connections ([`Config::max_links`]).
+    links: Arc<Semaphore>,
 }
 
 impl Shared {
+    fn new(config: Config) -> Shared {
+        Shared {
+            pending: Arc::new(Semaphore::new(config.max_pending.min(Semaphore::MAX_PERMITS))),
+            links: Arc::new(Semaphore::new(config.max_links.min(Semaphore::MAX_PERMITS))),
+            config,
+            rooms: Mutex::new(HashMap::new()),
+            next_link: AtomicU64::new(1),
+        }
+    }
+
     fn rooms(&self) -> MutexGuard<'_, HashMap<RoomId, Room>> {
         self.rooms.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -318,11 +421,17 @@ impl Shared {
         for &peer in r.clients.keys() {
             first.push(encode(Msg::PeerOpen(peer)));
         }
+        // Sent even when a host was online: a new host replaces it.
         for c in r.clients.values() {
-            send_ctrl(c, Msg::Status { host_online: true });
+            c.send_ctrl(Msg::Status { host_online: true });
         }
-        // Dropping the old host's Link closes its connection.
-        let replaced = r.host.replace(link).is_some();
+        let replaced = match r.host.replace(link) {
+            Some(old) => {
+                old.remove(Removed::Replaced);
+                true
+            }
+            None => false,
+        };
         Ok((first, replaced))
     }
 
@@ -342,7 +451,7 @@ impl Shared {
         let peer = r.alloc_peer();
         let online = r.host.is_some();
         if let Some(h) = &r.host {
-            send_ctrl(h, Msg::PeerOpen(peer));
+            h.send_ctrl(Msg::PeerOpen(peer));
         }
         r.clients.insert(peer, link);
         Ok((vec![encode(Msg::Ok), encode(Msg::Status { host_online: online })], peer, online))
@@ -357,14 +466,14 @@ impl Shared {
             Seat::Host if r.host_is(id) => {
                 r.host = None;
                 for c in r.clients.values() {
-                    send_ctrl(c, Msg::Status { host_online: false });
+                    c.send_ctrl(Msg::Status { host_online: false });
                 }
                 true
             }
             Seat::Client(peer) if r.client_is(peer, id) => {
                 r.clients.remove(&peer);
                 if let Some(h) = &r.host {
-                    send_ctrl(h, Msg::PeerClose(peer));
+                    h.send_ctrl(Msg::PeerClose(peer));
                 }
                 true
             }
@@ -388,10 +497,12 @@ impl Shared {
                     return Ok(());
                 }
                 let Some(host) = &r.host else { return Ok(()) };
-                if r.to_host.as_mut().is_some_and(|b| !b.take(out.len(), Instant::now())) {
+                // Queue first: a datagram dropped for a full queue must not
+                // use up the room's rate.
+                if !host.fits(out.len()) || r.to_host.as_mut().is_some_and(|b| !b.take(out.len(), Instant::now())) {
                     return Ok(());
                 }
-                send_data(host, out);
+                host.send_data(out);
                 Ok(())
             }
             (Seat::Host, Msg::HostData { peer, payload }) => {
@@ -402,18 +513,23 @@ impl Shared {
                     return Ok(());
                 }
                 let Some(client) = r.clients.get(&peer) else { return Ok(()) };
-                if r.to_clients.as_mut().is_some_and(|b| !b.take(out.len(), Instant::now())) {
+                if !client.fits(out.len()) || r.to_clients.as_mut().is_some_and(|b| !b.take(out.len(), Instant::now())) {
                     return Ok(());
                 }
-                send_data(client, out);
+                client.send_data(out);
                 Ok(())
             }
             (Seat::Host, Msg::PeerClose(peer)) => {
                 let removed = {
                     let mut rooms = self.rooms();
                     match rooms.get_mut(&room) {
-                        // Dropping the client's Link closes its connection.
-                        Some(r) if r.host_is(id) => r.clients.remove(&peer).is_some(),
+                        Some(r) if r.host_is(id) => match r.clients.remove(&peer) {
+                            Some(client) => {
+                                client.remove(Removed::ByHost);
+                                true
+                            }
+                            None => false,
+                        },
                         _ => false,
                     }
                 };
@@ -429,7 +545,7 @@ impl Shared {
 
 /// Serve the relay on `listener` until it fails.
 pub async fn serve(listener: TcpListener, config: Config) -> io::Result<()> {
-    let shared = Arc::new(Shared { config, rooms: Mutex::new(HashMap::new()), next_link: AtomicU64::new(1) });
+    let shared = Arc::new(Shared::new(config));
     let app = Router::new().fallback(dispatch).with_state(shared);
     let listener = listener.tap_io(|tcp| {
         let _ = tcp.set_nodelay(true);
@@ -449,45 +565,101 @@ async fn dispatch(
     match (uri.path(), upgrade) {
         ("/health", _) if read => (StatusCode::OK, "hyperspace relay ok\n").into_response(),
         ("/", _) if read => {
-            let (hosts, clients) = shared.counts();
-            let text = format!(
-                "hyperspace relay {}: {hosts} host(s) online, {clients} client(s)\n",
-                env!("CARGO_PKG_VERSION")
-            );
+            let version = env!("CARGO_PKG_VERSION");
+            // Counts only for a direct local request (curl on the box), not
+            // for one that came through the reverse proxy.
+            let text = if is_local(peer, &headers) {
+                let (hosts, clients) = shared.counts();
+                format!("hyperspace relay {version}: {hosts} host(s) online, {clients} client(s)\n")
+            } else {
+                format!("hyperspace relay {version}\n")
+            };
             (StatusCode::OK, text).into_response()
         }
         (proto::PATH, Ok(upgrade)) => {
+            // Taken before upgrading: past its limits the relay answers 503
+            // and spends nothing on the connection.
+            let (Ok(slot), Ok(pending)) =
+                (shared.links.clone().try_acquire_owned(), shared.pending.clone().try_acquire_owned())
+            else {
+                return (StatusCode::SERVICE_UNAVAILABLE, "hyperspace relay busy\n").into_response();
+            };
             let from = remote_addr(peer, &headers);
             upgrade
+                .read_buffer_size(READ_BUFFER)
+                .write_buffer_size(WRITE_BUFFER)
+                .max_write_buffer_size(MAX_WRITE_BUFFER)
                 .max_message_size(MAX_WS_MESSAGE)
                 .max_frame_size(MAX_WS_MESSAGE)
-                .on_upgrade(move |ws| connection(ws, shared, from))
+                .on_upgrade(move |ws| connection(ws, shared, from, pending, slot))
         }
         _ => (StatusCode::NOT_FOUND, "not found\n").into_response(),
     }
 }
 
-/// The address to log for a connection: the proxy's X-Forwarded-For (its
-/// last entry, which the proxy itself added) when the connection comes from
-/// loopback, else the socket's peer.
+/// Whether a request came straight from this machine rather than through
+/// the reverse proxy (which adds X-Forwarded-For and X-Real-IP).
+fn is_local(peer: SocketAddr, headers: &HeaderMap) -> bool {
+    peer.ip().is_loopback() && !headers.contains_key("x-forwarded-for") && !headers.contains_key("x-real-ip")
+}
+
+/// The address to log for a connection. From loopback (the reverse proxy):
+/// X-Real-IP, else the last X-Forwarded-For entry, the one the proxy itself
+/// appended (earlier ones come from the client and prove nothing). Else, or
+/// if neither holds an address, the socket's peer.
 fn remote_addr(peer: SocketAddr, headers: &HeaderMap) -> String {
     if peer.ip().is_loopback() {
-        let forwarded = headers
-            .get_all("x-forwarded-for")
-            .iter()
-            .last()
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.rsplit(',').next())
-            .and_then(|v| v.trim().parse::<IpAddr>().ok());
-        if let Some(ip) = forwarded {
+        let header_ip = |name: &str| {
+            headers
+                .get_all(name)
+                .iter()
+                .last()
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.rsplit(',').next())
+                .and_then(|v| v.trim().parse::<IpAddr>().ok())
+        };
+        if let Some(ip) = header_ip("x-real-ip").or_else(|| header_ip("x-forwarded-for")) {
             return ip.to_string();
         }
     }
     peer.ip().to_string()
 }
 
-/// One WebSocket connection, from CHALLENGE to close.
-async fn connection(mut ws: WebSocket, shared: Arc<Shared>, from: String) {
+/// A connection's seat in its room. Dropping it, at the end of the
+/// connection or while unwinding from a panic, gives the seat back.
+struct Seated {
+    shared: Arc<Shared>,
+    room: RoomId,
+    seat: Seat,
+    id: u64,
+    /// Why the connection ended, for the log.
+    why: Option<String>,
+    /// Counts against [`Config::max_links`] until the seat is given back.
+    slot: Option<OwnedSemaphorePermit>,
+}
+
+impl Drop for Seated {
+    fn drop(&mut self) {
+        drop(self.slot.take());
+        if self.shared.leave(self.room, self.seat, self.id) {
+            let why = self.why.as_deref().unwrap_or("internal error");
+            match self.seat {
+                Seat::Host => log!("host left room {}: {why}", self.room.masked()),
+                Seat::Client(peer) => log!("client {peer} left room {}: {why}", self.room.masked()),
+            }
+        }
+    }
+}
+
+/// One WebSocket connection, from CHALLENGE to close. `pending` is held
+/// until it authenticates, `slot` for as long as it lasts.
+async fn connection(
+    mut ws: WebSocket,
+    shared: Arc<Shared>,
+    from: String,
+    pending: OwnedSemaphorePermit,
+    slot: OwnedSemaphorePermit,
+) {
     let nonce = proto::new_nonce();
     let hello = match tokio::time::timeout(shared.config.auth_timeout, challenge(&mut ws, &nonce)).await {
         Err(_) => return refuse(ws, None, refused::TIMEOUT, &from).await,
@@ -504,10 +676,9 @@ async fn connection(mut ws: WebSocket, shared: Arc<Shared>, from: String) {
         return refuse(ws, who, refused::NOT_ALLOWED, &from).await;
     }
 
-    let (tx, rx) = mpsc::channel(DATA_QUEUE + CTRL_RESERVE);
-    let kill = Arc::new(Notify::new());
     let id = shared.next_link.fetch_add(1, Ordering::Relaxed);
-    let link = Link { id, tx, kill: kill.clone() };
+    let (link, outbox) = Link::new(id);
+    let state = link.state.clone();
     let (first, seat) = match role {
         Role::Host => match shared.join_host(room, link) {
             Ok((first, replaced)) => {
@@ -527,18 +698,16 @@ async fn connection(mut ws: WebSocket, shared: Arc<Shared>, from: String) {
         },
     };
 
+    drop(pending);
+    let mut seated = Seated { shared: shared.clone(), room, seat, id, why: None, slot: Some(slot) };
+
     let (sink, stream) = ws.split();
     let why = tokio::select! {
-        why = write(sink, rx, first, shared.config.ping_interval) => why,
+        why = write(sink, outbox, first, &shared.config) => why,
         why = read(stream, &shared, room, seat, id) => why,
-        _ = kill.notified() => "too slow (its queue was full)".to_string(),
+        _ = state.kill.notified() => "too slow (its queue was full)".to_string(),
     };
-    if shared.leave(room, seat, id) {
-        match seat {
-            Seat::Host => log!("host left room {}: {why}", room.masked()),
-            Seat::Client(peer) => log!("client {peer} left room {}: {why}", room.masked()),
-        }
-    }
+    seated.why = Some(why);
 }
 
 /// Send CHALLENGE and wait for the answer. None: the peer went away first.
@@ -588,55 +757,62 @@ async fn refuse(mut ws: WebSocket, who: Option<(Role, RoomId)>, reason: u8, from
 }
 
 /// Writes everything queued for the link, plus pings. Returns when the link
-/// fails or the room drops it (then it closes the WebSocket).
-async fn write(
-    mut sink: SplitSink<WebSocket, Message>,
-    mut rx: mpsc::Receiver<Bytes>,
+/// fails or the room lets go of it (then it closes the WebSocket, saying why).
+async fn write(mut sink: SplitSink<WebSocket, Message>, mut outbox: Outbox, first: Vec<Bytes>, config: &Config) -> String {
+    if let Err(why) = pump(&mut sink, &mut outbox, first, config).await {
+        return why;
+    }
+    let (code, reason, why) = match outbox.state.removed.get() {
+        Some(Removed::Replaced) => (proto::close::REPLACED, proto::close::REPLACED_REASON, "replaced by a new host"),
+        Some(Removed::ByHost) | None => (close_code::NORMAL, "closed by the host", "closed by the host"),
+    };
+    let close = CloseFrame { code, reason: reason.into() };
+    let _ = tokio::time::timeout(CLOSE_GRACE, sink.send(Message::Close(Some(close)))).await;
+    // Leave the reader time to see the peer's close.
+    tokio::time::sleep(CLOSE_GRACE).await;
+    why.to_string()
+}
+
+/// Sends the first messages, then the queue and pings, until the room lets
+/// go of the link (Ok) or the link fails (Err, with why).
+async fn pump(
+    sink: &mut SplitSink<WebSocket, Message>,
+    outbox: &mut Outbox,
     first: Vec<Bytes>,
-    ping: Duration,
-) -> String {
-    let lost = |e: axum::Error| format!("connection lost ({e})");
+    config: &Config,
+) -> Result<(), String> {
+    let limit = config.write_timeout;
     for b in first {
-        if let Err(e) = sink.feed(Message::Binary(b)).await {
-            return lost(e);
-        }
+        within(limit, sink.feed(Message::Binary(b))).await?;
     }
-    if let Err(e) = sink.flush().await {
-        return lost(e);
-    }
+    within(limit, sink.flush()).await?;
+    let ping = config.ping_interval;
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + ping, ping);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             biased;
-            _ = tick.tick() => {
-                if let Err(e) = sink.send(Message::Ping(Bytes::new())).await {
-                    return lost(e);
-                }
-            }
-            next = rx.recv() => {
-                let Some(b) = next else {
-                    // Removed from the room (replaced, or closed by the host).
-                    let close = CloseFrame { code: close_code::NORMAL, reason: "".into() };
-                    let _ = tokio::time::timeout(CLOSE_GRACE, sink.send(Message::Close(Some(close)))).await;
-                    // Leave the reader time to see the peer's close.
-                    tokio::time::sleep(CLOSE_GRACE).await;
-                    return "removed".to_string();
-                };
-                if let Err(e) = sink.feed(Message::Binary(b)).await {
-                    return lost(e);
-                }
+            _ = tick.tick() => within(limit, sink.send(Message::Ping(Bytes::new()))).await?,
+            next = outbox.recv() => {
+                let Some(b) = next else { return Ok(()) };
+                within(limit, sink.feed(Message::Binary(b))).await?;
                 for _ in 1..WRITE_BATCH {
-                    let Ok(b) = rx.try_recv() else { break };
-                    if let Err(e) = sink.feed(Message::Binary(b)).await {
-                        return lost(e);
-                    }
+                    let Some(b) = outbox.try_recv() else { break };
+                    within(limit, sink.feed(Message::Binary(b))).await?;
                 }
-                if let Err(e) = sink.flush().await {
-                    return lost(e);
-                }
+                within(limit, sink.flush()).await?;
             }
         }
+    }
+}
+
+/// One write, bounded in time: a peer that stopped reading must not keep
+/// its seat.
+async fn within(limit: Duration, op: impl Future<Output = Result<(), axum::Error>>) -> Result<(), String> {
+    match tokio::time::timeout(limit, op).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("connection lost ({e})")),
+        Err(_) => Err("too slow (it stopped reading)".to_string()),
     }
 }
 
@@ -670,6 +846,7 @@ async fn read(mut stream: SplitStream<WebSocket>, shared: &Shared, room: RoomId,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::FutureExt;
 
     #[test]
     fn bucket_passes_its_burst_then_its_rate() {
@@ -707,8 +884,7 @@ mod tests {
     #[test]
     fn peer_ids_skip_zero_and_ids_in_use() {
         let mut room = Room::new(None);
-        let (tx, _rx) = mpsc::channel(1);
-        let link = |id| Link { id, tx: tx.clone(), kill: Arc::new(Notify::new()) };
+        let link = |id| Link::new(id).0;
         assert_eq!(room.alloc_peer(), 1);
         room.clients.insert(2, link(1));
         assert_eq!(room.alloc_peer(), 3);
@@ -726,11 +902,52 @@ mod tests {
         let text = format!("# relay allow list\n\n  {}  # the office PC\nnot an id\n{}\n", id.hex(), id.hex().to_uppercase());
         std::fs::write(&path, text).unwrap();
         let (ids, bad) = read_allow_file(&path).unwrap();
-        std::fs::remove_file(&path).unwrap();
         assert_eq!(ids.len(), 1);
         assert!(ids.contains(&id));
         assert_eq!(bad, 1);
+        // A byte order mark (as some Windows editors write) before the first id.
+        let other = RoomId::from_bytes([0xcd; 32]);
+        std::fs::write(&path, format!("\u{feff}{}\r\n{}\r\n", other.hex(), id.hex())).unwrap();
+        let (ids, bad) = read_allow_file(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!((ids.len(), bad), (2, 0));
+        assert!(ids.contains(&other) && ids.contains(&id));
         assert!(read_allow_file(&path).is_err());
+    }
+
+    #[test]
+    fn queues_are_bounded_by_count_and_bytes_with_room_for_control() {
+        let (link, mut outbox) = Link::new(1);
+        let big = Bytes::from(vec![0u8; proto::MAX_MESSAGE]);
+        let mut sent = 0;
+        while link.send_data(big.clone()) {
+            sent += 1;
+        }
+        assert_eq!(sent, DATA_BYTES / proto::MAX_MESSAGE, "bounded by bytes");
+        // Control messages still pass, and do not kill the link.
+        link.send_ctrl(Msg::PeerOpen(7));
+        assert_eq!(link.state.kill.notified().now_or_never(), None);
+        // Draining gives the bytes back.
+        let first = outbox.try_recv().unwrap();
+        assert_eq!(first.len(), proto::MAX_MESSAGE);
+        assert!(link.send_data(big.clone()));
+        while outbox.try_recv().is_some() {}
+        assert_eq!(link.state.queued.load(Ordering::Relaxed), 0);
+
+        // Small datagrams: bounded by count, keeping CTRL_RESERVE slots.
+        let small = Bytes::from_static(&[mt::CLIENT_DATA, 1, 2, 3]);
+        let mut sent = 0;
+        while link.send_data(small.clone()) {
+            sent += 1;
+        }
+        assert_eq!(sent, DATA_QUEUE, "bounded by count");
+        for _ in 0..CTRL_RESERVE {
+            link.send_ctrl(Msg::Status { host_online: true });
+        }
+        assert_eq!(link.state.kill.notified().now_or_never(), None, "the reserve takes {CTRL_RESERVE} control messages");
+        // One more has no slot: the link is killed rather than left with a gap.
+        link.send_ctrl(Msg::Status { host_online: false });
+        assert_eq!(link.state.kill.notified().now_or_never(), Some(()));
     }
 
     #[test]
@@ -745,13 +962,35 @@ mod tests {
     #[test]
     fn forwarded_for_is_trusted_from_loopback_only() {
         let mut headers = HeaderMap::new();
+        // The client sent "10.1.2.3"; the proxy appended the address it saw.
         headers.insert("x-forwarded-for", "10.1.2.3, 192.0.2.7".parse().unwrap());
         let local: SocketAddr = "127.0.0.1:5000".parse().unwrap();
         let remote: SocketAddr = "198.51.100.1:5000".parse().unwrap();
         assert_eq!(remote_addr(local, &headers), "192.0.2.7");
         assert_eq!(remote_addr(remote, &headers), "198.51.100.1");
+        // X-Real-IP, which the proxy sets outright, wins.
+        headers.insert("x-real-ip", "192.0.2.9".parse().unwrap());
+        assert_eq!(remote_addr(local, &headers), "192.0.2.9");
+        assert_eq!(remote_addr(remote, &headers), "198.51.100.1");
+        headers.insert("x-real-ip", "nonsense".parse().unwrap());
+        assert_eq!(remote_addr(local, &headers), "192.0.2.7");
         headers.insert("x-forwarded-for", "<script>".parse().unwrap());
         assert_eq!(remote_addr(local, &headers), "127.0.0.1");
         assert_eq!(remote_addr(local, &HeaderMap::new()), "127.0.0.1");
+    }
+
+    #[test]
+    fn counts_are_for_direct_local_requests_only() {
+        let local: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let v6: SocketAddr = "[::1]:5000".parse().unwrap();
+        let remote: SocketAddr = "198.51.100.1:5000".parse().unwrap();
+        assert!(is_local(local, &HeaderMap::new()));
+        assert!(is_local(v6, &HeaderMap::new()));
+        assert!(!is_local(remote, &HeaderMap::new()));
+        for name in ["x-forwarded-for", "x-real-ip"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(name, "192.0.2.7".parse().unwrap());
+            assert!(!is_local(local, &headers), "{name}");
+        }
     }
 }

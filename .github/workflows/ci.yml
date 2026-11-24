@@ -34,12 +34,25 @@ jobs:
         run: |
           RELAY=target/x86_64-unknown-linux-musl/release/hyperspace-relay
           $RELAY --version
-          if $RELAY > relay.log 2>&1; then echo "started without --allow or --open"; exit 1; fi
+          # Without --allow or --open it must refuse to start (exit 2), not hang.
+          code=0; timeout 5 $RELAY > relay.log 2>&1 || code=$?
+          if [ "$code" != 2 ]; then echo "no-argument run exited $code, expected 2"; cat relay.log; exit 1; fi
           $RELAY --open --listen 127.0.0.1:47800 > relay.log 2>&1 &
           PID=$!
           curl -fsS --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:47800/health
-          curl -fsS http://127.0.0.1:47800/
+          curl -fsS http://127.0.0.1:47800/ | tee status.txt
+          grep -q 'host(s) online' status.txt
+          # Through the reverse proxy (it adds X-Forwarded-For): no counts.
+          curl -fsS -H "X-Forwarded-For: 192.0.2.1" http://127.0.0.1:47800/ | tee status.txt
+          if grep -q 'host(s)' status.txt; then echo "counts shown to a proxied request"; exit 1; fi
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:47800/nope)" = 404
+          # A WebSocket upgrade on /v1 is accepted (101); curl then waits on
+          # the open connection until --max-time (exit 28).
+          code=0
+          status=$(curl -sS --http1.1 -o /dev/null -w "%{http_code}" --max-time 3 -H "Connection: Upgrade" -H "Upgrade: websocket" -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" http://127.0.0.1:47800/v1) || code=$?
+          echo "upgrade: HTTP $status, curl exit $code"
+          test "$status" = 101
+          test "$code" = 0 || test "$code" = 28
           kill $PID
           echo "--- relay log"; cat relay.log
       - name: Collect the Linux binaries

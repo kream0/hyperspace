@@ -40,9 +40,17 @@ fn room() -> RoomKey {
 }
 
 async fn connect(addr: SocketAddr) -> Ws {
+    try_connect(addr).await.unwrap_or_else(|status| panic!("HTTP {status} instead of an upgrade"))
+}
+
+/// Open a WebSocket, or the HTTP status the relay answered instead.
+async fn try_connect(addr: SocketAddr) -> Result<Ws, u16> {
     let url = format!("ws://{addr}{}", relay::PATH);
-    let (ws, _) = timeout(WAIT, tokio_tungstenite::connect_async(url)).await.expect("connect timed out").unwrap();
-    ws
+    match timeout(WAIT, tokio_tungstenite::connect_async(url)).await.expect("connect timed out") {
+        Ok((ws, _)) => Ok(ws),
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => Err(response.status().as_u16()),
+        Err(e) => panic!("connect failed: {e}"),
+    }
 }
 
 /// The next binary message, or None once the connection has ended.
@@ -64,6 +72,44 @@ async fn expect(ws: &mut Ws, want: Msg<'_>) {
 async fn expect_closed(ws: &mut Ws) {
     if let Some(b) = next(ws).await {
         panic!("expected the relay to close, got {:?}", Msg::decode(&b));
+    }
+}
+
+/// Code and reason of the close frame the relay sends next.
+async fn close_frame(ws: &mut Ws) -> (u16, String) {
+    loop {
+        match timeout(WAIT, ws.next()).await.expect("timed out waiting for the close") {
+            Some(Ok(Message::Close(Some(frame)))) => return (u16::from(frame.code), frame.reason.as_str().to_string()),
+            Some(Ok(Message::Binary(b))) => panic!("expected a close, got {:?}", Msg::decode(&b)),
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+            other => panic!("expected a close frame, got {other:?}"),
+        }
+    }
+}
+
+/// Queue `n` datagrams of `payload` for `peer` and flush once.
+async fn blast(host: &mut Ws, peer: u32, payload: &[u8], n: usize) {
+    for _ in 0..n {
+        host.feed(Message::binary(Msg::HostData { peer, payload }.encode())).await.unwrap();
+    }
+    host.flush().await.unwrap();
+}
+
+/// What GET / says for this many hosts and clients (to a local request).
+fn counts(hosts: usize, clients: usize) -> String {
+    format!("hyperspace relay {}: {hosts} host(s) online, {clients} client(s)\n", env!("CARGO_PKG_VERSION"))
+}
+
+/// Polls GET / until it answers `want` or [`WAIT`] runs out.
+async fn wait_for_counts(addr: SocketAddr, want: &str) {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let (_, body) = http(addr, "GET", "/").await;
+        if body == want {
+            return;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "GET / still says {body:?}, waiting for {want:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -119,10 +165,31 @@ async fn client(addr: SocketAddr, key: &RoomKey, host_online: bool) -> Ws {
     ws
 }
 
+/// A client that will stop reading. Its receive buffer is a few kilobytes,
+/// so the relay's writes to it back up soon on every platform.
+async fn slow_client(addr: SocketAddr, key: &RoomKey) -> Ws {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    let tcp = timeout(WAIT, socket.connect(addr)).await.expect("connect timed out").unwrap();
+    let url = format!("ws://{addr}{}", relay::PATH);
+    let handshake = tokio_tungstenite::client_async(url, tokio_tungstenite::MaybeTlsStream::Plain(tcp));
+    let (mut ws, _) = timeout(WAIT, handshake).await.expect("handshake timed out").unwrap();
+    let nonce = challenge(&mut ws).await;
+    send(&mut ws, Msg::Hello(key.hello(Role::Client, &nonce))).await;
+    expect(&mut ws, Msg::Ok).await;
+    expect(&mut ws, Msg::Status { host_online: true }).await;
+    ws
+}
+
 /// Status line and body of a plain HTTP/1.1 request.
 async fn http(addr: SocketAddr, method: &str, path: &str) -> (u16, String) {
+    http_with(addr, method, path, "").await
+}
+
+/// The same, with extra header lines (each ending in CRLF).
+async fn http_with(addr: SocketAddr, method: &str, path: &str, headers: &str) -> (u16, String) {
     let mut s = TcpStream::connect(addr).await.unwrap();
-    let req = format!("{method} {path} HTTP/1.1\r\nHost: relay.test\r\nConnection: close\r\n\r\n");
+    let req = format!("{method} {path} HTTP/1.1\r\nHost: relay.test\r\n{headers}Connection: close\r\n\r\n");
     s.write_all(req.as_bytes()).await.unwrap();
     let mut buf = Vec::new();
     timeout(WAIT, s.read_to_end(&mut buf)).await.expect("HTTP timed out").unwrap();
@@ -269,13 +336,160 @@ async fn a_new_host_replaces_the_old_one() {
 
     let mut new = join(addr, &key, Role::Host).await;
     expect(&mut new, Msg::PeerOpen(1)).await;
-    expect_closed(&mut old).await;
+    // What the old host sends before it reads its close is ignored: no
+    // datagram reaches the client, and it cannot close the client.
+    send(&mut old, Msg::HostData { peer: 1, payload: b"stale" }).await;
+    send(&mut old, Msg::PeerClose(1)).await;
+    // Closed with a code of its own, so it backs off instead of taking the
+    // room back.
+    assert_eq!(close_frame(&mut old).await, (relay::close::REPLACED, relay::close::REPLACED_REASON.to_string()));
     // STATUS true again tells the client a new host is there.
     expect(&mut a, Msg::Status { host_online: true }).await;
+    expect_quiet(&mut a).await;
+    expect_quiet(&mut new).await;
     send(&mut a, Msg::ClientData(b"to the new host")).await;
     expect(&mut new, Msg::HostData { peer: 1, payload: b"to the new host" }).await;
+    send(&mut new, Msg::HostData { peer: 1, payload: b"from the new host" }).await;
+    expect(&mut a, Msg::ClientData(b"from the new host")).await;
     // The old host leaving later does not take the room offline.
+    drop(old);
     expect_quiet(&mut a).await;
+}
+
+#[tokio::test]
+async fn a_client_that_stops_reading_does_not_hold_up_the_room() {
+    let mut c = config(Allow::Open);
+    c.write_timeout = Duration::from_millis(500);
+    let addr = start(c).await;
+    let key = room();
+    let mut host = join(addr, &key, Role::Host).await;
+    // Never read: the relay's writes to it pile up.
+    let _slow = slow_client(addr, &key).await;
+    expect(&mut host, Msg::PeerOpen(1)).await;
+    let mut fast = client(addr, &key, true).await;
+    expect(&mut host, Msg::PeerOpen(2)).await;
+
+    // The host floods the slow client and keeps talking to the other one,
+    // which hears every datagram meant for it, without delay, while the
+    // slow client's socket and queue fill up; then the slow client is closed.
+    let big = vec![0x5a; relay::MAX_PAYLOAD];
+    let deadline = tokio::time::Instant::now() + 4 * WAIT;
+    let mut round = 0u32;
+    let closed = loop {
+        blast(&mut host, 1, &big, 32).await;
+        let mark = round.to_le_bytes();
+        send(&mut host, Msg::HostData { peer: 2, payload: &mark }).await;
+        expect(&mut fast, Msg::ClientData(&mark)).await;
+        round += 1;
+        match timeout(Duration::from_millis(5), host.next()).await {
+            Err(_) | Ok(Some(Ok(Message::Ping(_)))) => {}
+            Ok(Some(Ok(Message::Binary(b)))) => break Msg::decode(&b) == Some(Msg::PeerClose(1)),
+            Ok(other) => panic!("host link ended: {other:?}"),
+        }
+        assert!(tokio::time::Instant::now() < deadline, "the slow client was not closed after {round} rounds");
+    };
+    assert!(closed, "expected PEER_CLOSE for the slow client");
+
+    // Its seat is free, and the room carries on.
+    assert_eq!(http(addr, "GET", "/").await, (200, counts(1, 1)));
+    send(&mut fast, Msg::ClientData(b"still here")).await;
+    expect(&mut host, Msg::HostData { peer: 2, payload: b"still here" }).await;
+    let _c = client(addr, &key, true).await;
+    expect(&mut host, Msg::PeerOpen(3)).await;
+}
+
+#[tokio::test]
+async fn a_client_that_cannot_take_a_control_message_is_closed_at_once() {
+    let mut c = config(Allow::Open);
+    // Far longer than the test: only a full queue can close the client here.
+    c.write_timeout = Duration::from_secs(300);
+    let addr = start(c).await;
+    let key = room();
+    let mut host = join(addr, &key, Role::Host).await;
+    let _slow = slow_client(addr, &key).await;
+    expect(&mut host, Msg::PeerOpen(1)).await;
+    let mut fast = client(addr, &key, true).await;
+    expect(&mut host, Msg::PeerOpen(2)).await;
+
+    // 32 MB fills the socket buffers between the relay and the slow client,
+    // then its queue up to its byte limit; the rest is dropped.
+    let big = vec![0x5a; relay::MAX_PAYLOAD];
+    for _ in 0..64 {
+        blast(&mut host, 1, &big, 64).await;
+    }
+    // Small datagrams then take every slot but the ones kept for control
+    // messages; the rest is dropped.
+    blast(&mut host, 1, b"x", 400).await;
+    // The relay handles a link's messages in order: once this reaches the
+    // other client, all of the above has been queued or dropped.
+    send(&mut host, Msg::HostData { peer: 2, payload: b"sync" }).await;
+    expect(&mut fast, Msg::ClientData(b"sync")).await;
+    // Each new host sends STATUS to every client. The reserve takes 64; the
+    // next one cannot be queued, and the slow client is closed rather than
+    // left with a gap in its STATUS sequence.
+    let started = tokio::time::Instant::now();
+    for _ in 0..80 {
+        host = join(addr, &key, Role::Host).await;
+    }
+    wait_for_counts(addr, &counts(1, 1)).await;
+    assert!(started.elapsed() < Duration::from_secs(60), "closed by a timeout, not at once");
+
+    // The other client kept up: it has every STATUS, and still gets data.
+    send(&mut host, Msg::HostData { peer: 2, payload: b"still here" }).await;
+    let mut statuses = 0;
+    loop {
+        let b = next(&mut fast).await.expect("the other client was closed");
+        match Msg::decode(&b) {
+            Some(Msg::Status { host_online: true }) => statuses += 1,
+            Some(Msg::ClientData(b"still here")) => break,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(statuses, 80);
+}
+
+#[tokio::test]
+async fn connections_past_the_limits_are_answered_503() {
+    let mut c = config(Allow::Open);
+    c.max_pending = 2;
+    c.max_links = 3;
+    c.auth_timeout = Duration::from_secs(60);
+    let addr = start(c).await;
+    let key = room();
+
+    // Two connections still authenticating: a third must wait.
+    let mut a = connect(addr).await;
+    let nonce_a = challenge(&mut a).await;
+    let mut b = connect(addr).await;
+    let nonce_b = challenge(&mut b).await;
+    assert_eq!(try_connect(addr).await.err(), Some(503), "pending limit");
+
+    // Authenticating frees the pending slot, not the link slot.
+    send(&mut a, Msg::Hello(key.hello(Role::Host, &nonce_a))).await;
+    expect(&mut a, Msg::Ok).await;
+    let mut c3 = connect(addr).await;
+    challenge(&mut c3).await;
+    send(&mut b, Msg::Hello(key.hello(Role::Client, &nonce_b))).await;
+    expect(&mut b, Msg::Ok).await;
+    expect(&mut b, Msg::Status { host_online: true }).await;
+    assert_eq!(try_connect(addr).await.err(), Some(503), "link limit");
+
+    // A link that ends gives its slot back.
+    drop(b);
+    expect(&mut a, Msg::PeerOpen(1)).await;
+    expect(&mut a, Msg::PeerClose(1)).await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let mut d = loop {
+        match try_connect(addr).await {
+            Ok(ws) => break ws,
+            Err(status) => assert_eq!(status, 503),
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no slot was given back");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    challenge(&mut d).await;
+    // And the relay still answers plain HTTP while full.
+    assert_eq!(http(addr, "GET", "/health").await.0, 200);
 }
 
 #[tokio::test]
@@ -519,7 +733,7 @@ async fn http_endpoints() {
     let addr = start(config(Allow::Open)).await;
     assert_eq!(http(addr, "GET", "/health").await, (200, "hyperspace relay ok\n".to_string()));
     let version = env!("CARGO_PKG_VERSION");
-    let status = |h: usize, c: usize| -> (u16, String) { (200, format!("hyperspace relay {version}: {h} host(s) online, {c} client(s)\n")) };
+    let status = |h: usize, c: usize| -> (u16, String) { (200, counts(h, c)) };
     assert_eq!(http(addr, "GET", "/").await, status(0, 0));
 
     let key = room();
@@ -528,6 +742,12 @@ async fn http_endpoints() {
     let _b = client(addr, &room(), false).await;
     expect(&mut host, Msg::PeerOpen(1)).await;
     assert_eq!(http(addr, "GET", "/").await, status(1, 2));
+
+    // Through the reverse proxy: the version only, no counts.
+    let plain = (200, format!("hyperspace relay {version}\n"));
+    assert_eq!(http_with(addr, "GET", "/", "X-Forwarded-For: 192.0.2.7\r\n").await, plain);
+    assert_eq!(http_with(addr, "GET", "/", "X-Real-IP: 192.0.2.7\r\n").await, plain);
+    assert_eq!(http_with(addr, "HEAD", "/", "X-Real-IP: 192.0.2.7\r\n").await.0, 200);
 
     assert_eq!(http(addr, "GET", "/nope").await.0, 404);
     assert_eq!(http(addr, "GET", "/v1").await.0, 404, "no upgrade");
