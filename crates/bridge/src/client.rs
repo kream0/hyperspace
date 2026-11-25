@@ -332,7 +332,7 @@ enum End {
     Lost(String),
     /// The host closed this client's connection: wait for a reconnect call.
     ByHost(String),
-    /// The local socket failed: the bridge stops.
+    /// The local socket failed: the bridge stops, and closes the link first.
     Fatal(String),
 }
 
@@ -477,8 +477,9 @@ enum Event {
 }
 
 /// One link that is up, until it ends, or None: until the bridge is
-/// dropped, and then the link is closed. `host_online` is whether the host
-/// was online when the last link ended, and is kept up to date.
+/// dropped. The link is closed the clean way then, and when the bridge
+/// stops on a failure of its own. `host_online` is whether the host was
+/// online when the last link ended, and is kept up to date.
 async fn session(
     ws: Ws,
     local: &mut Local,
@@ -489,8 +490,11 @@ async fn session(
 ) -> Option<End> {
     let (mut sink, mut stream) = ws.split();
     let end = carry(&mut sink, &mut stream, local, shared, t, host_online, stop).await;
-    if end.is_none() {
-        link::close(&mut sink, &mut stream).await;
+    match &end {
+        // The relay is still there: say goodbye (a second at most).
+        None | Some(End::Fatal(_)) => link::close(&mut sink, &mut stream).await,
+        // The link is gone, or the host closed it.
+        Some(End::Lost(_) | End::ByHost(_)) => {}
     }
     end
 }
