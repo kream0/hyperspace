@@ -183,10 +183,10 @@ fn why_unreachable(sock: &UdpSocket, addr: SocketAddr, relay_set: bool) -> Strin
 /// a tunnel interface (`iface`). Without a relay, it points to one.
 fn through_tunnel(iface: &str, relay_set: bool) -> String {
     let advice = if relay_set {
-        "try from a network or device without it, or ask whoever manages it"
+        "if the relay is blocked as well, this network does not allow the session; its administrators decide what \
+         it lets through"
     } else {
-        "the host's relay (--relay URL) carries the session over HTTPS instead, or try from a network or device \
-         without it"
+        "the host's relay (--relay URL) carries the session over HTTPS instead"
     };
     format!(
         "traffic to this public address leaves through {iface} - a VPN or security client - which commonly blocks \
@@ -900,14 +900,14 @@ mod tests {
         assert_eq!(
             without,
             "traffic to this public address leaves through utun4 - a VPN or security client - which commonly blocks \
-             direct UDP like this; the host's relay (--relay URL) carries the session over HTTPS instead, or try from \
-             a network or device without it"
+             direct UDP like this; the host's relay (--relay URL) carries the session over HTTPS instead"
         );
         let with = through_tunnel("utun4", true);
         assert_eq!(
             with,
             "traffic to this public address leaves through utun4 - a VPN or security client - which commonly blocks \
-             direct UDP like this; try from a network or device without it, or ask whoever manages it"
+             direct UDP like this; if the relay is blocked as well, this network does not allow the session; its \
+             administrators decide what it lets through"
         );
         for line in [&without, &with] {
             assert!(!line.contains("e.g."), "{line}");
