@@ -29,6 +29,13 @@ const UDP_BUFFER: usize = 1 << 20;
 /// Refusals that usually clear up soon (TIMEOUT, ROOM_FULL, RELAY_FULL) are
 /// retried with the backoff this many times in a row, then slowly.
 const QUICK_RETRIES: u32 = 5;
+/// How long the line saying that a host which was online went offline waits
+/// before it is printed (the status changes at once). A host that ends the
+/// session goes offline at the relay right after its goodbye, and a client
+/// that is exiting closes the link within this time: printed then, the line
+/// would read like the start of a reconnect. Longer than the client's pause
+/// before it closes the link after a relayed session.
+const OFFLINE_LINE_HOLD: Duration = Duration::from_secs(1);
 
 /// Where the link to the relay stands, in words a user can act on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,6 +136,9 @@ struct Shared {
     /// Calls to [`ClientBridge::reconnect`], and the wakeup for them.
     reconnects_asked: AtomicU64,
     reconnect: Notify,
+    /// The status lines printed, for the tests.
+    #[cfg(test)]
+    lines: Mutex<Vec<String>>,
 }
 
 impl Shared {
@@ -144,9 +154,16 @@ impl Shared {
     fn set(&self, status: Status) {
         let mut s = self.lock_status();
         if *s != status {
-            log!("relay: {status}");
+            self.note(&status);
             *s = status;
         }
+    }
+
+    /// Logs a status line.
+    fn note(&self, status: &Status) {
+        log!("relay: {status}");
+        #[cfg(test)]
+        self.lines.lock().unwrap_or_else(|e| e.into_inner()).push(format!("relay: {status}"));
     }
 
     /// Sets the status without a log line (the caller logged why).
@@ -215,6 +232,8 @@ impl ClientBridge {
             counters: Counters::default(),
             reconnects_asked: AtomicU64::new(0),
             reconnect: Notify::new(),
+            #[cfg(test)]
+            lines: Mutex::new(Vec::new()),
         });
         let room = RoomKey::derive(key);
         let (stop, stopped) = watch::channel(());
@@ -231,6 +250,12 @@ impl ClientBridge {
 
     pub fn status(&self) -> Status {
         self.shared.lock_status().clone()
+    }
+
+    /// The status lines printed so far.
+    #[cfg(test)]
+    pub(crate) fn status_lines(&self) -> Vec<String> {
+        self.shared.lines.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Rises each time the relay reports a host the client may not have a
@@ -472,6 +497,8 @@ enum Event {
     Local(io::Result<(usize, SocketAddr)>),
     WriterDone(String),
     Idle,
+    /// The held line saying the host went offline is due.
+    OfflineLine,
     /// The bridge was dropped.
     Stop,
 }
@@ -517,19 +544,29 @@ async fn carry(
     tokio::pin!(idle);
     let counters = &shared.counters;
     let mut first_status = true;
+    // The line saying the host went offline, while it waits.
+    let held = tokio::time::sleep(OFFLINE_LINE_HOLD);
+    tokio::pin!(held);
+    let mut holding = false;
 
-    loop {
+    let end = loop {
         let event = tokio::select! {
             why = &mut writer => Event::WriterDone(why),
             _ = &mut idle => Event::Idle,
+            _ = &mut held, if holding => Event::OfflineLine,
             _ = link::stopped(stop) => Event::Stop,
             msg = stream.next() => Event::Relay(msg),
             r = local.sock.recv_from(&mut local.buf) => Event::Local(r),
         };
         match event {
-            Event::Stop => return None,
-            Event::WriterDone(why) => return Some(End::Lost(why)),
-            Event::Idle => return Some(End::Lost(format!("no traffic for {}", secs(t.idle_timeout)))),
+            // The client is done with the link: a held line goes unsaid.
+            Event::Stop => break None,
+            Event::WriterDone(why) => break Some(End::Lost(why)),
+            Event::Idle => break Some(End::Lost(format!("no traffic for {}", secs(t.idle_timeout)))),
+            Event::OfflineLine => {
+                holding = false;
+                shared.note(&Status::HostOffline);
+            }
             Event::Local(Ok((_, from))) if !local.is_app(from) => bump(&counters.dropped, 1),
             Event::Local(Ok((n, _))) => {
                 // Over the relay's limit: dropped, as on a path with a smaller
@@ -542,20 +579,20 @@ async fn carry(
                 }
             }
             Event::Local(Err(e)) if link::transient(&e) => {}
-            Event::Local(Err(e)) => return Some(End::Fatal(format!("the local UDP socket failed: {}", errors::plain(e)))),
+            Event::Local(Err(e)) => break Some(End::Fatal(format!("the local UDP socket failed: {}", errors::plain(e)))),
             Event::Relay(msg) => {
                 idle.as_mut().reset(tokio::time::Instant::now() + t.idle_timeout);
                 let data = match msg {
                     Some(Ok(Message::Binary(b))) => b,
                     Some(Ok(Message::Close(frame))) if link::is_closed_by_host(&frame) => {
-                        return Some(End::ByHost(format!("the host closed this connection{}", link::close_text(&frame))))
+                        break Some(End::ByHost(format!("the host closed this connection{}", link::close_text(&frame))))
                     }
                     Some(Ok(Message::Close(frame))) => {
-                        return Some(End::Lost(format!("the relay closed the connection{}", link::close_text(&frame))))
+                        break Some(End::Lost(format!("the relay closed the connection{}", link::close_text(&frame))))
                     }
                     Some(Ok(_)) => continue,
-                    Some(Err(e)) => return Some(End::Lost(link::read_error(&e))),
-                    None => return Some(End::Lost("the relay closed the connection".into())),
+                    Some(Err(e)) => break Some(End::Lost(link::read_error(&e))),
+                    None => break Some(End::Lost("the relay closed the connection".into())),
                 };
                 match Msg::decode(&data) {
                     Some(Msg::ClientData(payload)) => {
@@ -576,16 +613,35 @@ async fn carry(
                         }
                         first_status = false;
                         *host_online = true;
+                        // The host came back within the hold: both lines, in order.
+                        if std::mem::take(&mut holding) {
+                            shared.note(&Status::HostOffline);
+                        }
                         shared.set(Status::HostOnline);
                     }
                     Some(Msg::Status { host_online: false }) => {
                         first_status = false;
                         *host_online = false;
-                        shared.set(Status::HostOffline);
+                        let mut status = shared.lock_status();
+                        if *status == Status::HostOnline {
+                            // Said later, unless the client closes the link first.
+                            *status = Status::HostOffline;
+                            drop(status);
+                            holding = true;
+                            held.as_mut().reset(tokio::time::Instant::now() + OFFLINE_LINE_HOLD);
+                        } else {
+                            drop(status);
+                            shared.set(Status::HostOffline);
+                        }
                     }
                     _ => {}
                 }
             }
         }
+    };
+    // The link ended by itself: a held line comes before the line saying so.
+    if end.is_some() && holding {
+        shared.note(&Status::HostOffline);
     }
+    end
 }
