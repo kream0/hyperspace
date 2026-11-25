@@ -576,6 +576,17 @@ fn network_error(e: &std::io::Error) -> String {
     format!("network error: {}", clause(&plain_error(e)))
 }
 
+/// The video and cursor reassemblers of a new session, relayed or not. A
+/// session keeps its path: a switch between direct and relay is a new
+/// connect, so a new session with new reassemblers.
+fn reassemblers(chunk: usize, relayed: bool, now: u64) -> (Reassembler, Reassembler) {
+    let mut video = Reassembler::new(pt::VIDEO, chunk, now);
+    let mut cursor = Reassembler::new(pt::CURSOR, chunk, now);
+    video.set_relayed(relayed);
+    cursor.set_relayed(relayed);
+    (video, cursor)
+}
+
 /// Run until `stop` is set, the host goes away, or the socket fails. Sends BYE
 /// on the way out when the exit is ours. `keyframe_every_us` periodically asks
 /// the host for a keyframe, and `cut_after` ends the session without a
@@ -598,12 +609,7 @@ fn receive_loop(
     let (mut prev_dropped, mut prev_nacks) = (0u64, 0u64);
     let (mut st_delay_sum, mut st_delay_min, mut st_delay_n) = (0u64, u64::MAX, 0u64);
     let start = now_us();
-    let mut video = Reassembler::new(pt::VIDEO, chunk, start);
-    let mut cursor = Reassembler::new(pt::CURSOR, chunk, start);
-    // A session keeps its path: a switch between direct and relay is a new
-    // connect, so a new session with new reassemblers.
-    video.set_relayed(conn.relayed);
-    cursor.set_relayed(conn.relayed);
+    let (mut video, mut cursor) = reassemblers(chunk, conn.relayed, start);
     let mut cursor_serial = 0u32;
     let mut cursor_visible = true;
     let mut clock = ClockSync::default();
@@ -1027,5 +1033,30 @@ mod tests {
         s.relayed = true;
         let line = s.summary();
         assert!(line.ends_with("  duplicates 7  via relay"), "{line}");
+    }
+
+    #[test]
+    fn a_relayed_session_makes_relayed_reassemblers() {
+        use hyperspace_proto::frag::Fragmenter;
+        // The first of two fragments, then 5 ms of silence: direct, the other
+        // one is asked for; through the relay, not yet.
+        for relayed in [false, true] {
+            let (mut video, mut cursor) = reassemblers(100, relayed, 0);
+            for (r, kind) in [(&mut video, pt::VIDEO), (&mut cursor, pt::CURSOR)] {
+                let mut first = Vec::new();
+                Fragmenter::default().send_all(kind, wire::FLAG_KEYFRAME, 0, 0, &[7u8; 150], 100, |d| {
+                    if first.is_empty() {
+                        first = d.to_vec();
+                    }
+                });
+                let Some(Packet::Frag(h, payload)) = wire::parse(&first) else {
+                    panic!("not a fragment");
+                };
+                r.push(&h, payload, 1000);
+                let mut asks = 0;
+                r.poll(6000, |_| asks += 1);
+                assert_eq!(asks, if relayed { 0 } else { 1 }, "kind {kind}, relayed {relayed}");
+            }
+        }
     }
 }

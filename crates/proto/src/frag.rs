@@ -28,6 +28,10 @@ const RELAYED_SILENCE_US: u64 = 300_000;
 const RELAYED_RENACK_US: u64 = 300_000;
 /// Least time from a frame's first request to giving up on it: the repeat at 300 ms has 400 ms to come back.
 const RELAYED_GIVE_UP_US: u64 = 700_000;
+/// Least time before a keyframe is asked for again, counted from the last request or from the
+/// last keyframe fragment to arrive: the host makes a new keyframe for every request, so asking
+/// while one is still coming through only adds another.
+const RELAYED_KEYFRAME_REASK_US: u64 = 700_000;
 
 #[inline]
 pub fn frag_count(len: usize, chunk: usize) -> usize {
@@ -220,9 +224,11 @@ impl Reassembler {
     /// The fragments come through the relay: in order, but late while its
     /// TCP stream stalls. A gap is still asked for at once, but silence is
     /// given `RELAYED_SILENCE_US` before a frame's tail is asked for, a
-    /// fragment is not asked for again within `RELAYED_RENACK_US`, and a
-    /// frame is not given up within `RELAYED_GIVE_UP_US`. Set it before the
-    /// first fragment: a session keeps one path.
+    /// fragment is not asked for again within `RELAYED_RENACK_US`, a frame
+    /// is not given up within `RELAYED_GIVE_UP_US`, and a keyframe is not
+    /// asked for again within `RELAYED_KEYFRAME_REASK_US` of the last request
+    /// or of the last keyframe fragment to arrive. Set it before the first
+    /// fragment: a session keeps one path.
     pub fn set_relayed(&mut self, relayed: bool) {
         self.relayed = relayed;
     }
@@ -254,7 +260,12 @@ impl Reassembler {
     }
 
     fn kf_interval_us(&self) -> u64 {
-        (4 * self.rtt_us).clamp(100_000, 500_000)
+        let us = (4 * self.rtt_us).clamp(100_000, 500_000);
+        if self.relayed {
+            us.max(RELAYED_KEYFRAME_REASK_US)
+        } else {
+            us
+        }
     }
 
     /// Return a frame buffer for reuse.
@@ -380,6 +391,11 @@ impl Reassembler {
         p.max_idx = p.max_idx.max(idx as u32);
         p.last_rx_us = now_us;
         p.data[idx * chunk..idx * chunk + payload.len()].copy_from_slice(payload);
+        // Relayed, a keyframe still coming through is not asked for again:
+        // each of its fragments restarts the wait.
+        if self.relayed && self.need_key && is_key {
+            self.last_kf_req_us = now_us;
+        }
     }
 
     fn take(&mut self, pos: usize) -> Frame {
@@ -484,6 +500,11 @@ impl Reassembler {
             if p.first_nack_us == 0 {
                 p.first_nack_us = now_us;
             }
+            // Every request restarts the repeat, a soon-path one (relayed) too:
+            // a new gap puts off the repeat of the older ones. Repeating them
+            // sooner would ask again for what a stall still holds; the cost is
+            // that an early gap whose resent fragment is lost as well can wait
+            // for the give-up.
             p.last_nack_us = now_us;
             p.asked_upto = asked;
             self.stats.nacks_sent += 1;
@@ -772,58 +793,69 @@ mod tests {
 
     #[test]
     fn random_loss_with_retransmit_always_converges() {
-        // Simulated link: 10% loss on first transmission and on retransmits.
-        let mut s = 99u32;
-        let mut rnd = move || {
-            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
-            (s >> 8) % 100
-        };
-        let mut r = Reassembler::new(pt::VIDEO, CHUNK, 0);
-        r.set_rtt_us(1000);
-        let total = 300u32;
-        let mut sent: Vec<(bool, usize)> = Vec::new();
-        let mut delivered = Vec::new();
-        let mut now = 0u64;
-        let mut force_key = true;
-        let mut id = 0u32;
-        while id < total || r.busy() {
-            if id < total {
-                let len = 150 + (id as usize * 37) % 900;
-                sent.push((force_key, len));
-                for d in dgrams(id, force_key, len) {
-                    if rnd() >= 10 {
-                        feed(&mut r, &d, now);
-                    }
-                }
-                force_key = false;
-                id += 1;
-            }
-            for _ in 0..8 {
-                now += 2000;
-                let (nacks, kf) = collect_actions(&mut r, now);
-                if kf {
-                    force_key = true;
-                }
-                for (fid, frags) in nacks {
-                    let (key, len) = sent[fid as usize];
-                    let ds = dgrams(fid, key, len);
-                    let idxs: Vec<usize> =
-                        if frags.is_empty() { (0..ds.len()).collect() } else { frags.iter().map(|&f| f as usize).collect() };
-                    for i in idxs {
+        // Simulated link: 10% loss on first transmission and on retransmits,
+        // direct and through the relay (the same random sequence for both).
+        for relayed in [false, true] {
+            let mut s = 99u32;
+            let mut rnd = move || {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                (s >> 8) % 100
+            };
+            let mut r = Reassembler::new(pt::VIDEO, CHUNK, 0);
+            r.set_relayed(relayed);
+            r.set_rtt_us(1000);
+            let total = 300u32;
+            let mut sent: Vec<(bool, usize)> = Vec::new();
+            let mut delivered = Vec::new();
+            let mut now = 0u64;
+            let mut force_key = true;
+            let mut id = 0u32;
+            while id < total || r.busy() {
+                if id < total {
+                    let len = 150 + (id as usize * 37) % 900;
+                    sent.push((force_key, len));
+                    for d in dgrams(id, force_key, len) {
                         if rnd() >= 10 {
-                            feed(&mut r, &ds[i], now);
+                            feed(&mut r, &d, now);
                         }
                     }
+                    force_key = false;
+                    id += 1;
                 }
-                delivered.extend(pop_ids(&mut r));
+                for _ in 0..8 {
+                    now += 2000;
+                    let (nacks, kf) = collect_actions(&mut r, now);
+                    if kf {
+                        force_key = true;
+                    }
+                    for (fid, frags) in nacks {
+                        let (key, len) = sent[fid as usize];
+                        let ds = dgrams(fid, key, len);
+                        let idxs: Vec<usize> = if frags.is_empty() {
+                            (0..ds.len()).collect()
+                        } else {
+                            frags.iter().map(|&f| f as usize).collect()
+                        };
+                        for i in idxs {
+                            if rnd() >= 10 {
+                                feed(&mut r, &ds[i], now);
+                            }
+                        }
+                    }
+                    delivered.extend(pop_ids(&mut r));
+                }
+                if now > 60_000_000 {
+                    panic!("did not converge (relayed: {relayed})");
+                }
             }
-            if now > 60_000_000 {
-                panic!("did not converge");
-            }
+            // strictly increasing, and (with repair) nearly everything arrives
+            assert!(delivered.windows(2).all(|w| w[0] < w[1]), "relayed: {relayed}");
+            assert!(
+                delivered.len() as u32 > total * 9 / 10,
+                "relayed: {relayed}, only {} of {total}",
+                delivered.len()
+            );
         }
-        // strictly increasing, and (with repair) nearly everything arrives
-        assert!(delivered.windows(2).all(|w| w[0] < w[1]));
-        assert!(delivered.len() as u32 > total * 9 / 10, "only {} of {total}", delivered.len());
     }
 
     #[test]
@@ -846,6 +878,11 @@ mod tests {
         // ...and the frame is given up 3 RTT + 15 ms after the first request.
         assert!(!collect_actions(&mut r, 35_001).1);
         assert!(collect_actions(&mut r, 35_002).1);
+        // The keyframe is asked for again 4 RTT later, at least 100 ms, even
+        // while one is coming in.
+        feed(&mut r, &dgrams(2, true, 200)[0], 100_000);
+        assert!(!collect_actions(&mut r, 135_001).1);
+        assert!(collect_actions(&mut r, 135_002).1);
     }
 
     /// A relayed reassembler that delivered keyframe 0 at time 0.
@@ -966,5 +1003,59 @@ mod tests {
             ]
         );
         assert!(r.waiting_for_keyframe());
+    }
+
+    /// The times of the keyframe requests among `polled`.
+    fn keyframe_asks(polled: Polled) -> Vec<u64> {
+        polled.into_iter().filter(|p| p.2).map(|p| p.0).collect()
+    }
+
+    /// `relayed()`, then frame 1 lost and given up on: one keyframe request,
+    /// at 702 ms.
+    fn relayed_after_give_up() -> Reassembler {
+        let mut r = relayed();
+        for d in dgrams(2, false, 100) {
+            feed(&mut r, &d, 1000);
+        }
+        assert_eq!(keyframe_asks(poll_every_ms(&mut r, 1000, 702_000)), vec![702_000]);
+        assert!(r.waiting_for_keyframe());
+        r
+    }
+
+    #[test]
+    fn relayed_keyframe_coming_through_is_not_asked_for_again() {
+        let mut r = relayed_after_give_up();
+        // The keyframe takes 1 s to come through: 21 fragments, 50 ms apart.
+        let k = dgrams(3, true, 2100);
+        let mut polled = Polled::new();
+        let mut t = 703_000;
+        for (i, d) in k.iter().enumerate() {
+            let at = 750_000 + i as u64 * 50_000;
+            polled.extend(poll_every_ms(&mut r, t, at - 1000));
+            feed(&mut r, d, at);
+            t = at;
+        }
+        assert_eq!(t, 1_750_000);
+        // No request for it again, nor for any of its fragments: none is
+        // missing, and 50 ms is no silence through the relay.
+        assert!(polled.is_empty(), "{polled:?}");
+        assert_eq!(pop_ids(&mut r), vec![3]);
+        let after = poll_every_ms(&mut r, 1_750_000, 2_500_000);
+        assert!(after.is_empty(), "{after:?}");
+        assert_eq!(r.stats.keyframe_requests, 1);
+    }
+
+    #[test]
+    fn relayed_keyframe_is_asked_for_again_after_700_ms_without_a_fragment() {
+        let mut r = relayed_after_give_up();
+        // Nothing comes: one more request, 700 ms after the first.
+        assert_eq!(poll_every_ms(&mut r, 703_000, 1_499_000), vec![(1_402_000, vec![], true)]);
+        // A keyframe fragment restarts the wait: the next request comes 700 ms
+        // after it, not after the last request (the rest of the keyframe is
+        // asked for meanwhile).
+        let k = dgrams(3, true, 2000);
+        feed(&mut r, &k[0], 1_500_000);
+        assert_eq!(keyframe_asks(poll_every_ms(&mut r, 1_500_000, 2_300_000)), vec![2_200_000]);
+        assert_eq!(r.stats.keyframe_requests, 3);
     }
 }

@@ -96,8 +96,9 @@ struct Stats {
     latency_max_us: AtomicU64,
 }
 
-/// Keyframes sent, and what the client asked for to repair the stream, as
-/// the 5-second line shows them.
+/// Keyframes sent, and what the client asked for to repair the stream: the
+/// 5-second line shows them with their rise, the line that closes the
+/// session their totals.
 #[derive(Clone, Copy, Default)]
 struct Repairs {
     keyframes: u64,
@@ -134,6 +135,24 @@ impl Repairs {
             rise(self.too_old, last.too_old)
         )
     }
+}
+
+/// The line that closes a session: what it sent, then the repair totals (the
+/// keyframes beside the frames), without the rises of the 5-second line.
+fn ended_line(session: u32, secs: f64, st: &Stats, input_events: u64) -> String {
+    let n = |count: &AtomicU64| count.load(Ordering::Relaxed);
+    let r = Repairs::now(st);
+    format!(
+        "session {session} ended after {secs:.1}s: {} frames ({} keyframes), {:.1} MB, {} retransmits, \
+         {input_events} input events, {} keyframe requests, {} resend requests, {} too old to resend",
+        n(&st.frames),
+        r.keyframes,
+        n(&st.bytes) as f64 / 1e6,
+        n(&st.retransmits),
+        r.keyframe_requests,
+        r.resend_requests,
+        r.too_old
+    )
 }
 
 /// Per-session state shared with the pipeline thread.
@@ -743,16 +762,9 @@ impl Server {
                 Ok(Ok(())) => {}
             }
         }
-        let st = &s.shared.stats;
         log!(
-            "session {} ended after {:.1}s: {} frames ({} keyframes), {:.1} MB, {} retransmits, {} input events",
-            s.shared.session,
-            s.started_at.elapsed().as_secs_f64(),
-            st.frames.load(Ordering::Relaxed),
-            st.keyframes.load(Ordering::Relaxed),
-            st.bytes.load(Ordering::Relaxed) as f64 / 1e6,
-            st.retransmits.load(Ordering::Relaxed),
-            s.injector.injected()
+            "{}",
+            ended_line(s.shared.session, s.started_at.elapsed().as_secs_f64(), &s.shared.stats, s.injector.injected())
         );
     }
 }
@@ -792,6 +804,25 @@ mod tests {
         assert_eq!(
             Repairs::now(&st).text(&second),
             "2 keyframes (+0), 1 keyframe requests (+0), 350 resend requests (+0), 1 too old to resend (+0)"
+        );
+    }
+
+    #[test]
+    fn the_session_ended_line_shows_the_repair_totals() {
+        let st = Stats::default();
+        let add = |count: &AtomicU64, n: u64| count.fetch_add(n, Ordering::Relaxed);
+        add(&st.frames, 369);
+        add(&st.keyframes, 14);
+        add(&st.bytes, 4_210_000);
+        add(&st.retransmits, 84);
+        add(&st.keyframe_requests, 13);
+        add(&st.resend_requests, 350);
+        add(&st.too_old, 1);
+        // Totals only: the session is over, there is no rise to show.
+        assert_eq!(
+            ended_line(3, 12.34, &st, 52),
+            "session 3 ended after 12.3s: 369 frames (14 keyframes), 4.2 MB, 84 retransmits, 52 input events, \
+             13 keyframe requests, 350 resend requests, 1 too old to resend"
         );
     }
 
