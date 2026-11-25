@@ -333,11 +333,16 @@ a client is connected.
   carrier-grade NAT without IPv6 cannot be reached.
 - Through a relay, each room is limited to 60 Mbit/s in each direction by
   default, and the longer path over TCP adds delay.
-- If the relay stops answering during a relayed session, the client
-  reconnects on its own, directly and through the relay. After 3 failed
-  attempts in a row it stops with an error that lists each address it tried
-  and what the relay answered. Run `hyperspace-client` again once the relay
-  is back.
+- If the relay stops answering during a relayed session, host and client
+  both go back to it on their own, and a cut of a second or two can pass
+  unnoticed. After 5 s without data from the host, the session ends and the
+  client connects again, directly and through the relay: 3 attempts, after
+  waits of about 0.5, 1 and 2 s, each lasting up to `--connect-timeout`
+  (15 s by default). So about 50 s after the relay went silent, the client stops with
+  an error that lists each address it tried and what the relay answered.
+  The host keeps trying, but after a long outage only every 30 s or so, so
+  it can be back after the client has stopped: run `hyperspace-client` again
+  once the relay is back.
 - A pairing made before 0.3.0 has no relay in it: run the client once with
   `--relay URL`, or pair again.
 - Two hosts with the same pairing key replace each other on the relay, and
