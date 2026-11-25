@@ -841,21 +841,27 @@ fn offline_lines(lines: &StatusLines) -> Vec<Instant> {
 /// Timers may round to the millisecond.
 const SLACK: Duration = Duration::from_millis(50);
 
+/// A host bridge with `app` as its local end.
+fn start_host(url: &RelayUrl, key: &Key, app: &UdpSocket) -> HostBridge {
+    HostBridge::start_with(url.clone(), key, app.local_addr().unwrap(), RelayedPeers::new(), fast()).unwrap()
+}
+
 #[test]
 fn the_line_saying_a_host_left_waits_a_second_and_an_exit_drops_it() {
     let relay = Relay::start(Allow::Open);
+    let url = relay.url();
     let key = Key::generate();
-    let echo = Echo::start();
-    let (client, _) = ClientBridge::start_with(relay.url(), &key, fast()).unwrap();
+    let (client, _) = ClientBridge::start_with(url.clone(), &key, fast()).unwrap();
     let lines = client.status_lines();
 
     // No host yet: the line comes with the status.
     wait_for("the host to be reported offline", || client.status() == Status::HostOffline);
     assert_eq!(offline_lines(&lines).len(), 1);
 
-    // A host that was online leaves: the status changes at once, the line
-    // a second later.
-    let first = HostBridge::start_with(relay.url(), &key, echo.addr, RelayedPeers::new(), fast()).unwrap();
+    // A host that was online and left: the status changes at once, the
+    // line a second later.
+    let app = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let first = start_host(&url, &key, &app);
     wait_for("the host to come online", || client.status() == Status::HostOnline);
     let left = Instant::now();
     drop(first);
@@ -864,18 +870,17 @@ fn the_line_saying_a_host_left_waits_a_second_and_an_exit_drops_it() {
     let said = offline_lines(&lines)[1];
     assert!(said + SLACK >= left + OFFLINE_LINE_HOLD, "said {:?} after the host left", said - left);
 
-    // A client that stops within that second never says it, then or later:
-    // nothing of the bridge outlives it.
-    let second = HostBridge::start_with(relay.url(), &key, echo.addr, RelayedPeers::new(), fast()).unwrap();
+    // A client that stops within that second never says it.
+    let second = start_host(&url, &key, &app);
     wait_for("the host to come back", || client.status() == Status::HostOnline);
     drop(second);
     wait_for("the host to be reported offline once more", || client.status() == Status::HostOffline);
     let stopping = Instant::now();
     drop(client);
-    std::thread::sleep(OFFLINE_LINE_HOLD + Duration::from_millis(300));
     let late = lines_since(&lines, stopping);
-    assert!(late.is_empty(), "printed while or after stopping: {late:?}");
+    assert!(late.is_empty(), "printed while stopping: {late:?}");
     assert_eq!(offline_lines(&lines).len(), 2);
+    drop(relay);
 }
 
 #[test]
@@ -908,26 +913,45 @@ fn a_host_back_within_the_hold_is_said_offline_then_online_in_order() {
     let (said, line) = lines_since(&lines, left).remove(0);
     assert_eq!(line, OFFLINE_LINE);
     assert!(said + SLACK >= left + OFFLINE_LINE_HOLD, "said {:?} after the host left", said - left);
+
+    // Back, gone again, and the client stops within the hold: the held line
+    // is never said, then or later, as nothing of the bridge outlives it.
+    relay.report(&[true]);
+    wait_for("the host to be reported online again", || client.status() == Status::HostOnline);
+    relay.report(&[false]);
+    wait_for("the host to be reported offline once more", || client.status() == Status::HostOffline);
+    let stopping = Instant::now();
+    drop(client);
+    std::thread::sleep(OFFLINE_LINE_HOLD + Duration::from_millis(300));
+    let late = lines_since(&lines, stopping);
+    assert!(late.is_empty(), "printed while or after stopping: {late:?}");
 }
 
 #[test]
 fn a_link_that_ends_says_the_held_line_first() {
-    let relay = Flipper::start();
-    let (client, _) = ClientBridge::start_with(relay.url(), &Key::generate(), fast()).unwrap();
-    let lines = client.status_lines();
-    wait_for("the host to be reported online", || client.status() == Status::HostOnline);
+    let relay = Relay::start(Allow::Open);
+    let url = relay.url();
+    let key = Key::generate();
+    let (client, _) = ClientBridge::start_with(url.clone(), &key, fast()).unwrap();
+    let printed = client.status_lines();
+    let app = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let only = start_host(&url, &key, &app);
+    wait_for("the host to come online", || client.status() == Status::HostOnline);
     let left = Instant::now();
-    relay.report(&[false]);
+    drop(only);
     wait_for("the host to be reported offline", || client.status() == Status::HostOffline);
 
-    // The link goes within the second: the held line is said then, before
-    // the line about the lost link.
+    // The relay goes away within the second: the held line is said then,
+    // before the line about the lost link.
     drop(relay);
-    wait_for("a status line after the offline one", || lines_since(&lines, left).len() >= 2);
-    let after = lines_since(&lines, left);
-    assert_eq!(after[0].1, OFFLINE_LINE, "{after:?}");
-    assert!(after[0].0 < left + OFFLINE_LINE_HOLD, "said {:?} after the host left", after[0].0 - left);
-    assert_ne!(after[1].1, OFFLINE_LINE, "{after:?}");
+    wait_for("a status line after the offline one", || {
+        let lines = lines_since(&printed, left);
+        lines.len() >= 2
+    });
+    let lines = lines_since(&printed, left);
+    assert_eq!(lines[0].1, OFFLINE_LINE, "{lines:?}");
+    assert!(lines[0].0 < left + OFFLINE_LINE_HOLD, "said {:?} after the host left", lines[0].0 - left);
+    assert_ne!(lines[1].1, OFFLINE_LINE, "{lines:?}");
     drop(client);
 }
 
