@@ -18,6 +18,10 @@ name: Release
 # it builds and packages everything, then uploads the files it would
 # publish as the `release-dry-run` workflow artifact, and publishes nothing.
 # Any other push only runs the plan job.
+#
+# The release page's text is releases/<version>.md without its title line,
+# then an install section. The plan job builds it and checks it on every run,
+# and a release whose notes file is missing fails there, before any build.
 on:
   push:
     tags: ["v*"]
@@ -129,6 +133,78 @@ jobs:
           echo "release=$release" >> "$GITHUB_OUTPUT"
           echo "build=$build" >> "$GITHUB_OUTPUT"
           echo "replace=$replace" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      # The release page's text: releases/<version>.md without its title (the
+      # page has its own), then the install section. Built and checked on
+      # every push, so a broken notes file shows long before a release; a
+      # release without its notes file stops here, before anything is built.
+      # The notes file's text only ever goes through tail and cat, never
+      # through the shell, so its backticks, $, quotes and % stay as written.
+      - name: Release notes
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+          VERSION: ${{ steps.plan.outputs.version }}
+          RELEASE: ${{ steps.plan.outputs.release }}
+        run: |
+          src="releases/$VERSION.md"
+          : > body.md
+          if [ -f "$src" ]; then
+            # Drop the title line and the blank line after it.
+            start=1
+            if head -n 1 "$src" | grep -q '^# '; then
+              start=2
+              if sed -n '2p' "$src" | grep -q '^[[:space:]]*$'; then start=3; fi
+            fi
+            tail -n "+$start" "$src" > body.md
+            first=$(grep -m 1 -v '^[[:space:]]*$' body.md || true)
+            if [ -z "$first" ]; then
+              echo "::error::$src has nothing under its title: the release page would show only the install section"
+              exit 1
+            fi
+            if [[ "$first" == \#* ]]; then
+              echo "::error::$src still starts with a heading once its title is removed: its first line must be '# hyperspace $VERSION', then a blank line, then the notes"
+              exit 1
+            fi
+          elif [ "$RELEASE" = "true" ]; then
+            echo "::error::$src is missing: write the release notes of $VERSION before releasing it"
+            exit 1
+          else
+            echo "::warning::$src is missing: releasing $VERSION would fail until it exists"
+          fi
+          : > notes.md
+          if [ -s body.md ]; then
+            cat body.md >> notes.md
+            # A file without a final newline still ends its last line.
+            if [ -n "$(tail -c 1 body.md)" ]; then printf '\n' >> notes.md; fi
+            printf '\n' >> notes.md
+          fi
+          cat >> notes.md <<NOTES
+          ## Install
+
+          **Windows host** (the machine you want to control): unzip \`hyperspace-host-windows-x64.zip\` and run \`hyperspace-host.exe\`. Allow it through the firewall when Windows asks. It prints a pairing command.
+
+          **macOS client** (the machine you sit at):
+
+          \`\`\`bash
+          curl -L https://github.com/${{ github.repository }}/releases/download/$TAG/hyperspace-client-macos-universal.tar.gz | tar -xz
+          \`\`\`
+
+          Paste the pairing command the host printed (once), then connect from anywhere with \`./hyperspace-client\`.
+
+          **Relay** (optional, only for networks that block UDP): \`hyperspace-relay-linux-x64.tar.gz\` is a static Linux x64 binary to run behind a TLS reverse proxy.
+
+          Host and client must be the same version. See the README for options, shortcuts and limitations. \`SHA256SUMS.txt\` lists the checksum of every file.
+          NOTES
+          echo "----- release page text for $TAG (from $src) -----"
+          cat notes.md
+          echo "----- end of the release page text -----"
+      - name: Hand the release notes to the assemble job
+        if: steps.plan.outputs.build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: notes.md
+          if-no-files-found: error
 
   windows:
     name: Windows x64
@@ -222,34 +298,32 @@ jobs:
     env:
       TAG: ${{ needs.plan.outputs.tag }}
     steps:
+      # Each by name: the release notes are an artifact of this run too, and
+      # not a file of the release.
       - uses: actions/download-artifact@v4
         with:
-          merge-multiple: true
+          name: windows
+          path: assets
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos
+          path: assets
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux
           path: assets
       - name: Checksums
         run: |
           (cd assets && sha256sum *) > SHA256SUMS.txt
           mv SHA256SUMS.txt assets/
           cat assets/SHA256SUMS.txt
+      # Written and checked by the plan job.
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+          path: .
       - name: Release notes
         run: |
-          cat > notes.md <<NOTES
-          ## Install
-
-          **Windows host** (the machine you want to control): unzip \`hyperspace-host-windows-x64.zip\` and run \`hyperspace-host.exe\`. Allow it through the firewall when Windows asks. It prints a pairing command.
-
-          **macOS client** (the machine you sit at):
-
-          \`\`\`bash
-          curl -L https://github.com/${{ github.repository }}/releases/download/$TAG/hyperspace-client-macos-universal.tar.gz | tar -xz
-          \`\`\`
-
-          Paste the pairing command the host printed (once), then connect from anywhere with \`./hyperspace-client\`.
-
-          **Relay** (optional, only for networks that block UDP): \`hyperspace-relay-linux-x64.tar.gz\` is a static Linux x64 binary to run behind a TLS reverse proxy.
-
-          Host and client must be the same version. See the README for options, shortcuts and limitations. \`SHA256SUMS.txt\` lists the checksum of every file.
-          NOTES
           ls -la assets
           cat notes.md
       # A dry run keeps what would be published as `release-dry-run`; a
@@ -302,7 +376,12 @@ jobs:
                 echo "::error::the release $TAG already exists (another run may have just published it) and its files are kept: to replace them, run this workflow manually with publish and replace_assets ticked"
                 exit 1
               fi
+              # Replaces the release's files that have the same name and adds
+              # the others. The page's text, title and tag stay as they are:
+              # notes changed since are put on the page by hand
+              # (gh release edit "$TAG" --notes-file notes.md).
               gh release upload "$TAG" release/assets/* --clobber
+              echo "::notice::the files of $TAG were replaced; its release page text was left as it was"
               ;;
             *)
               echo "::error::cannot tell whether $TAG has a release: GitHub answered HTTP $status (expected 200 or 404); nothing was published"
