@@ -360,7 +360,9 @@ a client is connected.
 - Video is 4:2:0 8-bit SDR.
 - The cursor image is resampled to match the video scale, so it can look
   slightly soft on Retina displays.
-- Host and client must be the same version.
+- Host and client versions 0.3.0 and 0.3.1 connect to each other, in either
+  combination. For any other pair, keep the host and the client on the same
+  version; updating both brings every fix.
 
 ## Building
 
