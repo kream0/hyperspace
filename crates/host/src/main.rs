@@ -339,19 +339,34 @@ static SERVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 
 /// Holds SERVING up until it is dropped, which also covers serve()'s early
 /// returns.
-struct Serving;
+struct Serving(&'static std::sync::atomic::AtomicBool);
 
 impl Serving {
     fn start() -> Serving {
-        SERVING.store(true, std::sync::atomic::Ordering::SeqCst);
-        Serving
+        Serving::hold(&SERVING)
+    }
+
+    /// The same for any flag: a test holds one of its own.
+    fn hold(flag: &'static std::sync::atomic::AtomicBool) -> Serving {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        Serving(flag)
     }
 }
 
 impl Drop for Serving {
     fn drop(&mut self) {
-        SERVING.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+/// serve()'s last goodbyes, in this order: the relay link closes, the reach
+/// thread withdraws the router's mappings, and only then does `serving`
+/// clear its flag, so a console being closed ends the process after all of
+/// them.
+fn wind_down<B>(bridge: Option<B>, reach: std::thread::JoinHandle<()>, serving: Serving) {
+    drop(bridge);
+    let _ = reach.join();
+    drop(serving);
 }
 
 /// Waits until `flag` is false, for at most `limit`. True if it cleared in
@@ -404,12 +419,9 @@ fn serve(mut cfg: Config, extra: Extra) -> Result<(), String> {
     let result = server.run();
     // Let the reach thread withdraw the router's port mapping.
     server::SHUTDOWN.store(true, std::sync::atomic::Ordering::Relaxed);
-    drop(bridge);
-    let _ = reach.join();
-    // The client has its BYE, the relay link is closed and the router's
-    // mappings are withdrawn: a console being closed may end the process
-    // from here on.
-    drop(serving);
+    // The client has its BYE: close the relay link and wait for the router's
+    // mappings to be withdrawn before a closing console may end the process.
+    wind_down(bridge, reach, serving);
     result
 }
 
@@ -568,6 +580,25 @@ mod tests {
         assert!(SERVING.load(Ordering::SeqCst));
         drop(serving);
         assert!(!SERVING.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn serving_clears_only_once_the_router_mappings_are_withdrawn() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        // A flag of this test's own, so the test above keeps SERVING to itself.
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        static HELD_WHILE_WITHDRAWING: AtomicBool = AtomicBool::new(false);
+        let serving = Serving::hold(&FLAG);
+        // Stands in for the reach thread, still busy with the router when
+        // serve() winds down.
+        let reach = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(200));
+            HELD_WHILE_WITHDRAWING.store(FLAG.load(Ordering::SeqCst), Ordering::SeqCst);
+        });
+        wind_down(None::<()>, reach, serving);
+        assert!(HELD_WHILE_WITHDRAWING.load(Ordering::SeqCst), "the flag cleared before the mappings were withdrawn");
+        assert!(!FLAG.load(Ordering::SeqCst));
     }
 
     fn extra(dir: &std::path::Path, relay: RelayArg) -> Extra {

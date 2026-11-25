@@ -155,9 +155,10 @@ jobs:
               echo "::error::$src starts with a UTF-8 byte order mark: save it as UTF-8 without one"
               exit 1
             fi
-            # Drop the title line and the blank line after it.
+            # Drop the title line, which must read exactly "# hyperspace
+            # $VERSION" (line endings aside), and the blank line after it.
             start=1
-            if head -n 1 "$src" | grep -q '^# '; then
+            if [ "$(head -n 1 "$src" | tr -d '\r')" = "# hyperspace $VERSION" ]; then
               start=2
               if sed -n '2p' "$src" | grep -q '^[[:space:]]*$'; then start=3; fi
             fi

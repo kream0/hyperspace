@@ -857,7 +857,7 @@ fn start_host(url: &RelayUrl, key: &Key, app: &UdpSocket) -> HostBridge {
 }
 
 #[test]
-fn the_line_saying_a_host_left_waits_a_second_and_an_exit_drops_it() {
+fn the_line_saying_a_host_left_waits_out_the_hold_and_an_exit_drops_it() {
     let relay = Relay::start(Allow::Open);
     let url = relay.url();
     let key = Key::generate();
@@ -891,6 +891,14 @@ fn the_line_saying_a_host_left_waits_a_second_and_an_exit_drops_it() {
     assert!(late.is_empty(), "printed while stopping: {late:?}");
     assert_eq!(offline_lines(&lines).len(), 2);
     drop(relay);
+}
+
+#[test]
+fn the_client_holds_the_offline_line_longer_than_its_goodbye_pause() {
+    // A client ending a relayed session closes the link within its goodbye
+    // pause: a shorter hold would print the line while it exits.
+    let hold = Timing::client().offline_line_hold;
+    assert!(hold > crate::GOODBYE_PAUSE, "hold {hold:?}, goodbye pause {:?}", crate::GOODBYE_PAUSE);
 }
 
 #[test]

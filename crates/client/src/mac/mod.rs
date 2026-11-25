@@ -42,8 +42,9 @@ const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
 /// After a quit, how long the window waits for the network thread to say
 /// goodbye to the host and report back.
 const STOP_WAIT: Duration = Duration::from_millis(600);
-/// The same through the relay: the goodbye's 300 ms on the relay link, then
-/// the link's close, which waits a second at most for the relay's answer.
+/// The same through the relay: the goodbye's 300 ms on the relay link
+/// (`hyperspace_bridge::GOODBYE_PAUSE`), then the link's close, which waits
+/// a second at most for the relay's answer.
 const STOP_WAIT_RELAYED: Duration = Duration::from_millis(1500);
 
 /// State shared between the UI thread and the render thread.

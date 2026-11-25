@@ -67,7 +67,7 @@ pub struct Timing {
     /// goodbye, and a client that is exiting closes the link within this
     /// time: printed then, the line would read like the start of a
     /// reconnect. Longer than the client's pause before it closes the link
-    /// after a relayed session.
+    /// after a relayed session ([`crate::GOODBYE_PAUSE`]).
     pub offline_line_hold: Duration,
 }
 

@@ -51,6 +51,12 @@ pub use client::{ClientBridge, LinkStats, Status};
 pub use host::HostBridge;
 pub use url::RelayUrl;
 
+/// How long a client that ends a session through the relay waits before it
+/// closes the link, so the link carries the goodbyes it has queued. The
+/// client's hold on the line saying a host went offline is longer, so that
+/// line never shows while the client exits.
+pub const GOODBYE_PAUSE: Duration = Duration::from_millis(300);
+
 /// The loopback addresses [`HostBridge`] sends from, one per client connected
 /// through the relay. Shared with the host's server, which treats datagrams
 /// from them as coming from the internet.
