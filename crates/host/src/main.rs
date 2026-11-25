@@ -330,7 +330,48 @@ fn start_server(cfg: &Config, extra: &Extra) -> Result<(server::Server, Option<R
     Ok((server, relay))
 }
 
+/// True while serve() still has goodbyes to send: the BYE to a client, the
+/// release of held keys and the close of the relay link. When the console
+/// window is closed, Windows ends the process as soon as the console handler
+/// returns, so the handler waits for this to clear.
+static SERVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Holds SERVING up until it is dropped, which also covers serve()'s early
+/// returns.
+struct Serving;
+
+impl Serving {
+    fn start() -> Serving {
+        SERVING.store(true, std::sync::atomic::Ordering::SeqCst);
+        Serving
+    }
+}
+
+impl Drop for Serving {
+    fn drop(&mut self) {
+        SERVING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Waits until `flag` is false, for at most `limit`. True if it cleared in
+/// time.
+#[cfg(any(windows, test))]
+fn wait_while(flag: &std::sync::atomic::AtomicBool, limit: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if !flag.load(std::sync::atomic::Ordering::SeqCst) {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::sleep((deadline - now).min(std::time::Duration::from_millis(10)));
+    }
+}
+
 fn serve(mut cfg: Config, extra: Extra) -> Result<(), String> {
+    let serving = Serving::start();
     #[cfg(windows)]
     win::process_setup();
     cfg.key = load_key(&extra)?;
@@ -363,6 +404,9 @@ fn serve(mut cfg: Config, extra: Extra) -> Result<(), String> {
     // Let the reach thread withdraw the router's port mapping.
     server::SHUTDOWN.store(true, std::sync::atomic::Ordering::Relaxed);
     drop(bridge);
+    // The client has its BYE and the relay link is closed: a console being
+    // closed may end the process from here on.
+    drop(serving);
     let _ = reach.join();
     result
 }
@@ -482,6 +526,47 @@ fn self_test(cfg: Config, frames: u32) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_closing_console_waits_for_the_goodbyes_and_no_longer() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        // Cleared while waiting: the wait ends then, well before its limit.
+        let busy = Arc::new(AtomicBool::new(true));
+        let clear = {
+            let busy = busy.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                busy.store(false, Ordering::SeqCst);
+            })
+        };
+        let start = Instant::now();
+        assert!(wait_while(&busy, Duration::from_secs(3)));
+        assert!(start.elapsed() < Duration::from_secs(2), "waited {:?}", start.elapsed());
+        clear.join().unwrap();
+
+        // Never cleared: the wait gives up at its limit.
+        let stuck = AtomicBool::new(true);
+        let start = Instant::now();
+        assert!(!wait_while(&stuck, Duration::from_millis(100)));
+        let took = start.elapsed();
+        assert!(took >= Duration::from_millis(100) && took < Duration::from_secs(2), "waited {took:?}");
+
+        // Already clear: no wait at all.
+        assert!(wait_while(&AtomicBool::new(false), Duration::ZERO));
+    }
+
+    #[test]
+    fn serving_holds_until_it_is_dropped() {
+        use std::sync::atomic::Ordering;
+        // No test runs serve(), so nothing else touches SERVING.
+        let serving = Serving::start();
+        assert!(SERVING.load(Ordering::SeqCst));
+        drop(serving);
+        assert!(!SERVING.load(Ordering::SeqCst));
+    }
 
     fn extra(dir: &std::path::Path, relay: RelayArg) -> Extra {
         Extra { upnp: false, dht: false, public_host: None, new_key: false, config_dir: dir.to_path_buf(), relay }
