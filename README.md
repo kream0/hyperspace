@@ -199,7 +199,8 @@ location / {
 ```
 
 Every location that reaches the relay must set `X-Forwarded-For`: the relay
-logs that header's last entry as the peer's address. Through the proxy,
+logs that header's last entry as the peer's address, and shows its host and
+client counts to any request that arrives without it. Through the proxy,
 `https://relay.example.com/` is a status page that shows only the relay's
 version, and `/health` answers `hyperspace relay ok`.
 
@@ -241,8 +242,8 @@ Only a paired client can connect, and everything is encrypted.
   the credential.** Treat it like an SSH private key. It is stored in
   `%APPDATA%\hyperspace` on the host and `~/.config/hyperspace` on the client.
   If it leaks, run `hyperspace-host --new-key` and pair again.
-- A relay sees only ciphertext and room ids, never the pairing key: the
-  pairing string stays the only secret.
+- A relay sees only ciphertext, the room id and the IP addresses of both
+  ends, never the pairing key: the pairing string stays the only secret.
 
 ### Client shortcuts
 
@@ -359,9 +360,9 @@ a client is connected.
 ## Building
 
 ```bash
-cargo build --release            # host on Windows, client on macOS
+cargo build --release            # host on Windows, client on macOS, relay on Linux
 cargo test --workspace           # protocol, loss recovery, colour conversion
-bash scripts/e2e.sh              # real binaries: pairing, wrong key, port forwarding, packet loss
+bash scripts/e2e.sh              # real binaries: pairing, wrong key, port forwarding, packet loss, relay fallback
 ```
 
 The host and a headless client build on every platform: `hyperspace-host
