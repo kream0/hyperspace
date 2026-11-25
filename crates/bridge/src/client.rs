@@ -136,9 +136,9 @@ struct Shared {
     /// Calls to [`ClientBridge::reconnect`], and the wakeup for them.
     reconnects_asked: AtomicU64,
     reconnect: Notify,
-    /// The status lines printed, for the tests.
+    /// The status lines printed and when, for the tests.
     #[cfg(test)]
-    lines: Mutex<Vec<String>>,
+    lines: Mutex<Vec<(Instant, String)>>,
 }
 
 impl Shared {
@@ -163,7 +163,7 @@ impl Shared {
     fn note(&self, status: &Status) {
         log!("relay: {status}");
         #[cfg(test)]
-        self.lines.lock().unwrap_or_else(|e| e.into_inner()).push(format!("relay: {status}"));
+        self.lines.lock().unwrap_or_else(|e| e.into_inner()).push((Instant::now(), format!("relay: {status}")));
     }
 
     /// Sets the status without a log line (the caller logged why).
@@ -250,12 +250,6 @@ impl ClientBridge {
 
     pub fn status(&self) -> Status {
         self.shared.lock_status().clone()
-    }
-
-    /// The status lines printed so far.
-    #[cfg(test)]
-    pub(crate) fn status_lines(&self) -> Vec<String> {
-        self.shared.lines.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Rises each time the relay reports a host the client may not have a
@@ -644,4 +638,132 @@ async fn carry(
         shared.note(&Status::HostOffline);
     }
     end
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::UdpSocket;
+    use std::time::{Duration, Instant};
+
+    use hyperspace_proto::secure::Key;
+    use hyperspace_relay::{Allow, Config};
+
+    use super::{ClientBridge, Shared, Status, OFFLINE_LINE_HOLD};
+    use crate::link::Timing;
+    use crate::{HostBridge, RelayUrl, RelayedPeers};
+
+    const OFFLINE_LINE: &str = "relay: connected to the relay; the host is offline";
+
+    fn fast() -> Timing {
+        Timing {
+            backoff_min: Duration::from_millis(50),
+            backoff_max: Duration::from_millis(200),
+            refused_wait: Duration::from_millis(200),
+            ping_interval: Duration::from_millis(200),
+            idle_timeout: Duration::from_secs(10),
+            stable: Duration::from_secs(1),
+        }
+    }
+
+    /// A relay on its own runtime: shutting the runtime down drops every link.
+    fn relay() -> (tokio::runtime::Runtime, RelayUrl) {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+        let url = RelayUrl::parse(&format!("ws://{}", listener.local_addr().unwrap())).unwrap();
+        let mut config = Config::new(Allow::Open);
+        config.rate = None;
+        rt.spawn(async move {
+            let _ = hyperspace_relay::serve(listener, config).await;
+        });
+        (rt, url)
+    }
+
+    fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !cond() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The status lines printed from `since` on.
+    fn lines_since(shared: &Shared, since: Instant) -> Vec<(Instant, String)> {
+        let lines = shared.lines.lock().unwrap();
+        lines.iter().filter(|(at, _)| *at >= since).cloned().collect()
+    }
+
+    fn offline_lines(shared: &Shared) -> Vec<Instant> {
+        let lines = shared.lines.lock().unwrap();
+        lines.iter().filter(|(_, line)| line == OFFLINE_LINE).map(|(at, _)| *at).collect()
+    }
+
+    fn host(url: &RelayUrl, key: &Key, app: &UdpSocket) -> HostBridge {
+        HostBridge::start_with(url.clone(), key, app.local_addr().unwrap(), RelayedPeers::new(), fast()).unwrap()
+    }
+
+    /// Timers may round to the millisecond.
+    const SLACK: Duration = Duration::from_millis(50);
+
+    #[test]
+    fn the_line_saying_a_host_left_waits_a_second_and_an_exit_drops_it() {
+        let (rt, url) = relay();
+        let key = Key::generate();
+        let (client, _) = ClientBridge::start_with(url.clone(), &key, fast()).unwrap();
+        let shared = client.shared.clone();
+
+        // No host yet: the line comes with the status.
+        wait_for("the host to be reported offline", || client.status() == Status::HostOffline);
+        assert_eq!(offline_lines(&shared).len(), 1);
+
+        // A host that was online and left: the status changes at once, the
+        // line a second later.
+        let app = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let first = host(&url, &key, &app);
+        wait_for("the host to come online", || client.status() == Status::HostOnline);
+        let left = Instant::now();
+        drop(first);
+        wait_for("the host to be reported offline again", || client.status() == Status::HostOffline);
+        wait_for("the held line", || offline_lines(&shared).len() == 2);
+        let said = offline_lines(&shared)[1];
+        assert!(said + SLACK >= left + OFFLINE_LINE_HOLD, "said {:?} after the host left", said - left);
+
+        // A client that stops within that second never says it.
+        let second = host(&url, &key, &app);
+        wait_for("the host to come back", || client.status() == Status::HostOnline);
+        drop(second);
+        wait_for("the host to be reported offline once more", || client.status() == Status::HostOffline);
+        let stopping = Instant::now();
+        drop(client);
+        let late = lines_since(&shared, stopping);
+        assert!(late.is_empty(), "printed while stopping: {late:?}");
+        assert_eq!(offline_lines(&shared).len(), 2);
+        rt.shutdown_background();
+    }
+
+    #[test]
+    fn a_link_that_ends_says_the_held_line_first() {
+        let (rt, url) = relay();
+        let key = Key::generate();
+        let (client, _) = ClientBridge::start_with(url.clone(), &key, fast()).unwrap();
+        let shared = client.shared.clone();
+        let app = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let only = host(&url, &key, &app);
+        wait_for("the host to come online", || client.status() == Status::HostOnline);
+        let left = Instant::now();
+        drop(only);
+        wait_for("the host to be reported offline", || client.status() == Status::HostOffline);
+
+        // The relay goes away within the second: the held line is said then,
+        // before the line about the lost link.
+        rt.shutdown_background();
+        wait_for("a status line after the offline one", || {
+            let lines = lines_since(&shared, left);
+            lines.len() >= 2
+        });
+        let lines = lines_since(&shared, left);
+        assert_eq!(lines[0].1, OFFLINE_LINE, "{lines:?}");
+        assert!(lines[0].0 < left + OFFLINE_LINE_HOLD, "said {:?} after the host left", lines[0].0 - left);
+        assert_ne!(lines[1].1, OFFLINE_LINE, "{lines:?}");
+        drop(client);
+    }
 }
