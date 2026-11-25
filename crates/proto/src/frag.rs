@@ -1058,4 +1058,34 @@ mod tests {
         assert_eq!(keyframe_asks(poll_every_ms(&mut r, 1_500_000, 2_300_000)), vec![2_200_000]);
         assert_eq!(r.stats.keyframe_requests, 3);
     }
+
+    #[test]
+    fn relayed_stale_and_duplicate_keyframe_fragments_do_not_restart_the_wait() {
+        let mut r = relayed_after_give_up();
+        // One new fragment of keyframe 3 at 750 ms. Then, every 100 ms for
+        // 1.2 s, only fragments that bring nothing: a copy of that one, one of
+        // keyframe 0 (already delivered), and one that gives frame 3 another
+        // length.
+        let k = dgrams(3, true, 2000);
+        let stale = dgrams(0, true, 100);
+        let other_len = dgrams(3, true, 3000);
+        let mut polled = poll_every_ms(&mut r, 703_000, 749_000);
+        feed(&mut r, &k[0], 750_000);
+        let dups = r.stats.duplicate_frags;
+        let mut t = 750_000;
+        for at in (800_000u64..=2_000_000).step_by(100_000) {
+            polled.extend(poll_every_ms(&mut r, t, at - 1000));
+            feed(&mut r, &k[0], at);
+            feed(&mut r, &stale[0], at);
+            feed(&mut r, &other_len[0], at);
+            t = at;
+        }
+        polled.extend(poll_every_ms(&mut r, t, 2_200_000));
+        // The copy and the keyframe 0 fragment are each counted 13 times: they
+        // got as far as the duplicate and stale-id returns. The other length is
+        // turned away before the duplicate check and is not counted.
+        assert_eq!(r.stats.duplicate_frags - dups, 26);
+        // 700 ms after the last new fragment, then 700 ms after that request.
+        assert_eq!(keyframe_asks(polled), vec![1_450_000, 2_150_000]);
+    }
 }
