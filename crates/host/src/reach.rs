@@ -566,6 +566,13 @@ mod tests {
         let line = refused_line(&io_add(Error::from_raw_os_error(1)), &AddAnyPortError::DescriptionTooLong);
         assert!(line.ends_with("; The description was too long for the gateway to handle)"), "{line:?}");
         assert_plain(&line);
+        // Both parts end in a period: neither keeps it.
+        let line = refused_line(
+            &io_add(Error::new(ErrorKind::Other, "first part.")),
+            &io_any(Error::new(ErrorKind::Other, "second part. ")),
+        );
+        assert_eq!(line, "the router refused to forward a port (first part; second part)");
+        assert_plain(&line);
     }
 
     /// A failure of the library's HTTP client, which is how a router that
