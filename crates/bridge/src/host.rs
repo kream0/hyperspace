@@ -31,6 +31,9 @@ const UDP_BUFFER: usize = 1 << 20;
 /// Replaced this many times in a row: another host with the same pairing key
 /// is running, and they would keep taking the room from each other.
 const REPLACED_LIMIT: u32 = 3;
+/// Datagrams dropped on a full link queue are logged at most this often,
+/// and only when more were dropped since the last line.
+const DROPS_EVERY: Duration = Duration::from_secs(60);
 /// Tests make a peer's reader fail with this datagram, as an OS error would.
 #[cfg(test)]
 pub(crate) const FAIL_READER: &[u8] = b"test: fail this reader";
@@ -209,6 +212,8 @@ enum Event {
     Idle,
     /// The reader of this peer (id, serial) stopped on an error.
     PeerFailed(u32, u64),
+    /// Time to log the datagrams dropped so far, if that count rose.
+    Drops,
     /// The bridge was dropped.
     Stop,
 }
@@ -235,6 +240,10 @@ async fn carry(
     stop: &mut Stop,
 ) -> Option<End> {
     let (tx, rx) = queue::queue(queue::MAX_COUNT, queue::MAX_BYTES);
+    // Logs the drops once more when the link ends, however it ends.
+    let mut drops = Drops::new(tx.clone());
+    let mut drops_every = tokio::time::interval_at(tokio::time::Instant::now() + DROPS_EVERY, DROPS_EVERY);
+    drops_every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let writer = link::writer(sink, rx, t.ping_interval);
     tokio::pin!(writer);
     let idle = tokio::time::sleep(t.idle_timeout);
@@ -254,8 +263,15 @@ async fn carry(
             _ = link::stopped(stop) => Event::Stop,
             msg = stream.next() => Event::Relay(msg),
             Some((id, n)) = failed_rx.recv() => Event::PeerFailed(id, n),
+            _ = drops_every.tick() => Event::Drops,
         };
         let data: Bytes = match event {
+            Event::Drops => {
+                if let Some(line) = drops.rose() {
+                    log!("{line}");
+                }
+                continue;
+            }
             Event::PeerFailed(id, n) => {
                 // Unless that client has left already, or come back as a new
                 // peer with the same id.
@@ -317,6 +333,46 @@ async fn carry(
             _ => {}
         }
     }
+}
+
+/// The datagrams the clients' readers could not queue for the relay (the
+/// link was too slow for the stream), on one link: logged while the count
+/// rises, and once when the link ends.
+struct Drops {
+    tx: Tx,
+    /// The count in the last line logged.
+    logged: u64,
+}
+
+impl Drops {
+    fn new(tx: Tx) -> Drops {
+        Drops { tx, logged: 0 }
+    }
+
+    /// The line to log, if more were dropped since the last one.
+    fn rose(&mut self) -> Option<String> {
+        let total = self.tx.dropped();
+        if total == self.logged {
+            return None;
+        }
+        self.logged = total;
+        Some(drops_line(total, true))
+    }
+}
+
+impl Drop for Drops {
+    fn drop(&mut self) {
+        log!("{}", drops_line(self.tx.dropped(), false));
+    }
+}
+
+/// `total` datagrams dropped on a link: `so_far` while it is up, else at
+/// its end.
+fn drops_line(total: u64, so_far: bool) -> String {
+    let what = if total == 1 { "datagram" } else { "datagrams" };
+    let when = if so_far { "so far" } else { "while it was up" };
+    let why = if total > 0 { ": the link to the relay could not keep up" } else { "" };
+    format!("relay link: dropped {total} {what} {when}{why}")
 }
 
 /// One client seen through the relay: a loopback UDP socket connected to the
@@ -388,7 +444,7 @@ async fn peer_reader(id: u32, sock: Arc<UdpSocket>, tx: Tx) {
         match got {
             // Over the relay's limit: dropped, as on a path with a smaller MTU.
             Ok(n) if n > relay::MAX_PAYLOAD => {}
-            // A full queue drops it too.
+            // A full queue drops it too, and counts it.
             Ok(n) => {
                 let _ = tx.push(Msg::HostData { peer: id, payload: &buf[..n] }.encode());
             }
@@ -398,5 +454,36 @@ async fn peer_reader(id: u32, sock: Arc<UdpSocket>, tx: Tx) {
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drop_lines() {
+        assert_eq!(drops_line(0, false), "relay link: dropped 0 datagrams while it was up");
+        assert_eq!(drops_line(1, true), "relay link: dropped 1 datagram so far: the link to the relay could not keep up");
+        assert_eq!(
+            drops_line(37, false),
+            "relay link: dropped 37 datagrams while it was up: the link to the relay could not keep up"
+        );
+    }
+
+    #[test]
+    fn drops_are_logged_only_when_the_count_rose() {
+        let (tx, _rx) = queue::queue(2, 1 << 20);
+        let mut drops = Drops::new(tx.clone());
+        assert_eq!(drops.rose(), None);
+        for _ in 0..3 {
+            tx.push(vec![0; 10]);
+        }
+        assert_eq!(drops.rose(), Some(drops_line(1, true)));
+        assert_eq!(drops.rose(), None, "nothing new");
+        tx.push(vec![0; 10]);
+        tx.push(vec![0; 10]);
+        assert_eq!(drops.rose(), Some(drops_line(3, true)));
+        assert_eq!(drops.rose(), None);
     }
 }

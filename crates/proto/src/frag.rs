@@ -751,6 +751,26 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_fragments_are_counted() {
+        let mut r = Reassembler::new(pt::VIDEO, CHUNK, 0);
+        let d = dgrams(0, true, 250);
+        feed(&mut r, &d[0], 10);
+        assert_eq!(r.stats.duplicate_frags, 0);
+        // The same fragment twice: counted, and not used.
+        feed(&mut r, &d[0], 11);
+        assert_eq!(r.stats.duplicate_frags, 1);
+        for x in &d[1..] {
+            feed(&mut r, x, 12);
+        }
+        assert_eq!(pop_ids(&mut r), vec![0]);
+        assert_eq!(r.stats.duplicate_frags, 1);
+        // A late copy, after its frame was delivered: counted too.
+        feed(&mut r, &d[1], 13);
+        assert_eq!(r.stats.duplicate_frags, 2);
+        assert_eq!(pop_ids(&mut r), Vec::<u32>::new());
+    }
+
+    #[test]
     fn random_loss_with_retransmit_always_converges() {
         // Simulated link: 10% loss on first transmission and on retransmits.
         let mut s = 99u32;

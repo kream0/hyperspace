@@ -5,6 +5,7 @@
 //! Control messages (a few bytes each) always get in.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::Notify;
@@ -25,6 +26,8 @@ struct Inner {
     ready: Notify,
     max_bytes: usize,
     max_count: usize,
+    /// Datagrams [`Tx::push`] refused, the queue being full.
+    dropped: AtomicU64,
 }
 
 impl Inner {
@@ -45,6 +48,7 @@ pub fn queue(max_count: usize, max_bytes: usize) -> (Tx, Rx) {
         ready: Notify::new(),
         max_bytes,
         max_count,
+        dropped: AtomicU64::new(0),
     });
     (Tx(inner.clone()), Rx(inner))
 }
@@ -57,6 +61,7 @@ impl Tx {
         {
             let mut s = inner.lock();
             if s.items.len() >= inner.max_count || s.bytes + msg.len() > inner.max_bytes {
+                inner.dropped.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
             s.bytes += msg.len();
@@ -64,6 +69,12 @@ impl Tx {
         }
         inner.ready.notify_one();
         true
+    }
+
+    /// Datagrams [`push`](Tx::push) dropped so far because the queue was
+    /// full. Control messages are not counted.
+    pub fn dropped(&self) -> u64 {
+        self.0.dropped.load(Ordering::Relaxed)
     }
 
     /// Queues a control message, past the datagram limits.
@@ -106,5 +117,57 @@ impl Rx {
     pub fn len(&self) -> (usize, usize) {
         let s = self.0.lock();
         (s.items.len(), s.bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyperspace_proto::relay::{self, Msg};
+
+    /// Pushes `n` copies of `msg`; how many got in.
+    fn push_n(tx: &Tx, msg: &[u8], n: usize) -> usize {
+        (0..n).filter(|_| tx.push(msg.to_vec())).count()
+    }
+
+    #[test]
+    fn a_full_queue_counts_every_datagram_it_drops() {
+        // The link's own bounds, with the host's datagrams: big ones fill
+        // the bytes first, small ones the count.
+        for len in [relay::MAX_PAYLOAD, 1200, 40] {
+            let (tx, rx) = queue(MAX_COUNT, MAX_BYTES);
+            let msg = Msg::HostData { peer: 1, payload: &vec![7; len] }.encode();
+            let fit = (MAX_BYTES / msg.len()).min(MAX_COUNT);
+            assert_eq!(push_n(&tx, &msg, fit + 300), fit, "{len}-byte payloads");
+            assert_eq!(rx.len(), (fit, fit * msg.len()));
+            assert_eq!(tx.dropped(), 300, "{len}-byte payloads");
+        }
+    }
+
+    #[test]
+    fn the_drop_count_follows_the_queue() {
+        let (tx, rx) = queue(4, 1000);
+        assert_eq!(tx.dropped(), 0);
+        // Full by count.
+        assert_eq!(push_n(&tx, &[0; 10], 7), 4);
+        assert_eq!(tx.dropped(), 3);
+        // Control messages get in past the bound, and are never counted.
+        assert!(tx.push_control(vec![1; 10]));
+        assert_eq!(tx.dropped(), 3);
+        // Room again once the writer takes some: no new drop until full again.
+        assert!(rx.try_recv().is_some() && rx.try_recv().is_some());
+        assert!(tx.push(vec![0; 10]));
+        assert_eq!(tx.dropped(), 3);
+        assert!(!tx.push(vec![0; 10]));
+        assert_eq!(tx.dropped(), 4);
+        while rx.try_recv().is_some() {}
+        // Full by bytes: 600 + 600 is over 1000, 600 + 400 is not.
+        assert!(tx.push(vec![0; 600]));
+        assert!(!tx.push(vec![0; 600]));
+        assert!(tx.push(vec![0; 400]));
+        assert!(!tx.push(vec![0; 1]));
+        // Every sender shares the count.
+        assert!(!tx.clone().push(vec![0; 1]));
+        assert_eq!(tx.dropped(), 7);
     }
 }

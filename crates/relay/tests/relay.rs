@@ -1,7 +1,9 @@
 //! The relay end to end, over real sockets on loopback.
 
+use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -11,6 +13,7 @@ use hyperspace_proto::secure::Key;
 use hyperspace_relay::{Allow, Config, Rate};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -18,6 +21,9 @@ type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<T
 
 /// Upper bound for anything a test waits for.
 const WAIT: Duration = Duration::from_secs(5);
+/// Upper bound for a line the relay binary logs: a link it can no longer
+/// write to may take its write timeout (10 s) to end.
+const LOG_WAIT: Duration = Duration::from_secs(20);
 
 fn config(allow: Allow) -> Config {
     let mut c = Config::new(allow);
@@ -228,6 +234,73 @@ impl Drop for TempFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+/// The relay binary, open to every room on a free loopback port, for the
+/// lines it logs.
+struct RelayProcess {
+    child: Child,
+    lines: mpsc::UnboundedReceiver<String>,
+    addr: SocketAddr,
+}
+
+impl RelayProcess {
+    async fn start(args: &[&str]) -> RelayProcess {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_hyperspace-relay"))
+            .args(["--listen", "127.0.0.1:0", "--open"])
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("cannot start the relay binary");
+        let stderr = child.stderr.take().expect("stderr is piped");
+        let (tx, lines) = mpsc::unbounded_channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut relay = RelayProcess { child, lines, addr: SocketAddr::from(([127, 0, 0, 1], 0)) };
+        let line = relay.line(" listening on ").await;
+        let addr = line.split(" listening on ").nth(1).and_then(|rest| rest.split(' ').next());
+        relay.addr = addr.and_then(|a| a.parse().ok()).unwrap_or_else(|| panic!("no address in {line:?}"));
+        relay
+    }
+
+    /// The next line it logs that contains `want`.
+    async fn line(&mut self, want: &str) -> String {
+        let deadline = tokio::time::Instant::now() + LOG_WAIT;
+        loop {
+            match tokio::time::timeout_at(deadline, self.lines.recv()).await {
+                Ok(Some(line)) if line.contains(want) => return line,
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("the relay exited before logging {want:?}"),
+                Err(_) => panic!("the relay did not log {want:?}"),
+            }
+        }
+    }
+}
+
+impl Drop for RelayProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The counts in a leave line: "(dropped Q queued, R over rate)".
+fn drop_counts(line: &str) -> (u64, u64) {
+    let parse = || -> Option<(u64, u64)> {
+        let (_, rest) = line.split_once("(dropped ")?;
+        let (counts, _) = rest.split_once(')')?;
+        let (queued, rate) = counts.split_once(" queued, ")?;
+        Some((queued.parse().ok()?, rate.strip_suffix(" over rate")?.parse().ok()?))
+    };
+    parse().unwrap_or_else(|| panic!("no drop counts in {line:?}"))
 }
 
 #[tokio::test]
@@ -886,6 +959,85 @@ async fn each_direction_is_rate_limited() {
     for _ in 0..3 {
         expect(&mut a, Msg::ClientData(&payload)).await;
     }
+}
+
+#[tokio::test]
+async fn what_a_client_that_stopped_reading_missed_is_in_its_leave_line() {
+    let mut server = RelayProcess::start(&["--rate-mbit", "0"]).await;
+    let addr = server.addr;
+    let key = room();
+    let id = key.id().masked();
+    let mut host = join(addr, &key, Role::Host).await;
+    let slow = slow_client(addr, &key).await;
+    expect(&mut host, Msg::PeerOpen(1)).await;
+    let mut fast = client(addr, &key, true).await;
+    expect(&mut host, Msg::PeerOpen(2)).await;
+
+    // 32 MB fills the socket buffers between the relay and the slow client,
+    // then its queue; the rest is dropped, and counted.
+    let big = vec![0x5a; relay::MAX_PAYLOAD];
+    let sent: u64 = 64 * 64;
+    for _ in 0..64 {
+        blast(&mut host, 1, &big, 64).await;
+    }
+    // Once this reaches the other client, all of the above was queued or
+    // dropped.
+    send(&mut host, Msg::HostData { peer: 2, payload: b"sync" }).await;
+    expect(&mut fast, Msg::ClientData(b"sync")).await;
+    // It goes away without reading the rest.
+    drop(slow);
+    let line = server.line("client 1 left room").await;
+    let (queued, rate) = drop_counts(&line);
+    assert!(queued > 0 && queued <= sent, "{line}");
+    assert_eq!(rate, 0, "{line}");
+    assert!(line.contains(&format!("client 1 left room {id} (dropped {queued} queued, 0 over rate): ")), "{line}");
+
+    // The counts are the peer's own: the other client missed nothing.
+    fast.close(None).await.unwrap();
+    let line = server.line("client 2 left room").await;
+    assert!(line.ends_with(&format!("client 2 left room {id} (dropped 0 queued, 0 over rate): closed")), "{line}");
+}
+
+#[tokio::test]
+async fn what_the_rate_limit_dropped_is_in_the_leave_line() {
+    // 1 Mbit/s: a burst of 256 KiB, then 125 kB a second.
+    let mut server = RelayProcess::start(&["--rate-mbit", "1"]).await;
+    let addr = server.addr;
+    let key = room();
+    let id = key.id().masked();
+    let mut host = join(addr, &key, Role::Host).await;
+    let mut a = client(addr, &key, true).await;
+    expect(&mut host, Msg::PeerOpen(1)).await;
+
+    // 512 KiB at once: about half of it is over the rate. The queue holds
+    // more than the burst, so each datagram is delivered or counted once.
+    let big = vec![0x5a; relay::MAX_PAYLOAD];
+    let sent: u64 = 64;
+    blast(&mut host, 1, &big, sent as usize).await;
+    // Time for the bucket to let a small datagram through again.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    send(&mut host, Msg::HostData { peer: 1, payload: b"sync" }).await;
+    let mut received: u64 = 0;
+    loop {
+        let b = next(&mut a).await.expect("the client was closed");
+        match Msg::decode(&b) {
+            Some(Msg::ClientData(p)) if p == big.as_slice() => received += 1,
+            Some(Msg::ClientData(b"sync")) => break,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    a.close(None).await.unwrap();
+    let line = server.line("client 1 left room").await;
+    let (queued, rate) = drop_counts(&line);
+    assert_eq!(received + queued + rate, sent, "{received} received: {line}");
+    assert!(rate > 0, "{line}");
+    let want = format!("client 1 left room {id} (dropped {queued} queued, {rate} over rate): closed");
+    assert!(line.ends_with(&want), "{line}");
+
+    // Nothing was sent to the host, so nothing was dropped on the way.
+    host.close(None).await.unwrap();
+    let line = server.line("host left room").await;
+    assert!(line.ends_with(&format!("host left room {id} (dropped 0 queued, 0 over rate): closed")), "{line}");
 }
 
 #[tokio::test]

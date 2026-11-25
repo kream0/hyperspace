@@ -325,6 +325,18 @@ struct LinkState {
     removed: OnceLock<Removed>,
     /// ...and then notified, which starts the writer's close deadline.
     gone: Notify,
+    /// Datagrams for this link dropped because its queue was full...
+    dropped_queued: AtomicU64,
+    /// ...or because the room's rate limit in their direction was reached.
+    dropped_rate: AtomicU64,
+}
+
+impl LinkState {
+    /// What was dropped on the way to this link, for its last log line.
+    fn drops(&self) -> String {
+        let n = |count: &AtomicU64| count.load(Ordering::Relaxed);
+        format!("dropped {} queued, {} over rate", n(&self.dropped_queued), n(&self.dropped_rate))
+    }
 }
 
 /// The room's handle on one authenticated connection.
@@ -360,6 +372,19 @@ impl Link {
     /// path would). Returns whether it was queued.
     fn send_data(&self, bytes: Bytes) -> bool {
         self.fits(bytes.len()) && self.queue(bytes)
+    }
+
+    /// Queue a datagram that `rate` (the room's limit in its direction, if
+    /// any) lets through, or count it as dropped. The queue comes first: a
+    /// datagram dropped for a full queue must not use up the room's rate.
+    fn offer(&self, bytes: Bytes, rate: Option<&mut Bucket>) {
+        if !self.fits(bytes.len()) {
+            self.state.dropped_queued.fetch_add(1, Ordering::Relaxed);
+        } else if rate.is_some_and(|b| !b.take(bytes.len(), Instant::now())) {
+            self.state.dropped_rate.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.send_data(bytes);
+        }
     }
 
     /// Queue a control message. A link that cannot take one is closed rather
@@ -644,12 +669,7 @@ impl Shared {
                     return Ok(());
                 }
                 let Some(host) = &r.host else { return Ok(()) };
-                // Queue first: a datagram dropped for a full queue must not
-                // use up the room's rate.
-                if !host.fits(out.len()) || r.to_host.as_mut().is_some_and(|b| !b.take(out.len(), Instant::now())) {
-                    return Ok(());
-                }
-                host.send_data(out);
+                host.offer(out, r.to_host.as_mut());
                 Ok(())
             }
             (Seat::Host, Msg::HostData { peer, payload }) => {
@@ -660,10 +680,7 @@ impl Shared {
                     return Ok(());
                 }
                 let Some(client) = r.clients.get(&peer) else { return Ok(()) };
-                if !client.fits(out.len()) || r.to_clients.as_mut().is_some_and(|b| !b.take(out.len(), Instant::now())) {
-                    return Ok(());
-                }
-                client.send_data(out);
+                client.offer(out, r.to_clients.as_mut());
                 Ok(())
             }
             (Seat::Host, Msg::PeerClose(peer)) => {
@@ -795,6 +812,8 @@ struct Seated {
     id: u64,
     /// Why the connection ended, for the log.
     why: Option<String>,
+    /// The link's drop counts, for the log.
+    state: Arc<LinkState>,
     /// Counts against [`Config::links`] until the seat is given back.
     slot: Option<OwnedSemaphorePermit>,
 }
@@ -808,18 +827,21 @@ impl Drop for Seated {
         drop(self.slot.take());
         let why = self.why.as_deref().unwrap_or("internal error");
         let room = self.room.masked();
-        if self.shared.leave(self.room, self.seat, self.id) {
+        let left = self.shared.leave(self.room, self.seat, self.id);
+        // Out of its room now, so nothing more can be dropped for it.
+        let drops = self.state.drops();
+        if left {
             match self.seat {
-                Seat::Host => log!("host left room {room}: {why}"),
-                Seat::Client(peer) => log!("client {peer} left room {room}: {why}"),
+                Seat::Host => log!("host left room {room} ({drops}): {why}"),
+                Seat::Client(peer) => log!("client {peer} left room {room} ({drops}): {why}"),
             }
         } else {
             // The room let go of it earlier (that was logged then); this is
             // how its close went.
             self.shared.closed(self.id);
             match self.seat {
-                Seat::Host => log!("replaced host of room {room} gone: {why}"),
-                Seat::Client(peer) => log!("closed client {peer} of room {room} gone: {why}"),
+                Seat::Host => log!("replaced host of room {room} gone ({drops}): {why}"),
+                Seat::Client(peer) => log!("closed client {peer} of room {room} gone ({drops}): {why}"),
             }
         }
     }
@@ -858,7 +880,15 @@ async fn connection(
     let (first, seat, mut seated) = match role {
         Role::Host => match shared.join_host(room, link) {
             Ok((first, replaced)) => {
-                let seated = Seated { shared: shared.clone(), room, seat: Seat::Host, id, why: None, slot: Some(slot) };
+                let seated = Seated {
+                    shared: shared.clone(),
+                    room,
+                    seat: Seat::Host,
+                    id,
+                    why: None,
+                    state: state.clone(),
+                    slot: Some(slot),
+                };
                 let note = if replaced { " (replacing the previous host)" } else { "" };
                 log!("host joined room {} from {from}{note}", room.masked());
                 (first, Seat::Host, seated)
@@ -868,7 +898,8 @@ async fn connection(
         Role::Client => match shared.join_client(room, link) {
             Ok((first, peer, online)) => {
                 let seat = Seat::Client(peer);
-                let seated = Seated { shared: shared.clone(), room, seat, id, why: None, slot: Some(slot) };
+                let seated =
+                    Seated { shared: shared.clone(), room, seat, id, why: None, state: state.clone(), slot: Some(slot) };
                 let note = if online { "host online" } else { "waiting for the host" };
                 log!("client {peer} joined room {} from {from} ({note})", room.masked());
                 (first, seat, seated)

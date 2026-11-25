@@ -498,6 +498,9 @@ pub struct Stats {
     pub frames_dropped: u64,
     pub nacks: u64,
     pub keyframe_requests: u64,
+    /// Video fragments that arrived twice, or after their frame was
+    /// delivered or given up on: each one is bandwidth spent for nothing.
+    pub duplicate_frags: u64,
     /// The session goes through the relay.
     pub relayed: bool,
 }
@@ -514,6 +517,9 @@ impl Stats {
         s += &format!("  decode+present {:.1} ms", self.handler_ms);
         if self.frames_dropped != 0 || self.nacks != 0 {
             s += &format!("  dropped {}  nacks {}", self.frames_dropped, self.nacks);
+        }
+        if self.duplicate_frags != 0 {
+            s += &format!("  duplicates {}", self.duplicate_frags);
         }
         if self.relayed {
             s += "  via relay";
@@ -763,6 +769,7 @@ fn receive_loop(
                 frames_dropped: video.stats.frames_dropped,
                 nacks: video.stats.nacks_sent,
                 keyframe_requests: video.stats.keyframe_requests,
+                duplicate_frags: video.stats.duplicate_frags,
                 relayed: conn.relayed,
             });
             // Ask the host for less (or more) if the path changed.
@@ -1010,5 +1017,15 @@ mod tests {
         assert!(!s.summary().contains("relay"));
         s.relayed = true;
         assert!(s.summary().ends_with("  via relay"));
+    }
+
+    #[test]
+    fn stats_line_counts_duplicates() {
+        let mut s = Stats::default();
+        assert!(!s.summary().contains("duplicates"));
+        s.duplicate_frags = 7;
+        s.relayed = true;
+        let line = s.summary();
+        assert!(line.ends_with("  duplicates 7  via relay"), "{line}");
     }
 }
