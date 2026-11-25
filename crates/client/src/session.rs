@@ -594,6 +594,10 @@ fn receive_loop(
     let start = now_us();
     let mut video = Reassembler::new(pt::VIDEO, chunk, start);
     let mut cursor = Reassembler::new(pt::CURSOR, chunk, start);
+    // A session keeps its path: a switch between direct and relay is a new
+    // connect, so a new session with new reassemblers.
+    video.set_relayed(conn.relayed);
+    cursor.set_relayed(conn.relayed);
     let mut cursor_serial = 0u32;
     let mut cursor_visible = true;
     let mut clock = ClockSync::default();

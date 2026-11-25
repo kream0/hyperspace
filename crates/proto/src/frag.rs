@@ -7,7 +7,8 @@
 //! Receiver: frames are released strictly in order (P-frames depend on their
 //! predecessor). Holes are NACKed immediately; if the head-of-line frame cannot
 //! be repaired within a deadline derived from the RTT, the reassembler asks for
-//! a keyframe and discards everything until one arrives.
+//! a keyframe and discards everything until one arrives. Through the relay
+//! ([`Reassembler::set_relayed`]) silence is not taken for loss so soon.
 
 use crate::wire::{FragHeader, FLAG_KEYFRAME, FRAG_HEADER_LEN};
 use std::collections::VecDeque;
@@ -17,6 +18,16 @@ const MAX_PARTIALS: usize = 64;
 /// No fragment for this long on an incomplete newest frame => its tail was lost.
 const TAIL_TIMEOUT_US: u64 = 4_000;
 const MAX_NACK_FRAGS: usize = 256;
+
+// Relayed sessions: datagrams come in order, but late whenever the relay's
+// TCP stream waits out a lost segment, which takes a retransmission timeout
+// (200 ms or more) and a round trip. A gap is a real loss there; silence is not.
+/// Silence before asking for a frame's tail: one such stall, with a round trip of up to 100 ms.
+const RELAYED_SILENCE_US: u64 = 300_000;
+/// Least time between two requests for one fragment: a sooner one only duplicates what a stall still holds.
+const RELAYED_RENACK_US: u64 = 300_000;
+/// Least time from a frame's first request to giving up on it: the repeat at 300 ms has 400 ms to come back.
+const RELAYED_GIVE_UP_US: u64 = 700_000;
 
 #[inline]
 pub fn frag_count(len: usize, chunk: usize) -> usize {
@@ -123,6 +134,9 @@ struct Partial {
     last_rx_us: u64,
     first_nack_us: u64,
     last_nack_us: u64,
+    /// The requests so far covered the fragments below this (u32::MAX: the
+    /// whole frame). Only a relayed reassembler reads it.
+    asked_upto: u32,
 }
 
 impl Partial {
@@ -140,6 +154,7 @@ impl Partial {
             last_rx_us: now,
             first_nack_us: 0,
             last_nack_us: 0,
+            asked_upto: 0,
         }
     }
     fn complete(&self) -> bool {
@@ -169,6 +184,7 @@ pub struct Reassembler {
     need_key: bool,
     last_kf_req_us: u64,
     rtt_us: u64,
+    relayed: bool,
     pool: Vec<Vec<u8>>,
     scratch: Vec<u16>,
     pub stats: ReasmStats,
@@ -186,6 +202,7 @@ impl Reassembler {
             need_key: true,
             last_kf_req_us: now_us,
             rtt_us: 5_000,
+            relayed: false,
             pool: Vec::new(),
             scratch: Vec::new(),
             stats: ReasmStats::default(),
@@ -200,12 +217,40 @@ impl Reassembler {
         self.rtt_us = rtt.clamp(200, 500_000);
     }
 
+    /// The fragments come through the relay: in order, but late while its
+    /// TCP stream stalls. A gap is still asked for at once, but silence is
+    /// given `RELAYED_SILENCE_US` before a frame's tail is asked for, a
+    /// fragment is not asked for again within `RELAYED_RENACK_US`, and a
+    /// frame is not given up within `RELAYED_GIVE_UP_US`. Set it before the
+    /// first fragment: a session keeps one path.
+    pub fn set_relayed(&mut self, relayed: bool) {
+        self.relayed = relayed;
+    }
+
+    fn silence_us(&self) -> u64 {
+        if self.relayed {
+            RELAYED_SILENCE_US
+        } else {
+            TAIL_TIMEOUT_US
+        }
+    }
+
     fn renack_us(&self) -> u64 {
-        (self.rtt_us + self.rtt_us / 2 + 2_000).clamp(4_000, 100_000)
+        let us = (self.rtt_us + self.rtt_us / 2 + 2_000).clamp(4_000, 100_000);
+        if self.relayed {
+            us.max(RELAYED_RENACK_US)
+        } else {
+            us
+        }
     }
 
     fn give_up_us(&self) -> u64 {
-        (3 * self.rtt_us + 15_000).clamp(25_000, 300_000)
+        let us = (3 * self.rtt_us + 15_000).clamp(25_000, 300_000);
+        if self.relayed {
+            us.max(RELAYED_GIVE_UP_US)
+        } else {
+            us
+        }
     }
 
     fn kf_interval_us(&self) -> u64 {
@@ -384,6 +429,8 @@ impl Reassembler {
 
         let renack = self.renack_us();
         let give_up = self.give_up_us();
+        let silence = self.silence_us();
+        let relayed = self.relayed;
         let highest = self.highest_id;
         let mut give_up_now = false;
 
@@ -392,7 +439,7 @@ impl Reassembler {
                 continue;
             }
             let later_exists = id_lt(p.id, highest);
-            let stalled = now_us.saturating_sub(p.last_rx_us) > TAIL_TIMEOUT_US;
+            let stalled = now_us.saturating_sub(p.last_rx_us) > silence;
             let all = later_exists || stalled;
             if p.frag_cnt != 0 && !all && p.got_count == p.max_idx + 1 {
                 continue; // contiguous so far, still arriving
@@ -401,19 +448,28 @@ impl Reassembler {
                 give_up_now = true;
                 break;
             }
-            if p.last_nack_us != 0 && now_us.saturating_sub(p.last_nack_us) < renack {
+            // Too soon to ask again. Relayed, a gap found since the last
+            // request is still asked for at once: the fragments from
+            // `asked_upto` on, never asked for yet.
+            let soon = p.last_nack_us != 0 && now_us.saturating_sub(p.last_nack_us) < renack;
+            if soon && (!relayed || p.frag_cnt == 0) {
                 continue;
             }
+            let from = if soon { p.asked_upto } else { 0 };
             self.scratch.clear();
+            let mut asked = u32::MAX;
             if p.frag_cnt != 0 {
                 let limit = if all { p.frag_cnt } else { p.max_idx };
                 let missing = limit - p.got_count.min(limit);
-                // Mostly gone: cheaper to ask for the whole frame.
-                if !(all && missing as usize > MAX_NACK_FRAGS) {
-                    for idx in 0..limit {
+                // Mostly gone: cheaper to ask for the whole frame (but not
+                // again for fragments asked for a moment ago).
+                if soon || !(all && missing as usize > MAX_NACK_FRAGS) {
+                    asked = limit;
+                    for idx in from..limit {
                         if !p.has(idx) {
                             self.scratch.push(idx as u16);
                             if self.scratch.len() >= MAX_NACK_FRAGS {
+                                asked = idx + 1;
                                 break;
                             }
                         }
@@ -429,6 +485,7 @@ impl Reassembler {
                 p.first_nack_us = now_us;
             }
             p.last_nack_us = now_us;
+            p.asked_upto = asked;
             self.stats.nacks_sent += 1;
             act(Action::Nack { frame_id: p.id, frags: &self.scratch });
         }
@@ -747,5 +804,147 @@ mod tests {
         // strictly increasing, and (with repair) nearly everything arrives
         assert!(delivered.windows(2).all(|w| w[0] < w[1]));
         assert!(delivered.len() as u32 > total * 9 / 10, "only {} of {total}", delivered.len());
+    }
+
+    #[test]
+    fn direct_timers_are_unchanged() {
+        let mut r = Reassembler::new(pt::VIDEO, CHUNK, 0);
+        for d in dgrams(0, true, 100) {
+            feed(&mut r, &d, 0);
+        }
+        assert_eq!(pop_ids(&mut r), vec![0]);
+        let f1 = dgrams(1, false, 500);
+        for d in &f1[..3] {
+            feed(&mut r, d, 1000);
+        }
+        // The tail is asked for after 4 ms of silence...
+        assert!(collect_actions(&mut r, 5000).0.is_empty());
+        assert_eq!(collect_actions(&mut r, 5001), (vec![(1, vec![3, 4])], false));
+        // ...again 1.5 RTT + 2 ms later (the RTT is 5 ms until measured)...
+        assert!(collect_actions(&mut r, 14_500).0.is_empty());
+        assert_eq!(collect_actions(&mut r, 14_501), (vec![(1, vec![3, 4])], false));
+        // ...and the frame is given up 3 RTT + 15 ms after the first request.
+        assert!(!collect_actions(&mut r, 35_001).1);
+        assert!(collect_actions(&mut r, 35_002).1);
+    }
+
+    /// A relayed reassembler that delivered keyframe 0 at time 0.
+    fn relayed() -> Reassembler {
+        let mut r = Reassembler::new(pt::VIDEO, CHUNK, 0);
+        r.set_relayed(true);
+        for d in dgrams(0, true, 100) {
+            feed(&mut r, &d, 0);
+        }
+        assert_eq!(pop_ids(&mut r), vec![0]);
+        r
+    }
+
+    type Polled = Vec<(u64, Vec<(u32, Vec<u16>)>, bool)>;
+
+    /// Poll every millisecond from `from` to `to`, both included: the polls
+    /// that did something, with their time.
+    fn poll_every_ms(r: &mut Reassembler, from: u64, to: u64) -> Polled {
+        let mut out = Vec::new();
+        let mut t = from;
+        while t <= to {
+            let (nacks, kf) = collect_actions(r, t);
+            if !nacks.is_empty() || kf {
+                out.push((t, nacks, kf));
+            }
+            t += 1000;
+        }
+        out
+    }
+
+    #[test]
+    fn relayed_silence_of_250_ms_asks_for_nothing() {
+        let mut r = relayed();
+        let f1 = dgrams(1, false, 500);
+        for d in &f1[..3] {
+            feed(&mut r, d, 1000);
+        }
+        let got = poll_every_ms(&mut r, 1000, 251_000);
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    fn relayed_gap_is_asked_for_at_once() {
+        let mut r = relayed();
+        let f1 = dgrams(1, false, 2000); // 20 fragments
+        for (i, d) in f1[..10].iter().enumerate() {
+            if i != 3 {
+                feed(&mut r, d, 1000);
+            }
+        }
+        // A later fragment came while 3 is missing: on an in-order path, a loss.
+        assert_eq!(collect_actions(&mut r, 1000), (vec![(1, vec![3])], false));
+        let got = poll_every_ms(&mut r, 2000, 4000);
+        assert!(got.is_empty(), "{got:?}");
+        // A new gap a moment later is asked for at once too, without 3.
+        for (i, d) in f1.iter().enumerate().skip(10) {
+            if i != 15 {
+                feed(&mut r, d, 5000);
+            }
+        }
+        assert_eq!(collect_actions(&mut r, 5000), (vec![(1, vec![15])], false));
+        // Both again 300 ms after the last request, not sooner.
+        assert_eq!(poll_every_ms(&mut r, 6000, 305_000), vec![(305_000, vec![(1, vec![3, 15])], false)]);
+        feed(&mut r, &f1[3], 306_000);
+        feed(&mut r, &f1[15], 306_000);
+        assert_eq!(pop_ids(&mut r), vec![1]);
+    }
+
+    #[test]
+    fn relayed_newer_frame_asks_for_what_is_missing_at_once() {
+        let mut r = relayed();
+        let f1 = dgrams(1, false, 500); // 5 fragments
+        feed(&mut r, &f1[0], 1000);
+        feed(&mut r, &f1[2], 1000);
+        assert_eq!(collect_actions(&mut r, 1000), (vec![(1, vec![1])], false));
+        // Frame 2 starts 20 ms later: frame 1's tail is lost, and asked for
+        // at once although frame 1 was asked for a moment ago.
+        let f2 = dgrams(2, false, 300); // 3 fragments
+        feed(&mut r, &f2[0], 21_000);
+        assert_eq!(collect_actions(&mut r, 21_000), (vec![(1, vec![3, 4])], false));
+        // Frame 4 arrives whole: frame 2's tail and all of frame 3 are lost.
+        for d in dgrams(4, false, 100) {
+            feed(&mut r, &d, 22_000);
+        }
+        assert_eq!(collect_actions(&mut r, 22_000), (vec![(2, vec![1, 2]), (3, vec![])], false));
+    }
+
+    #[test]
+    fn relayed_tail_is_asked_for_once_after_300_ms_of_silence() {
+        let mut r = relayed();
+        let f1 = dgrams(1, false, 500);
+        for d in &f1[..3] {
+            feed(&mut r, d, 1000);
+        }
+        // 400 ms of silence: one request, for the tail, once 300 ms passed.
+        assert_eq!(poll_every_ms(&mut r, 1000, 401_000), vec![(302_000, vec![(1, vec![3, 4])], false)]);
+        // 100 ms later, still that one.
+        let got = poll_every_ms(&mut r, 402_000, 501_000);
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    fn relayed_gives_up_only_after_700_ms() {
+        let mut r = relayed();
+        // Frame 1 vanishes entirely, frame 2 arrives.
+        for d in dgrams(2, false, 100) {
+            feed(&mut r, &d, 1000);
+        }
+        // Asked for at once and again every 300 ms; given up once 700 ms
+        // passed since the first request, so the repeat had time to come back.
+        assert_eq!(
+            poll_every_ms(&mut r, 1000, 800_000),
+            vec![
+                (1000, vec![(1, vec![])], false),
+                (301_000, vec![(1, vec![])], false),
+                (601_000, vec![(1, vec![])], false),
+                (702_000, vec![], true),
+            ]
+        );
+        assert!(r.waiting_for_keyframe());
     }
 }
