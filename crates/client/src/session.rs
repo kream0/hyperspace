@@ -150,7 +150,7 @@ fn is_tunnel(name: &str) -> bool {
 }
 
 /// Best explanation this machine can give for an address staying silent.
-fn why_unreachable(sock: &UdpSocket, addr: SocketAddr) -> String {
+fn why_unreachable(sock: &UdpSocket, addr: SocketAddr, relay_set: bool) -> String {
     let ifaces = if_addrs::get_if_addrs().unwrap_or_default();
     // Which of our interfaces would carry traffic to it.
     let via = sock.local_addr().ok().and_then(|l| ifaces.iter().find(|i| i.ip() == l.ip()));
@@ -169,11 +169,7 @@ fn why_unreachable(sock: &UdpSocket, addr: SocketAddr) -> String {
             "a private address, only reachable from the host's own network (expected when you are elsewhere)".into()
         }
     } else if let Some(t) = tunnel {
-        format!(
-            "traffic to this public address leaves through {} - a VPN or security client (e.g. Zscaler) - which \
-             commonly blocks direct UDP like this; try from a network or device without it, or ask whoever manages it",
-            t.name
-        )
+        through_tunnel(&t.name, relay_set)
     } else {
         format!(
             "the host's public address - its router must forward UDP {} to the PC (the host log says whether it does), \
@@ -181,6 +177,20 @@ fn why_unreachable(sock: &UdpSocket, addr: SocketAddr) -> String {
             addr.port()
         )
     }
+}
+
+/// Why a public address stays silent when the traffic to it leaves through
+/// a tunnel interface (`iface`). Without a relay, it points to one.
+fn through_tunnel(iface: &str, relay_set: bool) -> String {
+    let advice = if relay_set {
+        "try from a network or device without it, or ask whoever manages it"
+    } else {
+        "a relay (--relay) gets around this, or try from a network or device without it"
+    };
+    format!(
+        "traffic to this public address leaves through {iface} - a VPN or security client - which commonly blocks \
+         direct UDP like this; {advice}"
+    )
 }
 
 /// Connect: authenticate with the pairing key over whichever address answers
@@ -261,7 +271,7 @@ pub fn connect(opts: &Options, mut relay: Option<&mut Relay>, stop: &AtomicBool)
         if start.elapsed() > opts.timeout || gave_up {
             let mut tried = String::new();
             for (s, addr) in &socks {
-                tried += &format!("\n  {addr}: {}", why_unreachable(s, *addr));
+                tried += &format!("\n  {addr}: {}", why_unreachable(s, *addr, relay.is_some()));
             }
             tried += &relay_line(relay.as_deref());
             let mut msg = if tried.is_empty() {
@@ -882,6 +892,26 @@ pub fn run_sessions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_blocking_tunnel_points_to_the_relay_when_none_is_set() {
+        let without = through_tunnel("utun4", false);
+        assert_eq!(
+            without,
+            "traffic to this public address leaves through utun4 - a VPN or security client - which commonly blocks \
+             direct UDP like this; a relay (--relay) gets around this, or try from a network or device without it"
+        );
+        let with = through_tunnel("utun4", true);
+        assert_eq!(
+            with,
+            "traffic to this public address leaves through utun4 - a VPN or security client - which commonly blocks \
+             direct UDP like this; try from a network or device without it, or ask whoever manages it"
+        );
+        for line in [&without, &with] {
+            assert!(!line.contains("e.g."), "{line}");
+            assert!(!line.contains('\n'), "{line}");
+        }
+    }
 
     #[test]
     fn only_lost_sessions_are_retried() {
