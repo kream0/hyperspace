@@ -20,7 +20,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Media::MediaFoundation::{MFShutdown, MFStartup, MFSTARTUP_FULL, MF_VERSION};
 use windows::Win32::Media::timeBeginPeriod;
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
-use windows::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT};
+use windows::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_CLOSE_EVENT};
 use windows::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED};
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, SetPriorityClass, SetThreadPriority, HIGH_PRIORITY_CLASS, THREAD_PRIORITY_HIGHEST,
@@ -56,19 +56,24 @@ pub fn process_setup() {
 }
 
 /// How long closing the console waits for serve()'s goodbyes. Windows ends
-/// the process 5 s after a close, logoff or shutdown event in any case.
+/// the process 5 s after a close event in any case.
 const CLOSE_WAIT: Duration = Duration::from_secs(3);
 
 unsafe extern "system" fn console_handler(ctrl_type: u32) -> windows::core::BOOL {
     crate::server::SHUTDOWN.store(true, Ordering::Relaxed);
     match ctrl_type {
         // The process dies as soon as this returns: wait until serve() has
-        // sent BYE, released held keys and closed the relay link.
-        CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => {
+        // sent BYE, released held keys, closed the relay link and withdrawn
+        // the router's mappings.
+        CTRL_CLOSE_EVENT => {
             crate::wait_while(&crate::SERVING, CLOSE_WAIT);
         }
         // Ctrl+C and Ctrl+Break: the process lives on and serve() returns
-        // by itself.
+        // by itself. Logoff and shutdown are not waited for: Windows calls
+        // this handler for them only in a console program that has not
+        // loaded user32, and this one has (SetProcessDpiAwarenessContext
+        // above comes from it). Should they come, they get this pause, as
+        // every event did before.
         _ => std::thread::sleep(Duration::from_millis(400)),
     }
     true.into()

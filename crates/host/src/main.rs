@@ -331,9 +331,10 @@ fn start_server(cfg: &Config, extra: &Extra) -> Result<(server::Server, Option<R
 }
 
 /// True while serve() still has goodbyes to send: the BYE to a client, the
-/// release of held keys and the close of the relay link. When the console
-/// window is closed, Windows ends the process as soon as the console handler
-/// returns, so the handler waits for this to clear.
+/// release of held keys, the close of the relay link and the withdrawal of
+/// the router's mappings. When the console window is closed, Windows ends
+/// the process as soon as the console handler returns, so the handler waits
+/// for this to clear.
 static SERVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Holds SERVING up until it is dropped, which also covers serve()'s early
@@ -404,10 +405,11 @@ fn serve(mut cfg: Config, extra: Extra) -> Result<(), String> {
     // Let the reach thread withdraw the router's port mapping.
     server::SHUTDOWN.store(true, std::sync::atomic::Ordering::Relaxed);
     drop(bridge);
-    // The client has its BYE and the relay link is closed: a console being
-    // closed may end the process from here on.
-    drop(serving);
     let _ = reach.join();
+    // The client has its BYE, the relay link is closed and the router's
+    // mappings are withdrawn: a console being closed may end the process
+    // from here on.
+    drop(serving);
     result
 }
 
