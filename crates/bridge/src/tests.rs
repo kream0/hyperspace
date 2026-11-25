@@ -18,7 +18,7 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::MaybeTlsStream;
 
-use crate::client::Refusals;
+use crate::client::{Refusals, StatusLines, OFFLINE_LINE_HOLD};
 use crate::errors::{self, UNTRUSTED};
 use crate::host::Takeovers;
 use crate::link::{self, jitter, secs, spread, Backoff, Timing};
@@ -234,6 +234,67 @@ impl Closer {
 }
 
 impl Drop for Closer {
+    fn drop(&mut self) {
+        if let Some(rt) = self.rt.take() {
+            rt.shutdown_background();
+        }
+    }
+}
+
+/// A relay that lets one client in with the host online, then says the host
+/// is online or offline whenever the test asks: as many changes, as fast as
+/// a test needs. Dropping it cuts the link.
+struct Flipper {
+    rt: Option<tokio::runtime::Runtime>,
+    addr: SocketAddr,
+    reports: tokio::sync::mpsc::UnboundedSender<bool>,
+}
+
+impl Flipper {
+    fn start() -> Flipper {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (reports, mut asked) = tokio::sync::mpsc::unbounded_channel::<bool>();
+        rt.spawn(async move {
+            let Ok((tcp, _)) = listener.accept().await else { return };
+            let Some(mut ws) = let_in(tcp).await else { return };
+            enum Step {
+                Report(Option<bool>),
+                Read(bool),
+            }
+            loop {
+                let step = tokio::select! {
+                    online = asked.recv() => Step::Report(online),
+                    msg = ws.next() => Step::Read(matches!(msg, Some(Ok(_)))),
+                };
+                match step {
+                    Step::Report(Some(host_online)) => {
+                        if ws.send(Message::binary(Msg::Status { host_online }.encode())).await.is_err() {
+                            return;
+                        }
+                    }
+                    Step::Report(None) | Step::Read(false) => return,
+                    Step::Read(true) => {}
+                }
+            }
+        });
+        Flipper { rt: Some(rt), addr, reports }
+    }
+
+    fn url(&self) -> RelayUrl {
+        RelayUrl::parse(&format!("ws://{}", self.addr)).unwrap()
+    }
+
+    /// Says these, in this order, at once.
+    fn report(&self, host_online: &[bool]) {
+        for &online in host_online {
+            self.reports.send(online).unwrap();
+        }
+    }
+}
+
+impl Drop for Flipper {
     fn drop(&mut self) {
         if let Some(rt) = self.rt.take() {
             rt.shutdown_background();
@@ -763,6 +824,111 @@ fn a_dropped_bridge_closes_its_link() {
     assert!(took < link::CLOSE_TIMEOUT, "the host took {took:?} to close");
     wait_for("the host's close", || relay.ends().len() == 2);
     assert_eq!(relay.ends(), ["close 1000", "close 1000"]);
+}
+
+const ONLINE_LINE: &str = "relay: connected to the relay; the host is online";
+const OFFLINE_LINE: &str = "relay: connected to the relay; the host is offline";
+
+/// The status lines printed from `since` on, each with when.
+fn lines_since(lines: &StatusLines, since: Instant) -> Vec<(Instant, String)> {
+    lines.lock().unwrap().iter().filter(|(at, _)| *at >= since).cloned().collect()
+}
+
+fn offline_lines(lines: &StatusLines) -> Vec<Instant> {
+    lines.lock().unwrap().iter().filter(|(_, line)| line == OFFLINE_LINE).map(|(at, _)| *at).collect()
+}
+
+/// Timers may round to the millisecond.
+const SLACK: Duration = Duration::from_millis(50);
+
+#[test]
+fn the_line_saying_a_host_left_waits_a_second_and_an_exit_drops_it() {
+    let relay = Relay::start(Allow::Open);
+    let key = Key::generate();
+    let echo = Echo::start();
+    let (client, _) = ClientBridge::start_with(relay.url(), &key, fast()).unwrap();
+    let lines = client.status_lines();
+
+    // No host yet: the line comes with the status.
+    wait_for("the host to be reported offline", || client.status() == Status::HostOffline);
+    assert_eq!(offline_lines(&lines).len(), 1);
+
+    // A host that was online leaves: the status changes at once, the line
+    // a second later.
+    let first = HostBridge::start_with(relay.url(), &key, echo.addr, RelayedPeers::new(), fast()).unwrap();
+    wait_for("the host to come online", || client.status() == Status::HostOnline);
+    let left = Instant::now();
+    drop(first);
+    wait_for("the host to be reported offline again", || client.status() == Status::HostOffline);
+    wait_for("the held line", || offline_lines(&lines).len() == 2);
+    let said = offline_lines(&lines)[1];
+    assert!(said + SLACK >= left + OFFLINE_LINE_HOLD, "said {:?} after the host left", said - left);
+
+    // A client that stops within that second never says it, then or later:
+    // nothing of the bridge outlives it.
+    let second = HostBridge::start_with(relay.url(), &key, echo.addr, RelayedPeers::new(), fast()).unwrap();
+    wait_for("the host to come back", || client.status() == Status::HostOnline);
+    drop(second);
+    wait_for("the host to be reported offline once more", || client.status() == Status::HostOffline);
+    let stopping = Instant::now();
+    drop(client);
+    std::thread::sleep(OFFLINE_LINE_HOLD + Duration::from_millis(300));
+    let late = lines_since(&lines, stopping);
+    assert!(late.is_empty(), "printed while or after stopping: {late:?}");
+    assert_eq!(offline_lines(&lines).len(), 2);
+}
+
+#[test]
+fn a_host_back_within_the_hold_is_said_offline_then_online_in_order() {
+    let relay = Flipper::start();
+    let (client, _) = ClientBridge::start_with(relay.url(), &Key::generate(), fast()).unwrap();
+    let lines = client.status_lines();
+    wait_for("the host to be reported online", || client.status() == Status::HostOnline);
+
+    // Off and on again, twice, all well within the hold.
+    let began = Instant::now();
+    relay.report(&[false, true, false, true]);
+    wait_for("the four lines", || lines_since(&lines, began).len() >= 4);
+    let flips = lines_since(&lines, began);
+    let said: Vec<&str> = flips.iter().map(|(_, line)| line.as_str()).collect();
+    assert_eq!(said, [OFFLINE_LINE, ONLINE_LINE, OFFLINE_LINE, ONLINE_LINE]);
+    // Said as the host came back, not when the hold ran out.
+    assert!(flips.iter().all(|(at, _)| *at < began + OFFLINE_LINE_HOLD), "{flips:?}");
+
+    // The hold runs out with the host online: no stale "offline" after it.
+    std::thread::sleep(OFFLINE_LINE_HOLD + Duration::from_millis(300));
+    assert_eq!(lines_since(&lines, began).len(), 4, "{:?}", lines_since(&lines, began));
+    assert_eq!(client.status(), Status::HostOnline);
+
+    // The last change is said in its turn, a second later.
+    let left = Instant::now();
+    relay.report(&[false]);
+    wait_for("the host to be reported offline", || client.status() == Status::HostOffline);
+    wait_for("the held line", || lines_since(&lines, left).len() == 1);
+    let (said, line) = lines_since(&lines, left).remove(0);
+    assert_eq!(line, OFFLINE_LINE);
+    assert!(said + SLACK >= left + OFFLINE_LINE_HOLD, "said {:?} after the host left", said - left);
+}
+
+#[test]
+fn a_link_that_ends_says_the_held_line_first() {
+    let relay = Flipper::start();
+    let (client, _) = ClientBridge::start_with(relay.url(), &Key::generate(), fast()).unwrap();
+    let lines = client.status_lines();
+    wait_for("the host to be reported online", || client.status() == Status::HostOnline);
+    let left = Instant::now();
+    relay.report(&[false]);
+    wait_for("the host to be reported offline", || client.status() == Status::HostOffline);
+
+    // The link goes within the second: the held line is said then, before
+    // the line about the lost link.
+    drop(relay);
+    wait_for("a status line after the offline one", || lines_since(&lines, left).len() >= 2);
+    let after = lines_since(&lines, left);
+    assert_eq!(after[0].1, OFFLINE_LINE, "{after:?}");
+    assert!(after[0].0 < left + OFFLINE_LINE_HOLD, "said {:?} after the host left", after[0].0 - left);
+    assert_ne!(after[1].1, OFFLINE_LINE, "{after:?}");
+    drop(client);
 }
 
 #[test]
