@@ -149,6 +149,12 @@ jobs:
           src="releases/$VERSION.md"
           : > body.md
           if [ -f "$src" ]; then
+            # A byte order mark hides the title from the check below, and the
+            # page would then show it.
+            if [ "$(head -c 3 "$src" | od -An -tx1 | tr -d ' \n')" = "efbbbf" ]; then
+              echo "::error::$src starts with a UTF-8 byte order mark: save it as UTF-8 without one"
+              exit 1
+            fi
             # Drop the title line and the blank line after it.
             start=1
             if head -n 1 "$src" | grep -q '^# '; then
@@ -162,7 +168,12 @@ jobs:
               exit 1
             fi
             if [[ "$first" == \#* ]]; then
-              echo "::error::$src still starts with a heading once its title is removed: its first line must be '# hyperspace $VERSION', then a blank line, then the notes"
+              if [ "$start" -gt 1 ]; then
+                line=$(( start - 1 + $(grep -n -m 1 -v '^[[:space:]]*$' body.md | cut -d: -f1) ))
+                echo "::error::$src: the notes under its title start with a heading (line $line), so the release page would open with a section title: put the notes' own text first, before any '##' section"
+              else
+                echo "::error::$src does not start with its title: its first line must be '# hyperspace $VERSION', then a blank line, then the notes"
+              fi
               exit 1
             fi
           elif [ "$RELEASE" = "true" ]; then
@@ -379,7 +390,7 @@ jobs:
               # Replaces the release's files that have the same name and adds
               # the others. The page's text, title and tag stay as they are:
               # notes changed since are put on the page by hand
-              # (gh release edit "$TAG" --notes-file notes.md).
+              # (gh release edit "$TAG" --notes-file release/notes.md).
               gh release upload "$TAG" release/assets/* --clobber
               echo "::notice::the files of $TAG were replaced; its release page text was left as it was"
               ;;

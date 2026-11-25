@@ -29,13 +29,6 @@ const UDP_BUFFER: usize = 1 << 20;
 /// Refusals that usually clear up soon (TIMEOUT, ROOM_FULL, RELAY_FULL) are
 /// retried with the backoff this many times in a row, then slowly.
 const QUICK_RETRIES: u32 = 5;
-/// How long the line saying that a host which was online went offline waits
-/// before it is printed (the status changes at once). A host that ends the
-/// session goes offline at the relay right after its goodbye, and a client
-/// that is exiting closes the link within this time: printed then, the line
-/// would read like the start of a reconnect. Longer than the client's pause
-/// before it closes the link after a relayed session.
-pub(crate) const OFFLINE_LINE_HOLD: Duration = Duration::from_secs(1);
 
 /// Where the link to the relay stands, in words a user can act on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -550,7 +543,7 @@ async fn carry(
     let counters = &shared.counters;
     let mut first_status = true;
     // The line saying the host went offline, while it waits.
-    let held = tokio::time::sleep(OFFLINE_LINE_HOLD);
+    let held = tokio::time::sleep(t.offline_line_hold);
     tokio::pin!(held);
     let mut holding = false;
 
@@ -633,7 +626,7 @@ async fn carry(
                             *status = Status::HostOffline;
                             drop(status);
                             holding = true;
-                            held.as_mut().reset(tokio::time::Instant::now() + OFFLINE_LINE_HOLD);
+                            held.as_mut().reset(tokio::time::Instant::now() + t.offline_line_hold);
                         } else {
                             drop(status);
                             shared.set(Status::HostOffline);

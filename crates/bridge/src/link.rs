@@ -61,6 +61,14 @@ pub struct Timing {
     pub idle_timeout: Duration,
     /// A link that stayed up this long resets the backoff.
     pub stable: Duration,
+    /// Client only: how long the line saying that a host which was online
+    /// went offline waits before it is printed (the status changes at once).
+    /// A host that ends the session goes offline at the relay right after its
+    /// goodbye, and a client that is exiting closes the link within this
+    /// time: printed then, the line would read like the start of a
+    /// reconnect. Longer than the client's pause before it closes the link
+    /// after a relayed session.
+    pub offline_line_hold: Duration,
 }
 
 impl Timing {
@@ -74,6 +82,7 @@ impl Timing {
             ping_interval: Duration::from_secs(15),
             idle_timeout: Duration::from_secs(35),
             stable: Duration::from_secs(30),
+            offline_line_hold: Duration::from_secs(1),
         }
     }
 
@@ -87,6 +96,7 @@ impl Timing {
             ping_interval: Duration::from_secs(15),
             idle_timeout: Duration::from_secs(35),
             stable: Duration::from_secs(10),
+            offline_line_hold: Duration::from_secs(1),
         }
     }
 }
