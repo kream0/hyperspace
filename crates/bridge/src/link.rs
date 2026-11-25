@@ -372,18 +372,27 @@ pub async fn close(sink: &mut SplitSink<Ws, Message>, stream: &mut SplitStream<W
     .await;
 }
 
-/// `" (code 1008: refused)"`, or nothing without a close frame.
+/// `" (code 1008: refused)"`, or nothing without a close frame. The reason
+/// comes from the far end: it is cut short and made printable, and it loses
+/// a final period, since it sits inside a longer line.
 pub fn close_text(frame: &Option<CloseFrame>) -> String {
     match frame {
-        Some(f) if f.reason.is_empty() => format!(" (code {})", u16::from(f.code)),
-        Some(f) => format!(" (code {}: {})", u16::from(f.code), sanitize(f.reason.as_str())),
+        Some(f) => {
+            let reason = sanitize(f.reason.as_str());
+            match errors::clause(reason.trim()) {
+                "" => format!(" (code {})", u16::from(f.code)),
+                reason => format!(" (code {}: {reason})", u16::from(f.code)),
+            }
+        }
         None => String::new(),
     }
 }
 
-/// Text from the network, made safe for a log line.
+/// Text from the network, made safe for a log line: 120 characters at most,
+/// each one shown only when it is printable ASCII, '?' otherwise (control
+/// characters, and the invisible ones that reorder a line on screen).
 pub fn sanitize(s: &str) -> String {
-    s.chars().take(120).map(|c| if c.is_control() { '?' } else { c }).collect()
+    s.chars().take(120).map(|c| if c == ' ' || c.is_ascii_graphic() { c } else { '?' }).collect()
 }
 
 /// True if the close frame says another host took the room.

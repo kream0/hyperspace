@@ -818,6 +818,21 @@ fn close_frames_are_told_apart() {
 }
 
 #[test]
+fn a_close_reason_reads_as_one_plain_clause() {
+    let frame = |code: u16, reason: &str| Some(CloseFrame { code: CloseCode::from(code), reason: reason.into() });
+    assert_eq!(link::close_text(&frame(1000, "closed by the relay.")), " (code 1000: closed by the relay)");
+    assert_eq!(link::close_text(&frame(1001, " going away. ")), " (code 1001: going away)");
+    assert_eq!(link::close_text(&frame(1008, "...")), " (code 1008)");
+    assert_eq!(link::close_text(&frame(1008, "  ")), " (code 1008)");
+    // From the far end: printable characters only, and cut short.
+    assert_eq!(link::close_text(&frame(1008, "tab\there\u{202e}txt\u{1b}[31m")), " (code 1008: tab?here?txt?[31m)");
+    assert_eq!(link::close_text(&frame(1008, "x".repeat(500).as_str())), format!(" (code 1008: {})", "x".repeat(120)));
+    let why = format!("the relay closed the connection{}", link::close_text(&frame(1011, "Internal error.")));
+    let line = link::closed_line(Duration::from_secs(3), &why, "reconnecting in 1 s");
+    assert_eq!(line, "relay link closed after 3 s: the relay closed the connection (code 1011: Internal error); reconnecting in 1 s");
+}
+
+#[test]
 fn a_room_the_relay_does_not_serve_is_refused() {
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     let dir = std::env::temp_dir().join(format!("hyperspace-bridge-test-{}-{nanos}", std::process::id()));
