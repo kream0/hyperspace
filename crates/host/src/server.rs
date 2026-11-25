@@ -84,9 +84,56 @@ struct Stats {
     keyframes: AtomicU64,
     bytes: AtomicU64,
     retransmits: AtomicU64,
+    /// Keyframe requests from the client.
+    keyframe_requests: AtomicU64,
+    /// Requests to resend video fragments (each one resends one or more of
+    /// the `retransmits`)...
+    resend_requests: AtomicU64,
+    /// ...and those for a frame no longer kept, answered with a keyframe.
+    too_old: AtomicU64,
     /// Sum / max of capture -> packets-on-the-wire time.
     latency_sum_us: AtomicU64,
     latency_max_us: AtomicU64,
+}
+
+/// Keyframes sent, and what the client asked for to repair the stream, as
+/// the 5-second line shows them.
+#[derive(Clone, Copy, Default)]
+struct Repairs {
+    keyframes: u64,
+    keyframe_requests: u64,
+    resend_requests: u64,
+    too_old: u64,
+}
+
+impl Repairs {
+    fn now(st: &Stats) -> Repairs {
+        let n = |count: &AtomicU64| count.load(Ordering::Relaxed);
+        Repairs {
+            keyframes: n(&st.keyframes),
+            keyframe_requests: n(&st.keyframe_requests),
+            resend_requests: n(&st.resend_requests),
+            too_old: n(&st.too_old),
+        }
+    }
+
+    /// Each count for the session so far, with its rise since `last` (the
+    /// previous line) in parentheses, so that a jump in retransmits can be
+    /// matched to the keyframes and requests around it.
+    fn text(&self, last: &Repairs) -> String {
+        let rise = |now: u64, then: u64| now.saturating_sub(then);
+        format!(
+            "{} keyframes (+{}), {} keyframe requests (+{}), {} resend requests (+{}), {} too old to resend (+{})",
+            self.keyframes,
+            rise(self.keyframes, last.keyframes),
+            self.keyframe_requests,
+            rise(self.keyframe_requests, last.keyframe_requests),
+            self.resend_requests,
+            rise(self.resend_requests, last.resend_requests),
+            self.too_old,
+            rise(self.too_old, last.too_old)
+        )
+    }
 }
 
 /// Per-session state shared with the pipeline thread.
@@ -284,6 +331,8 @@ struct Session {
     last_stats: Instant,
     last_frames: u64,
     last_bytes: u64,
+    /// The repairs in the last 5-second line, for the rise in the next one.
+    last_repairs: Repairs,
     input_rx: InputReceiver,
     injector: Box<dyn Injector>,
     applied_rect: Option<(i32, i32, i32, i32)>,
@@ -499,11 +548,19 @@ impl Server {
                 s.shared.send(&wire::input_ack(s.input_rx.last()));
             }
             Packet::Nack(n) => {
+                let st = &s.shared.stats;
+                if n.kind == pt::VIDEO {
+                    st.resend_requests.fetch_add(1, Ordering::Relaxed);
+                }
                 if !s.shared.retransmit(&n) {
+                    st.too_old.fetch_add(1, Ordering::Relaxed);
                     s.ctl.keyframe.store(true, Ordering::Relaxed);
                 }
             }
-            Packet::RequestKeyframe => s.ctl.keyframe.store(true, Ordering::Relaxed),
+            Packet::RequestKeyframe => {
+                s.shared.stats.keyframe_requests.fetch_add(1, Ordering::Relaxed);
+                s.ctl.keyframe.store(true, Ordering::Relaxed);
+            }
             Packet::RequestWelcome => {
                 if let Some(w) = s.shared.welcome.lock().unwrap().as_ref() {
                     s.shared.send(w);
@@ -603,6 +660,7 @@ impl Server {
             last_stats: now,
             last_frames: 0,
             last_bytes: 0,
+            last_repairs: Repairs::default(),
             input_rx: InputReceiver::default(),
             injector: new_injector(self.cfg.view_only),
             applied_rect: None,
@@ -652,14 +710,17 @@ impl Server {
             let sum = st.latency_sum_us.swap(0, Ordering::Relaxed);
             let max = st.latency_max_us.swap(0, Ordering::Relaxed);
             if df > 0 {
+                let repairs = Repairs::now(st);
                 log!(
-                    "{:.1} fps, {:.2} Mbit/s, capture->wire avg {:.2} ms max {:.2} ms, {} retransmits",
+                    "{:.1} fps, {:.2} Mbit/s, capture->wire avg {:.2} ms max {:.2} ms, {} retransmits, {}",
                     df as f64 / dt,
                     db as f64 * 8.0 / dt / 1e6,
                     sum as f64 / df as f64 / 1000.0,
                     max as f64 / 1000.0,
-                    st.retransmits.load(Ordering::Relaxed)
+                    st.retransmits.load(Ordering::Relaxed),
+                    repairs.text(&s.last_repairs)
                 );
+                s.last_repairs = repairs;
             }
         }
     }
@@ -704,6 +765,35 @@ fn pretty(addr: SocketAddr) -> SocketAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_five_second_line_shows_repairs_so_far_and_their_rise() {
+        let st = Stats::default();
+        let add = |count: &AtomicU64, n: u64| count.fetch_add(n, Ordering::Relaxed);
+        // A session's first line: its first keyframe, asked for.
+        add(&st.keyframes, 1);
+        add(&st.keyframe_requests, 1);
+        let first = Repairs::now(&st);
+        assert_eq!(
+            first.text(&Repairs::default()),
+            "1 keyframes (+1), 1 keyframe requests (+1), 0 resend requests (+0), 0 too old to resend (+0)"
+        );
+        // Then 350 resend requests, one of them for a frame no longer kept,
+        // which was answered with a keyframe.
+        add(&st.resend_requests, 350);
+        add(&st.too_old, 1);
+        add(&st.keyframes, 1);
+        let second = Repairs::now(&st);
+        assert_eq!(
+            second.text(&first),
+            "2 keyframes (+1), 1 keyframe requests (+0), 350 resend requests (+350), 1 too old to resend (+1)"
+        );
+        // Nothing new: the totals stay, the rises are 0.
+        assert_eq!(
+            Repairs::now(&st).text(&second),
+            "2 keyframes (+0), 1 keyframe requests (+0), 350 resend requests (+0), 1 too old to resend (+0)"
+        );
+    }
 
     #[test]
     fn a_client_is_on_the_internet_unless_its_address_is_local() {
