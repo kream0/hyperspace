@@ -361,8 +361,8 @@ a client is connected.
 - The cursor image is resampled to match the video scale, so it can look
   slightly soft on Retina displays.
 - Host and client versions 0.3.0 and 0.3.1 connect to each other, in either
-  combination. For any other pair, keep the host and the client on the same
-  version; updating both brings every fix.
+  combination; updating both brings every fix. For any other pair, keep the
+  host and the client on the same version.
 
 ## Building
 
